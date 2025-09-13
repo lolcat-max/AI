@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-KB_LEN = 999
+KB_LEN = 299
 # Example CBOW model definition (same as before)
 class CBOW(nn.Module):
     def __init__(self, vocab_size, embedding_dim):
