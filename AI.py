@@ -67,12 +67,12 @@ class NeuralEnhancedMarkov:
         total_sum = 0
         n = 0
         while n < 1000:
-            term_sum = 0
+            term_sum = 1
             for word, next_words in self.transition_matrix.items():
                 i = self.word_frequencies[next_words[0]]
                 for next_word, count in next_words.items():
                     j = count
-                    term_sum += (i * j) / (n + 1) ** 0.5
+                    term_sum *= (i * j) / (n + 1) ** 0.5
             total_sum += term_sum
             n += 1
         return total_sum if total_sum > 0 else 1.0
@@ -88,7 +88,7 @@ class NeuralEnhancedMarkov:
                 base_weight = epsilon * self.series_sum
                 freq_weight = (i * j * count) / word_freq
                 rarity_penalty = 1.0 / (count + 1)
-                weight = max(base_weight, freq_weight) * (1 - rarity_penalty * 0.1)
+                weight = max(base_weight, freq_weight) * (1 - rarity_penalty * 0.8)
                 transitions.append(next_word)
                 weights.append(weight)
             total_weight = sum(weights)
@@ -200,7 +200,7 @@ class NeuralEnhancedMarkov:
         for word in available_words:
             if word in self.spike_patterns:
                 target_spikes = self.spike_patterns[word]
-                synchrony = sum(1 for st in current_spikes for tt in target_spikes if abs(st-tt)<=5)
+                synchrony = sum(1 for st in current_spikes for tt in target_spikes if abs(st-tt)<=15)
                 max_sync = min(len(current_spikes), len(target_spikes))
                 sync_weight = synchrony / max_sync if max_sync > 0 else 0
             else:
@@ -246,14 +246,11 @@ class NeuralEnhancedMarkov:
 # Usage Example
 with open(input("Filename: "), 'r', encoding='utf-8') as f:
     corpus = f.read()[:KB_LEN]
-
-while True:
-
     generator = NeuralEnhancedMarkov()
     generator.build_enhanced_model(corpus)
     generator.add_n_gram_enhancement(n=2)
     generator.build_semantic_clusters()
     generator.simulate_neural_spike_patterns()
-    generator.set_seed(input("USER: "))
-
-    print(f"Neural Enhanced: {generator.generate_with_neural_enhancement(max_words=550, neural_strength=0.8)}")
+    while True:
+        generator.set_seed(input("USER: "))
+        print(f"Neural Enhanced: {generator.generate_with_neural_enhancement(max_words=550, neural_strength=0.8)}")
