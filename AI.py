@@ -160,34 +160,6 @@ class NeuralEnhancedMarkov:
             next_word = words[i+n]
             self.n_gram_model[n_gram][next_word] += 1
 
-    def generate_with_context_awareness(self, max_words=20, context_strength=0.5):
-        if not self.n_gram_model: return self.generate_text(max_words=max_words)
-        
-        # Use seed word if available
-        start_word = self.seed_word if self.seed_word else random.choice(list(self.model.keys()))
-        current_word = start_word
-        sentence = [current_word.capitalize()]
-        
-        for _ in range(max_words - 1):
-            if len(sentence) >= 2:
-                context = tuple(word.lower() for word in sentence[-2:])
-                if context in self.n_gram_model and random.random() < context_strength:
-                    next_options = self.n_gram_model[context]
-                    if next_options:
-                        next_word = random.choices(list(next_options.keys()), weights=list(next_options.values()))[0]
-                        sentence.append(next_word)
-                        continue
-            current_word = sentence[-1].lower()
-            if current_word in self.model and self.model[current_word]:
-                words, weights = zip(*self.model[current_word])
-                next_word = np.random.choice(words, p=weights)
-                sentence.append(next_word)
-            else:
-                break
-        generated_text = " ".join(sentence)
-        if generated_text[-1] not in ".?!": generated_text += "."
-        return generated_text
-
     def build_semantic_clusters(self):
         co_occurrence = defaultdict(lambda: defaultdict(float))
         for word, transitions in self.transition_matrix.items():
@@ -206,7 +178,7 @@ class NeuralEnhancedMarkov:
                     intersection = len(word_neighbors & other_neighbors)
                     union = len(word_neighbors | other_neighbors)
                     similarity = intersection / union if union > 0 else 0
-                    if similarity > 0.3:
+                    if similarity > 0.8:
                         cluster.append(other_word)
                         processed_words.add(other_word)
             if len(cluster) > 1:
