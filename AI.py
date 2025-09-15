@@ -1,5 +1,4 @@
 import random
-
 import math
 import numpy as np
 import json
@@ -20,7 +19,6 @@ class NeuralEnhancedMarkov:
         self.vocabulary = set()
         self.generation_history = []
         self.performance_metrics = {}
-        self.n_gram_model = defaultdict(lambda: defaultdict(int))
         self.semantic_clusters = {}
         self.spike_patterns = defaultdict(list)
         self.seed_word = None
@@ -48,7 +46,6 @@ class NeuralEnhancedMarkov:
             # If any word is not found, print a warning and use random start
             self.seed_word = None
             print(f"Warning: The seed phrase '{seed_input.strip()}' contains word(s) not found in vocabulary. Using random start.")
-
 
     def build_enhanced_model(self, text):
         processed_text = text.lower()
@@ -152,14 +149,6 @@ class NeuralEnhancedMarkov:
         })
         return generated_text
 
-    def add_n_gram_enhancement(self, n=2):
-        if n < 2: return
-        words = list(self.vocabulary)
-        for i in range(len(words) - n):
-            n_gram = tuple(words[i:i+n])
-            next_word = words[i+n]
-            self.n_gram_model[n_gram][next_word] += 1
-
     def build_semantic_clusters(self):
         co_occurrence = defaultdict(lambda: defaultdict(float))
         for word, transitions in self.transition_matrix.items():
@@ -218,7 +207,6 @@ class NeuralEnhancedMarkov:
         if not self.model: return "No model available."
         if not self.semantic_clusters: self.build_semantic_clusters()
         if not self.spike_patterns: self.simulate_neural_spike_patterns()
-        
         # Handle multi-word seeds
         if self.seed_word is not None:
             if isinstance(self.seed_word, list):
@@ -230,7 +218,6 @@ class NeuralEnhancedMarkov:
         else:
             current_word = random.choice(list(self.model.keys()))
             sentence = [current_word.capitalize()]
-        
         for _ in range(max_words - len(sentence)):
             if current_word in self.model and self.model[current_word]:
                 words, weights = zip(*self.model[current_word])
@@ -248,7 +235,6 @@ with open(input("Filename: "), 'r', encoding='utf-8') as f:
     corpus = f.read()[:KB_LEN]
     generator = NeuralEnhancedMarkov()
     generator.build_enhanced_model(corpus)
-    generator.add_n_gram_enhancement(n=2)
     generator.build_semantic_clusters()
     generator.simulate_neural_spike_patterns()
     while True:
