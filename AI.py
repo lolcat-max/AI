@@ -1,3 +1,4 @@
+
 import random
 import math
 import numpy as np
@@ -189,14 +190,14 @@ class NeuralEnhancedMarkov:
         for word in available_words:
             if word in self.spike_patterns:
                 target_spikes = self.spike_patterns[word]
-                synchrony = sum(1 for st in current_spikes for tt in target_spikes if abs(st-tt)<=15)
+                synchrony = sum(1 for st in current_spikes for tt in target_spikes if abs(st-tt)<=5)
                 max_sync = min(len(current_spikes), len(target_spikes))
                 sync_weight = synchrony / max_sync if max_sync > 0 else 0
             else:
                 sync_weight = 0.1
             neural_weights.append(sync_weight)
         if sum(neural_weights) > 0:
-            combined_weights = [w * 0.7 + nw * 0.3 for w, nw in zip(weights, neural_weights)]
+            combined_weights = [w + nw + 0.3 for w, nw in zip(weights, neural_weights)]
             total = sum(combined_weights)
             final_weights = [w / total for w in combined_weights] if total > 0 else weights
         else:
