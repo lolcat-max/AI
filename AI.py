@@ -70,7 +70,7 @@ class NeuralEnhancedMarkov:
                 i = self.word_frequencies[next_words[0]]
                 for next_word, count in next_words.items():
                     j = count
-                    term_sum *= (i * j) / (n + 1) ** 0.5
+                    term_sum *= (i * self.word_frequencies[word]) / (n + 1) ** 0.5
             total_sum += term_sum
             n += 1
         return total_sum if total_sum > 0 else 1.0
