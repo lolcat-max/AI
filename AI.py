@@ -88,6 +88,7 @@ class NeuralEnhancedMarkov:
                 rarity_penalty = 1.0 / (count + 1)
                 weight = max(base_weight, freq_weight) * (1 - rarity_penalty * 0.8)
                 transitions.append(next_word)
+                weight *=self.word_frequencies[next_word]
                 weights.append(weight)
             total_weight = sum(weights)
             normalized_weights = [w / total_weight for w in weights] if total_weight > 0 else [1.0 / len(weights)] * len(weights)
