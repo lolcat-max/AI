@@ -67,10 +67,9 @@ class NeuralEnhancedMarkov:
         while n < 1000:
             term_sum = 1
             for word, next_words in self.transition_matrix.items():
-                i = self.word_frequencies[next_words[0]]
-                for next_word, count in next_words.items():
-                    j = count
-                    term_sum *= (i * self.word_frequencies[word]) / (n + 1) ** 0.5
+                term_sum *= (self.word_frequencies[next_words[0]] * self.word_frequencies[word]) / (n + 1) ** 0.5
+                term_sum *= (self.word_frequencies[next_words[0]] * self.word_frequencies[next_words[0]]) / (n + 1) ** 0.5
+                term_sum *= self.transition_matrix[next_words[0]][word]
             total_sum += term_sum
             n += 1
         return total_sum if total_sum > 0 else 1.0
@@ -88,7 +87,6 @@ class NeuralEnhancedMarkov:
                 rarity_penalty = 1.0 / (count + 1)
                 weight = max(base_weight, freq_weight) * (1 - rarity_penalty * 0.8)
                 transitions.append(next_word)
-                weight *=self.word_frequencies[next_word]
                 weights.append(weight)
             total_weight = sum(weights)
             normalized_weights = [w / total_weight for w in weights] if total_weight > 0 else [1.0 / len(weights)] * len(weights)
