@@ -1,4 +1,5 @@
 
+
 import random
 import math
 import numpy as np
@@ -23,7 +24,26 @@ class NeuralEnhancedMarkov:
         self.semantic_clusters = {}
         self.spike_patterns = defaultdict(list)
         self.seed_word = None
-
+    def _calculate_gap_sum(self, gap_id, source, target):
+        """
+        Calculate natural number sum for a gap using multiple sum series.
+        """
+        source_freq = self.word_frequencies.get(source, 1)
+        target_freq = self.word_frequencies.get(target, 1)
+        
+        # Multiple sum series combined
+        arithmetic_sum = gap_id * (gap_id + 1) / 2  # 1+2+3+...+n
+        geometric_factor = (1 - (0.5 ** gap_id)) / (1 - 0.5) if gap_id > 0 else 1
+        logarithmic_sum = sum(math.log(n) for n in range(1, min(gap_id + 1, 10)))
+        frequency_sum = math.sqrt(source_freq * target_freq)
+        
+        # Combine all sums with weights
+        total_sum = (arithmetic_sum * 0.1 + 
+                    geometric_factor * 0.2 + 
+                    logarithmic_sum * 0.3 + 
+                    frequency_sum * 0.4)
+        
+        return total_sum
     def set_seed(self, seed_input):
         """
         Set the seed word(s) for text generation.
@@ -56,7 +76,7 @@ class NeuralEnhancedMarkov:
         for i in range(len(words) - 1):
             current, next = words[i], words[i + 1]
             self.transition_matrix[current][next] += 1
-            self.word_frequencies[current] += 1
+            self.word_frequencies[current] += self._calculate_gap_sum(i, current, next)
         self.series_sum = self._calculate_infinite_series()
         self.model = self._build_weighted_model()
         self._calculate_performance_metrics()
@@ -67,9 +87,10 @@ class NeuralEnhancedMarkov:
         while n < 1000:
             term_sum = 1
             for word, next_words in self.transition_matrix.items():
-                term_sum *= (self.word_frequencies[next_words[0]] * self.word_frequencies[word]) / (n + 1) ** 0.5
-                term_sum *= (self.word_frequencies[next_words[0]] * self.word_frequencies[next_words[0]]) / (n + 1) ** 0.5
-                term_sum *= self.transition_matrix[next_words[0]][word]
+                i = self.word_frequencies[next_words[0]]
+                for next_word, count in next_words.items():
+                    j = count
+                    term_sum *= (i * self.word_frequencies[word]) / (n + 1) ** 0.5
             total_sum += term_sum
             n += 1
         return total_sum if total_sum > 0 else 1.0
@@ -87,6 +108,7 @@ class NeuralEnhancedMarkov:
                 rarity_penalty = 1.0 / (count + 1)
                 weight = max(base_weight, freq_weight) * (1 - rarity_penalty * 0.8)
                 transitions.append(next_word)
+                weight *=self.word_frequencies[next_word]
                 weights.append(weight)
             total_weight = sum(weights)
             normalized_weights = [w / total_weight for w in weights] if total_weight > 0 else [1.0 / len(weights)] * len(weights)
