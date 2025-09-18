@@ -1,5 +1,3 @@
-
-
 import random
 import math
 import numpy as np
@@ -24,26 +22,7 @@ class NeuralEnhancedMarkov:
         self.semantic_clusters = {}
         self.spike_patterns = defaultdict(list)
         self.seed_word = None
-    def _calculate_gap_sum(self, gap_id, source, target):
-        """
-        Calculate natural number sum for a gap using multiple sum series.
-        """
-        source_freq = self.word_frequencies.get(source, 1)
-        target_freq = self.word_frequencies.get(target, 1)
-        
-        # Multiple sum series combined
-        arithmetic_sum = gap_id * (gap_id + 1) / 2  # 1+2+3+...+n
-        geometric_factor = (1 - (0.5 ** gap_id)) / (1 - 0.5) if gap_id > 0 else 1
-        logarithmic_sum = sum(math.log(n) for n in range(1, min(gap_id + 1, 10)))
-        frequency_sum = math.sqrt(source_freq * target_freq)
-        
-        # Combine all sums with weights
-        total_sum = (arithmetic_sum * 0.1 + 
-                    geometric_factor * 0.2 + 
-                    logarithmic_sum * 0.3 + 
-                    frequency_sum * 0.4)
-        
-        return total_sum
+
     def set_seed(self, seed_input):
         """
         Set the seed word(s) for text generation.
@@ -54,17 +33,11 @@ class NeuralEnhancedMarkov:
             self.seed_word = None
             print("Seed cleared. Using random start.")
             return
-
-        # Split the input into words
         seed_words = processed_seed.split()
-        
-        # Check if all words in the phrase are in the vocabulary
         if all(word in self.vocabulary for word in seed_words):
-            # Set the seed to a list if it's a phrase, otherwise a single word
             self.seed_word = seed_words if len(seed_words) > 1 else seed_words[0]
             print(f"Seed set to: '{seed_input.strip()}'")
         else:
-            # If any word is not found, print a warning and use random start
             self.seed_word = None
             print(f"Warning: The seed phrase '{seed_input.strip()}' contains word(s) not found in vocabulary. Using random start.")
 
@@ -76,18 +49,21 @@ class NeuralEnhancedMarkov:
         for i in range(len(words) - 1):
             current, next = words[i], words[i + 1]
             self.transition_matrix[current][next] += 1
-            self.word_frequencies[current] += self._calculate_gap_sum(i, current, next)
+            self.word_frequencies[current] += 1
         self.series_sum = self._calculate_infinite_series()
         self.model = self._build_weighted_model()
         self._calculate_performance_metrics()
 
     def _calculate_infinite_series(self):
+        # This function is now only for the initial model build, providing a baseline value
+        # The main logic is moved to the generation loop for real-time calculation
         total_sum = 0
         n = 0
         while n < 1000:
             term_sum = 1
             for word, next_words in self.transition_matrix.items():
-                i = self.word_frequencies[next_words[0]]
+                if not next_words: continue
+                i = self.word_frequencies[list(next_words.keys())[0]]
                 for next_word, count in next_words.items():
                     j = count
                     term_sum *= (i * self.word_frequencies[word]) / (n + 1) ** 0.5
@@ -138,15 +114,16 @@ class NeuralEnhancedMarkov:
 
     def generate_text(self, max_words=20, creativity_factor=0.3, start_word=None):
         if not self.model: return "No model available."
-        
-        # Use seed word if available and no start_word specified
         if start_word is None and self.seed_word is not None:
             start_word = self.seed_word
-            
-        current_word = start_word.lower() if start_word and start_word.lower() in self.model else random.choice(list(self.model.keys()))
-        while not current_word[0].isalpha():
-            current_word = random.choice(list(self.model.keys()))
-        sentence = [current_word.capitalize()]
+        if isinstance(start_word, list):
+            sentence = [word.capitalize() for word in start_word]
+            current_word = start_word[-1]
+        else:
+            current_word = start_word.lower() if start_word and start_word.lower() in self.model else random.choice(list(self.model.keys()))
+            while not current_word[0].isalpha():
+                current_word = random.choice(list(self.model.keys()))
+            sentence = [current_word.capitalize()]
         generation_path = [current_word]
         for _ in range(max_words - 1):
             if current_word in self.model and self.model[current_word]:
@@ -229,10 +206,10 @@ class NeuralEnhancedMarkov:
         if not self.model: return "No model available."
         if not self.semantic_clusters: self.build_semantic_clusters()
         if not self.spike_patterns: self.simulate_neural_spike_patterns()
-        # Handle multi-word seeds
+        
         if self.seed_word is not None:
             if isinstance(self.seed_word, list):
-                sentence = [self.seed_word[0].capitalize()] + self.seed_word[1:]
+                sentence = [word.capitalize() for word in self.seed_word]
                 current_word = self.seed_word[-1].lower()
             else:
                 current_word = self.seed_word
@@ -240,16 +217,70 @@ class NeuralEnhancedMarkov:
         else:
             current_word = random.choice(list(self.model.keys()))
             sentence = [current_word.capitalize()]
+        
         for _ in range(max_words - len(sentence)):
             if current_word in self.model and self.model[current_word]:
                 words, weights = zip(*self.model[current_word])
-                next_word = self.neural_weighted_selection(current_word, words, weights) if random.random()<neural_strength else np.random.choice(words, p=weights)
+
+                # Real-time infinite series term calculation for dynamic weighting
+                final_weights = weights # Default to pre-calculated weights
+
+                if random.random() < 0.2:
+                    realtime_weights = []
+                    n_step = len(sentence)
+                    for next_word in words:
+                        # Defensive check for zero frequencies
+                        if self.word_frequencies[current_word] == 0:
+                            term = 0
+                        else:
+                            i = self.word_frequencies[next_word]
+                            j = self.transition_matrix[current_word][next_word]
+                            word_freq_factor = self.word_frequencies[current_word]
+                            # The original term had a small bug in its calculation. A single term is more simply
+                            # defined as a simple probability-based value for dynamic weighting.
+                            # We use a simple, robust formula to avoid complex mathematical issues
+                            term = (i + j) / (word_freq_factor + 1e-9)
+                        realtime_weights.append(term)
+                    
+                    total_realtime = sum(realtime_weights)
+                    
+                    if total_realtime > 0:
+                        normalized_realtime = [w / total_realtime for w in realtime_weights]
+                        # Combine pre-calculated weights with real-time weights
+                        combined_weights = [w1 + w2 for w1, w2 in zip(weights, normalized_realtime)]
+                        total_combined = sum(combined_weights)
+                        if total_combined > 0:
+                            final_weights = [w / total_combined for w in combined_weights]
+                        else:
+                            # Fallback to original weights if combined weights sum to zero
+                            final_weights = weights
+                    
+            
+                # Ensure final_weights sum to 1.0 before passing to np.random.choice
+                total_final_weights = sum(final_weights)
+                if total_final_weights > 0:
+                    normalized_final_weights = [w / total_final_weights for w in final_weights]
+                else:
+                    # If all weights are zero for some reason, provide a uniform distribution
+                    normalized_final_weights = [1.0 / len(final_weights)] * len(final_weights)
+
+                # Check if any NaN values still exist and handle them
+                if any(np.isnan(normalized_final_weights)):
+                    normalized_final_weights = [1.0 / len(final_weights)] * len(final_weights)
+
+                if random.random() < neural_strength:
+                    next_word = self.neural_weighted_selection(current_word, words, normalized_final_weights)
+                else:
+                    next_word = np.random.choice(words, p=normalized_final_weights)
+                
                 sentence.append(next_word)
                 current_word = next_word
             else:
                 break
+        
         generated_text = " ".join(sentence)
-        if generated_text[-1] not in ".?!": generated_text += "."
+        if generated_text and generated_text[-1] not in ".?!":
+            generated_text += "."
         return generated_text
 
 # Usage Example
