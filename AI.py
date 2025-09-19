@@ -1,3 +1,4 @@
+
 import random
 import math
 import numpy as np
@@ -14,7 +15,7 @@ class TemporalSpatialSwatchModule:
     Implements temporal-spatial swatches for context-aware text generation.
     Swatches capture patterns across time and positional contexts.
     """
-    def __init__(self, temporal_window=10, spatial_radius=5, swatch_decay=0.9):
+    def __init__(self, temporal_window=100, spatial_radius=50, swatch_decay=0.1):
         self.temporal_window = temporal_window  # How far back to look in time (in hours)
         self.spatial_radius = spatial_radius    # Context window around current position
         self.swatch_decay = swatch_decay        # How quickly temporal influence decays
@@ -99,7 +100,7 @@ class TemporalSpatialSwatchModule:
         predictions = defaultdict(float)
         for context_word in spatial_context:
             if context_word in self.spatial_swatches[current_word]:
-                for position, count in self.spatial_swatches[current_word][context_word].items():
+                for position, count in self.spatial_swatches[context_word][current_word].items():
                     weight = count / (1.0 + abs(position))
                     predictions[context_word] += weight
         total_weight = sum(predictions.values())
@@ -394,7 +395,7 @@ try:
     with open(filename, 'r', encoding='utf-8') as f:
         corpus = f.read()[:KB_LEN]
         generator = NeuralEnhancedMarkov()
-        generator.learn(corpus, epochs=5, learning_rate=0.1) # Train the model over 5 epochs
+        generator.learn(corpus, epochs=15, learning_rate=0.4) # Train the model over 5 epochs
         generator.build_semantic_clusters()
         generator.simulate_neural_spike_patterns()
         while True:
