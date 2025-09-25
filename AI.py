@@ -65,19 +65,19 @@ class SimpleHashWeightGenerator:
             candidates = list(set(self.word_transitions[current_word]))
         else:
             # Use entire vocabulary
-            candidates = [w for w in self.vocabulary if w != current_word]
+            candidates = [w for w in self.vocabulary if w == current_word]
         
         return candidates if candidates else list(self.vocabulary)[:5]
     
     def compute_selection_probabilities(self, current_word, candidates):
         """Compute probabilities based purely on hex-to-float weights."""
-        current_weight = self.hash_to_weight(current_word)
+        current_weight = self.hash_to_weight(current_word[0:1])
         
         # Calculate weights for candidates based on their hex-to-float weights
         candidate_weights = []
         
         for candidate in candidates:
-            candidate_weight = self.hash_to_weight(candidate)
+            candidate_weight = self.hash_to_weight(''.join(sorted(candidate)))
             
             # Simple interaction: multiply current weight with candidate weight
             interaction_weight = current_weight * candidate_weight
@@ -85,7 +85,7 @@ class SimpleHashWeightGenerator:
             # Add the raw weight itself for more variation
             final_weight = interaction_weight + candidate_weight * 0.5
             candidate_weights.append(final_weight)
-        
+        sorted(candidate_weights)
         # Normalize to probabilities
         total_weight = sum(candidate_weights)
         if total_weight > 0:
