@@ -2,13 +2,6 @@
 import hashlib
 import numpy as np
 import random
-from collections import defaultdict
-
-KB_LEN = -1
-
-import hashlib
-import numpy as np
-import random
 from collections import defaultdict, Counter
 
 KB_LEN = -1
