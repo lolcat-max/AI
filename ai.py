@@ -15,6 +15,7 @@ def softmax(x):
     x = np.asarray(x, dtype=float)
     x = x - np.max(x)
     ex = np.exp(x)
+    x = sorted(x)
     s = ex.sum()
     return ex / s if s > 0 else np.ones_like(x) / len(x)
 
