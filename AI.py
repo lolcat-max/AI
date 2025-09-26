@@ -1,3 +1,4 @@
+
 import hashlib
 import numpy as np
 import random
@@ -5,95 +6,143 @@ from collections import defaultdict
 
 KB_LEN = -1
 
+import hashlib
+import numpy as np
+import random
+from collections import defaultdict, Counter
+
+KB_LEN = -1
+
 class SimpleHashWeightGenerator:
     """
-    Simple text generator that converts SHA256 hex directly to float weights.
+    Text generator with SHA256-derived scores, interpolated with
+    a corpus bigram model and an online self bigram model under a
+    bigram constraint mask.
     """
-    def __init__(self):
-        self.word_weights = {}  # Direct hex-to-float mapping
+
+    def __init__(self, alpha=0.75, beta=0.20, gamma=0.05, smoothing=1.0):
+        # Hash weight components
+        self.word_weights = {}
         self.vocabulary = set()
         self.word_transitions = defaultdict(list)
-        
+
+        # Corpus counts
+        self.unigram_counts = Counter()
+        self.bigram_counts = defaultdict(Counter)
+        self.total_unigrams = 0
+
+        # Generated (self) counts
+        self.gen_unigram_counts = Counter()
+        self.gen_bigram_counts = defaultdict(Counter)
+
+        # Mixture weights and smoothing
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.gamma = float(gamma)
+        s = self.alpha + self.beta + self.gamma
+        if s <= 0:
+            raise ValueError("alpha+beta+gamma must be > 0")
+        # normalize in case user passed arbitrary values
+        self.alpha /= s; self.beta /= s; self.gamma /= s
+        self.smoothing = float(smoothing)  # e.g., add-k smoothing
+
     def hash_to_weight(self, word):
-        """Convert word's SHA256 hex directly to a float weight."""
         if word in self.word_weights:
             return self.word_weights[word]
-        
-        # Generate SHA256 hash
-        hash_obj = hashlib.sha256(word.encode('utf-8'))
-        hex_hash = hash_obj.hexdigest()
-        
-        # Convert hex string directly to float
-        # Take first 16 hex characters (64 bits) and convert to int, then normalize
-        hex_segment = hex_hash[:16]
-        int_value = int(hex_segment, 16)
-        max_value = int('f' * 16, 16)  # Maximum 16-char hex value
+        h = hashlib.sha256(word.encode('utf-8')).hexdigest()
+        int_value = int(h[:16], 16)
+        max_value = int('f' * 16, 16)
         weight = int_value / max_value
-        
-        # Store and return
         self.word_weights[word] = weight
         return weight
-    
+
     def build_vocabulary(self, text):
-        """Build vocabulary and compute weights for all words."""
         words = text.lower().split()
-        unique_words = list(set(words))
-        
-        print(f"Building vocabulary with {len(unique_words)} words...")
-        
-        # Build word transitions from text
-        for i in range(len(words) - 1):
-            current_word = words[i]
-            next_word = words[i + 1]
-            self.word_transitions[current_word].append(next_word)
-            self.vocabulary.add(current_word)
-            self.vocabulary.add(next_word)
-        
-        # Compute hex-to-float weights for all vocabulary words
-        for word in sorted(self.vocabulary):
-            weight = self.hash_to_weight(word)
-            hex_hash = hashlib.sha256(word.encode()).hexdigest()
-            print(f"  '{word:12s}' -> hex: {hex_hash[:16]} -> weight: {weight:.6f}")
-        
-        print(f"Vocabulary built with {len(self.vocabulary)} words")
+        # Build counts
+        for i, w in enumerate(words):
+            self.unigram_counts[w] += 1
+            self.vocabulary.add(w)
+            if i < len(words) - 1:
+                nxt = words[i + 1]
+                self.bigram_counts[w][nxt] += 1
+                self.word_transitions[w].append(nxt)
+                self.vocabulary.add(nxt)
+        self.total_unigrams = sum(self.unigram_counts.values())
+
+        # Precompute hash weights for vocabulary (optional)
+        for w in sorted(self.vocabulary):
+            _ = self.hash_to_weight(w)
         return len(self.vocabulary)
-    
+
+    def get_corpus_bigram_prob(self, prev_w, w):
+        # Add-k smoothing
+        c_big = self.bigram_counts[prev_w][w]
+        c_prev = self.unigram_counts[prev_w]
+        V = max(1, len(self.vocabulary))
+        return (c_big + self.smoothing) / (c_prev + self.smoothing * V)
+
+    def get_generated_bigram_prob(self, prev_w, w):
+        c_big = self.gen_bigram_counts[prev_w][w]
+        c_prev = self.gen_unigram_counts[prev_w]
+        V = max(1, len(self.vocabulary))
+        return (c_big + self.smoothing) / (c_prev + self.smoothing * V)
+
     def get_candidates_for_word(self, current_word, use_transitions=True):
-        """Get candidate next words, optionally using learned transitions."""
-        if use_transitions and current_word in self.word_transitions:
-            # Use words that actually followed this word in training
-            candidates = list(set(self.word_transitions[current_word]))
+        if use_transitions and current_word in self.word_transitions and self.word_transitions[current_word]:
+            # Constrained: only bigrams seen in corpus from current_word
+            return sorted(set(self.word_transitions[current_word]))
+        # Fallback: allow a small pool if no outgoing edges
+        return sorted(list(self.vocabulary))[: min(32, len(self.vocabulary))]
+
+    def compute_interpolated_probabilities(self, current_word, candidates):
+        # Normalize hash scores over candidates to [0,1] distribution
+        hash_scores = np.array([self.hash_to_weight(''.join(sorted(c))) for c in candidates], dtype=float)
+        if hash_scores.sum() == 0.0:
+            hash_probs = np.ones_like(hash_scores) / len(candidates)
         else:
-            # Use entire vocabulary
-            candidates = [w for w in self.vocabulary if w == current_word]
-        
-        return candidates if candidates else list(self.vocabulary)[:5]
-    
-    def compute_selection_probabilities(self, current_word, candidates):
-        """Compute probabilities based purely on hex-to-float weights."""
-        current_weight = self.hash_to_weight(current_word[0:1])
-        
-        # Calculate weights for candidates based on their hex-to-float weights
-        candidate_weights = []
-        
-        for candidate in candidates:
-            candidate_weight = self.hash_to_weight(''.join(sorted(candidate)))
-            
-            # Simple interaction: multiply current weight with candidate weight
-            interaction_weight = current_weight * candidate_weight
-            
-            # Add the raw weight itself for more variation
-            final_weight = interaction_weight + candidate_weight * 0.5
-            candidate_weights.append(final_weight)
-        sorted(candidate_weights)
-        # Normalize to probabilities
-        total_weight = sum(candidate_weights)
-        if total_weight > 0:
-            probabilities = [w / total_weight for w in candidate_weights]
-        else:
-            probabilities = [1.0 / len(candidates)] * len(candidates)
-        
-        return probabilities
+            hash_probs = hash_scores / hash_scores.sum()
+
+        # Corpus/self bigram probabilities
+        corp_probs = np.array([self.get_corpus_bigram_prob(current_word, c) for c in candidates], dtype=float)
+        corp_probs /= corp_probs.sum() if corp_probs.sum() > 0 else len(candidates)
+
+        gen_probs = np.array([self.get_generated_bigram_prob(current_word, c) for c in candidates], dtype=float)
+        gen_probs /= gen_probs.sum() if gen_probs.sum() > 0 else len(candidates)
+
+        # Linear interpolation
+        mix = self.alpha * corp_probs + self.beta * gen_probs + self.gamma * hash_probs
+        # Renormalize to guard against numerical issues
+        total = mix.sum()
+        if total <= 0:
+            return np.ones_like(mix) / len(candidates)
+        return mix / total
+
+    def update_generated_counts(self, prev_w, w):
+        self.gen_unigram_counts[prev_w] += 1
+        self.gen_unigram_counts[w] += 1
+        self.gen_bigram_counts[prev_w][w] += 1
+
+    def generate_text(self, start_word, max_words=15, use_transitions=True):
+        if not self.vocabulary:
+            return ""
+        start = start_word.lower()
+        if start not in self.vocabulary:
+            start = random.choice(list(self.vocabulary))
+        current = start
+        generated = [current]
+
+        for _ in range(max_words - 1):
+            candidates = self.get_candidates_for_word(current, use_transitions=use_transitions)
+            if not candidates:
+                break
+            probs = self.compute_interpolated_probabilities(current, candidates)
+            next_word = np.random.choice(candidates, p=probs)
+            self.update_generated_counts(current, next_word)
+            generated.append(next_word)
+            current = next_word
+
+        return " ".join(generated)
+
     
     def generate_text(self, start_word, max_words=15, use_transitions=True):
         """Generate text using hex-to-float weights only."""
@@ -117,7 +166,7 @@ class SimpleHashWeightGenerator:
                 break
             
             # Compute probabilities based on hex weights
-            probabilities = self.compute_selection_probabilities(current_word, candidates)
+            probabilities = self.compute_interpolated_probabilities(current_word, candidates)
             
             # Select next word
             next_word = np.random.choice(candidates, p=probabilities)
