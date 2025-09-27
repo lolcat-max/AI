@@ -5,6 +5,7 @@ import random
 from collections import defaultdict, Counter
 import unicodedata
 import re
+from datasets import load_dataset # New import for Hugging Face datasets
 
 KB_LEN = 9999
 
@@ -205,14 +206,28 @@ class PatternRepeatingHashWeightGenerator(SimpleHashWeightGenerator):
     def build_vocabulary(self, text):
         self.find_repeating_patterns(text)
         return super().build_vocabulary(text)
-KB_LEN = 99999
-# Example usage
+
 try:
-    with open(input("Filename: "), 'r', encoding='utf-8') as f:
-        corpus = f.read()[:KB_LEN]
-except FileNotFoundError:
-    print("File not found, using sample text")
-    corpus = "the quick brown fox jumps over the lazy dog"
+    # Load 'ag_news' dataset, taking the first 1000 examples from the train split
+    dataset = load_dataset('ag_news', split='train[:1000]') 
+    
+    corpus_parts = []
+    # Concatenate the 'text' field from each example
+    for item in dataset:
+        if 'text' in item and item['text']:
+            corpus_parts.append(item['text'])
+        
+    corpus = " ".join(corpus_parts)[:KB_LEN]
+    
+    if not corpus or len(corpus.split()) < 20:
+        raise ValueError("Corpus too small or empty after loading dataset.")
+
+except Exception as e:
+    print(f"Error loading dataset or extracting text (Did you install 'datasets'?): {e}")
+    print("Falling back to sample text for demonstration.")
+    corpus = "the quick brown fox jumps over the lazy dog and the lazy dog sleeps and the fox runs quick and slow"
+    
+print(f"Corpus loaded successfully. Total size: {len(corpus)} characters.")
 generator = PatternRepeatingHashWeightGenerator()
 generator.build_vocabulary(corpus)
 while True:
