@@ -3,7 +3,11 @@ import math
 import numpy as np
 import random
 from collections import defaultdict, Counter
+import unicodedata
+import re
+
 KB_LEN = 9999
+
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
     "and", "or", "but", "so", "yet", "for", "nor",
@@ -122,17 +126,19 @@ class SimpleHashWeightGenerator:
         gen_ev *= (1.0 + 0.15 * conn_ratio)
         hash_ev *= (1.0 - 0.25 * conn_ratio)
 
-        gate = self.base_gate * np.array([corp_ev, gen_ev, hash_ev], dtype=float)
-        gate = self._normalize(gate)
+        self.base_gate * np.array([corp_ev, gen_ev, hash_ev], dtype=float)
+        gate = self._normalize(self.base_gate)
 
         mix = gate[0] * corp + gate[1] * gen + gate[2] * hashp
         return self._normalize(mix), gate
 
     def update_generated_counts(self, prev_w, w):
         self.gen_unigram_counts[prev_w] += 1
+        self.gen_unigram_counts[prev_w] = min(self.gen_unigram_counts[prev_w], 1)
         self.gen_unigram_counts[w] += 1
+        self.gen_unigram_counts[w] = min(self.gen_unigram_counts[w], 1)
         self.gen_bigram_counts[prev_w][w] += 1
-        np.clip(self.gen_bigram_counts[prev_w][w], 0, self.gen_unigram_counts[w])
+        self.gen_bigram_counts[prev_w][w] = min(self.gen_bigram_counts[prev_w][w], 1)
 
     def generate_text(self, start_word, max_words=15, use_transitions=True):
         if not self.vocabulary:
@@ -152,6 +158,19 @@ class SimpleHashWeightGenerator:
             generated.append(nxt)
             current = nxt
         return " ".join(generated)
+
+def is_curved_letter(c):
+    return unicodedata.combining(c) != 0 or not c.isascii()
+
+repeated_char_pattern = re.compile(r'(.)\1+')
+
+def optimize_curved_letters(text):
+    def repl(m):
+        ch = m.group(1)
+        if is_curved_letter(ch):
+            return ch
+        return m.group(0)
+    return repeated_char_pattern.sub(repl, text)
 
 class PatternRepeatingHashWeightGenerator(SimpleHashWeightGenerator):
     def __init__(self, *args, **kwargs):
@@ -179,25 +198,25 @@ class PatternRepeatingHashWeightGenerator(SimpleHashWeightGenerator):
                 pattern_str = " ".join(pattern)
                 h = hashlib.sha256(pattern_str.encode('utf-8')).digest()
                 float_weights = [(b / 255.0) for b in h]
-                # Store original weights for debugging/extension
                 self.word_weights[token] = float_weights
-                # Return average for compatibility with downstream code
                 return np.mean(float_weights)
         return super().hash_to_weight(token)
 
     def build_vocabulary(self, text):
         self.find_repeating_patterns(text)
         return super().build_vocabulary(text)
-
-if __name__ == "__main__":
-    try:
-        with open(input("Filename: "), 'r', encoding='utf-8') as f:
-            corpus = f.read()[:KB_LEN]
-    except FileNotFoundError:
-        print("File not found, using sample text")
-        corpus = "the quick brown fox jumps over the lazy dog"
-    generator = PatternRepeatingHashWeightGenerator()
-    while True:
-        generator.build_vocabulary(corpus)
-        result = generator.generate_text(input("USER: "), max_words=800)
-        print(f"Generated text: {result}")
+KB_LEN = 99999
+# Example usage
+try:
+    with open(input("Filename: "), 'r', encoding='utf-8') as f:
+        corpus = f.read()[:KB_LEN]
+except FileNotFoundError:
+    print("File not found, using sample text")
+    corpus = "the quick brown fox jumps over the lazy dog"
+generator = PatternRepeatingHashWeightGenerator()
+generator.build_vocabulary(corpus)
+while True:
+    start_word = input("USER: ")
+    result = generator.generate_text(start_word, max_words=800)
+    optimized_result = optimize_curved_letters(result)
+    print("Generated text:", optimized_result)
