@@ -1,23 +1,18 @@
-import hashlib, math, numpy as np, random
+import hashlib
+import math
+import numpy as np
+import random
 from collections import defaultdict, Counter
-KB_LEN = -1
+KB_LEN = 9999
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
     "and", "or", "but", "so", "yet", "for", "nor",
     "however", "therefore", "moreover", "meanwhile", "then", "thus",
-    "of", "to", "in", "on", "at"  # light adjuncts; adjust as desired
+    "of", "to", "in", "on", "at"
 }
 
 def is_connective(w):
     return w in CONNECTIVES
-
-def softmax(x):
-    x = np.asarray(x, dtype=float)
-    x = x - np.max(x)
-    ex = np.exp(x)
-    x = sorted(x)
-    s = ex.sum()
-    return ex / s if s > 0 else np.ones_like(x) / len(x)
 
 class SimpleHashWeightGenerator:
     def __init__(self, alpha=0.15, beta=0.20, gamma=0.05, smoothing=1.0, rng=None):
@@ -33,7 +28,7 @@ class SimpleHashWeightGenerator:
         if s <= 0:
             raise ValueError("alpha+beta+gamma must be > 0")
         self.alpha = float(alpha) / s
-        self.beta  = float(beta)  / s
+        self.beta = float(beta) / s
         self.gamma = float(gamma) / s
         self.base_gate = np.array([self.alpha, self.beta, self.gamma], dtype=float)
         self.smoothing = float(smoothing)
@@ -50,7 +45,6 @@ class SimpleHashWeightGenerator:
         return w
 
     def context_hash_weight(self, prev_w, w):
-        # Context-conditional hash: treat the bigram as the “meta connective”.
         return self.hash_to_weight(f"{prev_w}→{w}")
 
     def build_vocabulary(self, text):
@@ -83,11 +77,9 @@ class SimpleHashWeightGenerator:
     def get_candidates_for_word(self, current_word, use_transitions=True, cap=64):
         if use_transitions and self.word_transitions[current_word]:
             return sorted(set(self.word_transitions[current_word]))
-        # small, but diverse fallback
         vocab = sorted(self.vocabulary)
         if len(vocab) <= cap:
             return vocab
-        # stratified sample: even indices provide spread
         step = max(1, len(vocab) // cap)
         return vocab[::step][:cap]
 
@@ -104,37 +96,34 @@ class SimpleHashWeightGenerator:
         return 0.0 if Hmax == 0 else min(1.0, H / Hmax)
 
     def compute_interpolated_probabilities(self, current_word, candidates):
-        # Per-stream distributions
         corp = np.array([self.get_corpus_bigram_prob(current_word, c) for c in candidates], dtype=float)
         corp = self._normalize(corp)
 
-        gen  = np.array([self.get_generated_bigram_prob(current_word, c) for c in candidates], dtype=float)
-        gen  = self._normalize(gen)
+        gen = np.array([self.get_generated_bigram_prob(current_word, c) for c in candidates], dtype=float)
+        gen = self._normalize(gen)
 
-        # Context-conditional hash stream; blend token and bigram hash
         h_tok = np.array([self.hash_to_weight(c) for c in candidates], dtype=float)
         h_ctx = np.array([self.context_hash_weight(current_word, c) for c in candidates], dtype=float)
         hashp = 0.5 * h_tok + 0.5 * h_ctx
         hashp = self._normalize(hashp)
 
-        # Evidence-driven gate (meta-connective aware)
         c_prev = self.unigram_counts[current_word]
         out_deg = sum(self.bigram_counts[current_word].values())
 
-        corp_ent = self._entropy01(corp)   # high entropy => less certainty
-        gen_ent  = self._entropy01(gen)
+        corp_ent = self._entropy01(corp)
+        gen_ent = self._entropy01(gen)
 
         corp_ev = (1.0 if out_deg > 0 else 0.35) * (1.0 - 0.6 * corp_ent)
-        gen_ev  = (1.0 if self.gen_unigram_counts[current_word] > 0 else 0.5) * (1.0 - 0.6 * gen_ent)
-        hash_ev = 1.0  # steady fallback
+        gen_ev = (1.0 if self.gen_unigram_counts[current_word] > 0 else 0.5) * (1.0 - 0.6 * gen_ent)
+        hash_ev = 1.0
 
         conn_ratio = sum(is_connective(c) for c in candidates) / max(1, len(candidates))
-        corp_ev *= (1.0 + 0.20 * conn_ratio)   # connectives favor data-driven streams
-        gen_ev  *= (1.0 + 0.15 * conn_ratio)
-        hash_ev *= (1.0 - 0.25 * conn_ratio)   # reduce hash reliance when structure words dominate
+        corp_ev *= (1.0 + 0.20 * conn_ratio)
+        gen_ev *= (1.0 + 0.15 * conn_ratio)
+        hash_ev *= (1.0 - 0.25 * conn_ratio)
 
         gate = self.base_gate * np.array([corp_ev, gen_ev, hash_ev], dtype=float)
-        gate = self._normalize(gate)  # λc, λg, λh
+        gate = self._normalize(gate)
 
         mix = gate[0] * corp + gate[1] * gen + gate[2] * hashp
         return self._normalize(mix), gate
@@ -143,6 +132,7 @@ class SimpleHashWeightGenerator:
         self.gen_unigram_counts[prev_w] += 1
         self.gen_unigram_counts[w] += 1
         self.gen_bigram_counts[prev_w][w] += 1
+        np.clip(self.gen_bigram_counts[prev_w][w], 0, self.gen_unigram_counts[w])
 
     def generate_text(self, start_word, max_words=15, use_transitions=True):
         if not self.vocabulary:
@@ -163,8 +153,42 @@ class SimpleHashWeightGenerator:
             current = nxt
         return " ".join(generated)
 
+class PatternRepeatingHashWeightGenerator(SimpleHashWeightGenerator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.repeating_patterns = {}
 
-# Usage example
+    def find_repeating_patterns(self, text, min_len=2, max_len=6):
+        words = text.lower().split()
+        length = len(words)
+        patterns = Counter()
+
+        for l in range(min_len, max_len + 1):
+            seen = defaultdict(int)
+            for start in range(length - l + 1):
+                subseq = tuple(words[start:start+l])
+                seen[subseq] += 1
+            for p, c in seen.items():
+                if c > 1:
+                    patterns[p] += l
+        self.repeating_patterns = patterns
+
+    def hash_to_weight(self, token):
+        for pattern in self.repeating_patterns:
+            if token in pattern:
+                pattern_str = " ".join(pattern)
+                h = hashlib.sha256(pattern_str.encode('utf-8')).digest()
+                float_weights = [(b / 255.0) for b in h]
+                # Store original weights for debugging/extension
+                self.word_weights[token] = float_weights
+                # Return average for compatibility with downstream code
+                return np.mean(float_weights)
+        return super().hash_to_weight(token)
+
+    def build_vocabulary(self, text):
+        self.find_repeating_patterns(text)
+        return super().build_vocabulary(text)
+
 if __name__ == "__main__":
     try:
         with open(input("Filename: "), 'r', encoding='utf-8') as f:
@@ -172,15 +196,8 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print("File not found, using sample text")
         corpus = "the quick brown fox jumps over the lazy dog"
-    
-    # Create and test generator
-    generator = SimpleHashWeightGenerator()
-    generator.build_vocabulary(corpus)
-    
+    generator = PatternRepeatingHashWeightGenerator()
     while True:
-        try:
-            # Generate text using hash weights
-            result = generator.generate_text(input("USER: "), max_words=800)
-            print(f"\nGenerated text: {result}")
-        except KeyboardInterrupt:
-            break
+        generator.build_vocabulary(corpus)
+        result = generator.generate_text(input("USER: "), max_words=800)
+        print(f"Generated text: {result}")
