@@ -284,8 +284,8 @@ try:
         corpus_parts = []
         # **FIXED**: Use the correct feature name 'question' instead of 'text'
         for item in dataset:
-            if 'question' in item and item['question']:
-                corpus_parts.append(item['question'])
+            if 'reference_answer' in item and item['reference_answer']:
+                corpus_parts.append(item['reference_answer'])
             
         corpus = " ".join(corpus_parts)[:KB_LEN]
         
