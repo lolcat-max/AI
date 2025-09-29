@@ -294,13 +294,11 @@ if load_dataset:
         return item.get(field_name, None)
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # Process questions
         question_futures = {executor.submit(extract_field, item, 'question'): item for item in dataset}
+        answer_futures = {executor.submit(extract_field, item, 'reference_answer'): item for item in dataset}
+
         question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
-        
-        # Process answers
-        answer_futures = {executor.submit(extract_field, item, 'reference_answer'): item for item in dataset}[:KB_LEN]
-        answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()][:KB_LEN]
+        answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()]
 
 print(f"Corpus loaded successfully. Total size: {len(question_parts)+len(answer_parts)} characters.")
 
@@ -345,4 +343,3 @@ while True:
         break
 
      
-
