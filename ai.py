@@ -309,7 +309,7 @@ generatorA = PatternRepeatingAnnealedHashWeightGenerator(
     min_temp=0.1,
     cooling_rate=0.95
 )
-generatorA.build_vocabulary(question_parts)
+generatorA.build_vocabulary(' '.join(question_parts))
 
 # Initialize generator with annealing parameters
 generatorB = PatternRepeatingAnnealedHashWeightGenerator(
@@ -317,7 +317,7 @@ generatorB = PatternRepeatingAnnealedHashWeightGenerator(
     min_temp=0.1,
     cooling_rate=0.95
 )
-generatorB.build_vocabulary(answer_parts)
+generatorB.build_vocabulary(' '.join(answer_parts))
 
 while True:
     try:
