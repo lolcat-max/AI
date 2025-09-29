@@ -274,19 +274,18 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
 
     def build_vocabulary(self, text):
         self.find_repeating_patterns(text)
-        return super().build_vocabulary(text)
+        return super().build_vocabulary(text) 
 
 # Load dataset and build corpus
 try:
     if load_dataset:
-        # Load 'ag_news' dataset, taking the first 1000 examples from the train split
-        dataset = load_dataset('ag_news', split='train[:1000]') 
+        dataset = load_dataset('facebook/natural_reasoning', split='train') 
         
         corpus_parts = []
-        # Concatenate the 'text' field from each example
+        # **FIXED**: Use the correct feature name 'question' instead of 'text'
         for item in dataset:
-            if 'text' in item and item['text']:
-                corpus_parts.append(item['text'])
+            if 'question' in item and item['question']:
+                corpus_parts.append(item['question'])
             
         corpus = " ".join(corpus_parts)[:KB_LEN]
         
@@ -331,4 +330,3 @@ while True:
     except (KeyboardInterrupt, EOFError):
         print("\nExiting program.")
         break
-
