@@ -5,13 +5,16 @@ import random
 from collections import defaultdict, Counter
 import unicodedata
 import re
+from tqdm import tqdm
+import concurrent.futures
+
 try:
     from datasets import load_dataset # Hugging Face datasets
 except ImportError:
     print("datasets library not found. Using fallback corpus.")
     load_dataset = None
 
-KB_LEN = 9999
+KB_LEN = 99999
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -41,6 +44,13 @@ class AnnealedHashWeightGenerator:
         self.min_temp = min_temp
         self.cooling_rate = cooling_rate
         self.iteration = 0
+        
+        # Annealing parameters
+        self.initial_tempB = initial_temp
+        self.current_tempB = initial_temp
+        self.min_tempB = min_temp
+        self.cooling_rateB = cooling_rate
+        self.iterationB = 0
         
         s = float(alpha) + float(beta) + float(gamma)
         if s <= 0:
@@ -276,41 +286,44 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
         self.find_repeating_patterns(text)
         return super().build_vocabulary(text) 
 
-# Load dataset and build corpus
-try:
-    if load_dataset:
-        dataset = load_dataset('facebook/natural_reasoning', split='train') 
-        
-        corpus_parts = []
-        # **FIXED**: Use the correct feature name 'question' instead of 'text'
-        for item in dataset:
-            if 'reference_answer' in item and item['reference_answer']:
-                corpus_parts.append(item['reference_answer'])
-            
-        corpus = " ".join(corpus_parts)[:KB_LEN]
-        
-        if not corpus or len(corpus.split()) < 20:
-            raise ValueError("Corpus too small or empty after loading dataset.")
-    else:
-        raise ImportError("datasets library not available")
+# Load dataset and build corpus using multithreading
+question_parts = []
+answer_parts = []
 
-except Exception as e:
-    print(f"Error loading dataset or extracting text: {e}")
-    print("Falling back to sample text for demonstration.")
-    corpus = "the quick brown fox jumps over the lazy dog and the lazy dog sleeps and the fox runs quick and slow"
+if load_dataset:
+    print("Loading dataset...")
+    dataset = load_dataset('facebook/natural_reasoning', split='train')
     
-print(f"Corpus loaded successfully. Total size: {len(corpus)} characters.")
+    def extract_field(item, field_name):
+        return item.get(field_name, None)
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Process questions
+        question_futures = {executor.submit(extract_field, item, 'question'): item for item in dataset}
+        question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
+        
+        # Process answers
+        answer_futures = {executor.submit(extract_field, item, 'reference_answer'): item for item in dataset}[:KB_LEN]
+        answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()][:KB_LEN]
+
+print(f"Corpus loaded successfully. Total size: {len(question_parts)+len(answer_parts)} characters.")
+
 
 # Initialize generator with annealing parameters
-generator = PatternRepeatingAnnealedHashWeightGenerator(
+generatorA = PatternRepeatingAnnealedHashWeightGenerator(
     initial_temp=5.0,
     min_temp=0.1,
     cooling_rate=0.95
 )
-generator.build_vocabulary(corpus)
+generatorA.build_vocabulary(question_parts)
 
-print(f"Vocabulary built: {len(generator.vocabulary)} words")
-print(f"Initial temperature: {generator.current_temp:.3f}")
+# Initialize generator with annealing parameters
+generatorB = PatternRepeatingAnnealedHashWeightGenerator(
+    initial_temp=5.0,
+    min_temp=0.1,
+    cooling_rate=0.95
+)
+generatorB.build_vocabulary(answer_parts)
 
 while True:
     try:
@@ -319,10 +332,14 @@ while True:
             break
         
         # Reset temperature for each new generation
-        generator.current_temp = generator.initial_temp
-        generator.iteration = 0
+        generatorA.current_temp = generator.initial_temp
+        generatorA.iteration = 0
         
-        result = generator.generate_text(start_word, max_words=500)
+        # Reset temperature for each new generation
+        generatorB.current_tempB = generator.initial_tempB
+        generatorB.iterationB = 0
+        
+        result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=500), max_words=500)
         optimized_result = optimize_curved_letters(result)
         print(f"Generated text: {optimized_result}")
         print(f"Final temperature: {generator.current_temp:.3f}")
@@ -330,3 +347,5 @@ while True:
     except (KeyboardInterrupt, EOFError):
         print("\nExiting program.")
         break
+
+     
