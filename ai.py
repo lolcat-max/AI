@@ -5,9 +5,13 @@ import random
 from collections import defaultdict, Counter
 import unicodedata
 import re
-from datasets import load_dataset # New import for Hugging Face datasets
+try:
+    from datasets import load_dataset # Hugging Face datasets
+except ImportError:
+    print("datasets library not found. Using fallback corpus.")
+    load_dataset = None
 
-KB_LEN = 9999
+KB_LEN = 99999
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -19,8 +23,9 @@ CONNECTIVES = {
 def is_connective(w):
     return w in CONNECTIVES
 
-class SimpleHashWeightGenerator:
-    def __init__(self, alpha=0.15, beta=0.20, gamma=0.05, smoothing=1.0, rng=None):
+class AnnealedHashWeightGenerator:
+    def __init__(self, alpha=0.15, beta=0.20, gamma=0.05, smoothing=1.0, rng=None, 
+                 initial_temp=10.0, min_temp=0.01, cooling_rate=0.98):
         self.word_weights = {}
         self.vocabulary = set()
         self.word_transitions = defaultdict(list)
@@ -29,6 +34,14 @@ class SimpleHashWeightGenerator:
         self.total_unigrams = 0
         self.gen_unigram_counts = Counter()
         self.gen_bigram_counts = defaultdict(Counter)
+        
+        # Annealing parameters
+        self.initial_temp = initial_temp
+        self.current_temp = initial_temp
+        self.min_temp = min_temp
+        self.cooling_rate = cooling_rate
+        self.iteration = 0
+        
         s = float(alpha) + float(beta) + float(gamma)
         if s <= 0:
             raise ValueError("alpha+beta+gamma must be > 0")
@@ -39,32 +52,74 @@ class SimpleHashWeightGenerator:
         self.smoothing = float(smoothing)
         self.rng = np.random.default_rng(rng)
 
+    def anneal_hash_weight(self, token, base_weight):
+        """Apply simulated annealing to hash weights."""
+        if self.current_temp <= self.min_temp:
+            return base_weight
+            
+        # Generate a neighbor weight by adding noise
+        noise_factor = 0.1
+        neighbor_weight = base_weight + self.rng.normal(0, noise_factor * self.current_temp)
+        neighbor_weight = max(0.0, min(1.0, neighbor_weight))  # Clamp to [0,1]
+        
+        # Energy function (we want to maximize entropy in early stages)
+        def energy(weight):
+            # Penalize weights too close to 0 or 1 when temperature is high
+            entropy_bonus = -abs(weight - 0.5) * self.current_temp / self.initial_temp
+            return -weight + entropy_bonus
+        
+        current_energy = energy(base_weight)
+        neighbor_energy = energy(neighbor_weight)
+        
+        # Acceptance probability
+        if neighbor_energy < current_energy:
+            return neighbor_weight
+        else:
+            acceptance_prob = math.exp((current_energy - neighbor_energy) / self.current_temp)
+            if self.rng.random() < acceptance_prob:
+                return neighbor_weight
+            else:
+                return base_weight
+
     def hash_to_weight(self, token):
         if token in self.word_weights:
             return self.word_weights[token]
+        
+        # Base SHA256 hash weight
         h = hashlib.sha256(token.encode('utf-8')).hexdigest()
         iv = int(h[:16], 16)
         mv = int('f' * 16, 16)
-        w = iv / mv
-        self.word_weights[token] = w
-        return w
+        base_weight = iv / mv
+        
+        # Apply annealing to the weight
+        annealed_weight = self.anneal_hash_weight(token, base_weight)
+        
+        self.word_weights[token] = annealed_weight
+        return annealed_weight
 
     def context_hash_weight(self, prev_w, w):
         return self.hash_to_weight(f"{prev_w}→{w}")
+
+    def update_temperature(self):
+        """Cool down the temperature after each iteration."""
+        self.iteration += 1
+        self.current_temp = max(self.min_temp, self.current_temp * self.cooling_rate)
 
     def build_vocabulary(self, text):
         words = text.lower().split()
         for i, w in enumerate(words):
             self.unigram_counts[w] += 1
             self.vocabulary.add(w)
+            _ = []
+            for word in self.vocabulary:
+                _.append(self.hash_to_weight(word))
             if i < len(words) - 1:
                 nxt = words[i + 1]
                 self.bigram_counts[w][nxt] += 1
                 self.word_transitions[w].append(nxt)
                 self.vocabulary.add(nxt)
         self.total_unigrams = sum(self.unigram_counts.values())
-        for w in self.vocabulary:
-            _ = self.hash_to_weight(w)
+        
         return len(self.vocabulary)
 
     def get_corpus_bigram_prob(self, prev_w, w):
@@ -107,6 +162,7 @@ class SimpleHashWeightGenerator:
         gen = np.array([self.get_generated_bigram_prob(current_word, c) for c in candidates], dtype=float)
         gen = self._normalize(gen)
 
+        # Apply annealed hash weights
         h_tok = np.array([self.hash_to_weight(c) for c in candidates], dtype=float)
         h_ctx = np.array([self.context_hash_weight(current_word, c) for c in candidates], dtype=float)
         hashp = 0.5 * h_tok + 0.5 * h_ctx
@@ -127,8 +183,12 @@ class SimpleHashWeightGenerator:
         gen_ev *= (1.0 + 0.15 * conn_ratio)
         hash_ev *= (1.0 - 0.25 * conn_ratio)
 
-        self.base_gate * np.array([corp_ev, gen_ev, hash_ev], dtype=float)
-        gate = self._normalize(self.base_gate)
+        # Temperature-influenced gating
+        temp_influence = self.current_temp / self.initial_temp
+        hash_ev *= (1.0 + temp_influence)  # Give more weight to exploration at high temp
+
+        gate_weights = np.array([corp_ev, gen_ev, hash_ev], dtype=float)
+        gate = self._normalize(gate_weights)
 
         mix = gate[0] * corp + gate[1] * gen + gate[2] * hashp
         return self._normalize(mix), gate
@@ -149,6 +209,7 @@ class SimpleHashWeightGenerator:
             start = random.choice(tuple(self.vocabulary))
         current = start
         generated = [current]
+        
         for _ in range(max_words - 1):
             cands = self.get_candidates_for_word(current, use_transitions=use_transitions)
             if not cands:
@@ -158,6 +219,10 @@ class SimpleHashWeightGenerator:
             self.update_generated_counts(current, nxt)
             generated.append(nxt)
             current = nxt
+            
+            # Update temperature after each word generation
+            self.update_temperature()
+            
         return " ".join(generated)
 
 def is_curved_letter(c):
@@ -173,7 +238,7 @@ def optimize_curved_letters(text):
         return m.group(0)
     return repeated_char_pattern.sub(repl, text)
 
-class PatternRepeatingHashWeightGenerator(SimpleHashWeightGenerator):
+class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.repeating_patterns = {}
@@ -194,44 +259,75 @@ class PatternRepeatingHashWeightGenerator(SimpleHashWeightGenerator):
         self.repeating_patterns = patterns
 
     def hash_to_weight(self, token):
+        # Check if token is part of a repeating pattern first
         for pattern in self.repeating_patterns:
             if token in pattern:
                 pattern_str = " ".join(pattern)
                 h = hashlib.sha256(pattern_str.encode('utf-8')).digest()
                 float_weights = [(b / 255.0) for b in h]
-                self.word_weights[token] = float_weights
-                return np.mean(float_weights)
+                base_weight = np.mean(float_weights)
+                # Apply annealing to pattern-based weights too
+                annealed_weight = self.anneal_hash_weight(token, base_weight)
+                self.word_weights[token] = annealed_weight
+                return annealed_weight
         return super().hash_to_weight(token)
 
     def build_vocabulary(self, text):
         self.find_repeating_patterns(text)
         return super().build_vocabulary(text)
 
+# Load dataset and build corpus
 try:
-    # Load 'ag_news' dataset, taking the first 1000 examples from the train split
-    dataset = load_dataset('ag_news', split='train[:1000]') 
-    
-    corpus_parts = []
-    # Concatenate the 'text' field from each example
-    for item in dataset:
-        if 'text' in item and item['text']:
-            corpus_parts.append(item['text'])
+    if load_dataset:
+        # Load 'ag_news' dataset, taking the first 1000 examples from the train split
+        dataset = load_dataset('ag_news', split='train[:1000]') 
         
-    corpus = " ".join(corpus_parts)[:KB_LEN]
-    
-    if not corpus or len(corpus.split()) < 20:
-        raise ValueError("Corpus too small or empty after loading dataset.")
+        corpus_parts = []
+        # Concatenate the 'text' field from each example
+        for item in dataset:
+            if 'text' in item and item['text']:
+                corpus_parts.append(item['text'])
+            
+        corpus = " ".join(corpus_parts)[:KB_LEN]
+        
+        if not corpus or len(corpus.split()) < 20:
+            raise ValueError("Corpus too small or empty after loading dataset.")
+    else:
+        raise ImportError("datasets library not available")
 
 except Exception as e:
-    print(f"Error loading dataset or extracting text (Did you install 'datasets'?): {e}")
+    print(f"Error loading dataset or extracting text: {e}")
     print("Falling back to sample text for demonstration.")
     corpus = "the quick brown fox jumps over the lazy dog and the lazy dog sleeps and the fox runs quick and slow"
     
 print(f"Corpus loaded successfully. Total size: {len(corpus)} characters.")
-generator = PatternRepeatingHashWeightGenerator()
+
+# Initialize generator with annealing parameters
+generator = PatternRepeatingAnnealedHashWeightGenerator(
+    initial_temp=5.0,
+    min_temp=0.1,
+    cooling_rate=0.95
+)
 generator.build_vocabulary(corpus)
+
+print(f"Vocabulary built: {len(generator.vocabulary)} words")
+print(f"Initial temperature: {generator.current_temp:.3f}")
+
 while True:
-    start_word = input("USER: ")
-    result = generator.generate_text(start_word, max_words=800)
-    optimized_result = optimize_curved_letters(result)
-    print("Generated text:", optimized_result)
+    try:
+        start_word = input("USER: ")
+        if start_word.lower() in ['quit', 'exit']:
+            break
+        
+        # Reset temperature for each new generation
+        generator.current_temp = generator.initial_temp
+        generator.iteration = 0
+        
+        result = generator.generate_text(start_word, max_words=500)
+        optimized_result = optimize_curved_letters(result)
+        print(f"Generated text: {optimized_result}")
+        print(f"Final temperature: {generator.current_temp:.3f}")
+        
+    except (KeyboardInterrupt, EOFError):
+        print("\nExiting program.")
+        break
