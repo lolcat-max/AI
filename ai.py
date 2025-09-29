@@ -11,7 +11,7 @@ except ImportError:
     print("datasets library not found. Using fallback corpus.")
     load_dataset = None
 
-KB_LEN = 99999
+KB_LEN = 9999
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -331,3 +331,4 @@ while True:
     except (KeyboardInterrupt, EOFError):
         print("\nExiting program.")
         break
+
