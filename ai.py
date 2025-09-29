@@ -7,12 +7,8 @@ import unicodedata
 import re
 from tqdm import tqdm
 import concurrent.futures
+from datasets import load_dataset # Hugging Face datasets
 
-try:
-    from datasets import load_dataset # Hugging Face datasets
-except ImportError:
-    print("datasets library not found. Using fallback corpus.")
-    load_dataset = None
 
 KB_LEN = 99999
 
@@ -349,3 +345,4 @@ while True:
         break
 
      
+
