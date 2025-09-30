@@ -10,7 +10,7 @@ import concurrent.futures
 from datasets import load_dataset # Hugging Face datasets
 
 
-KB_LEN = -1
+KB_LEN = 9999
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -306,7 +306,7 @@ if load_dataset:
 
 print(f"Corpus loaded successfully. Total size: {len(question_parts[:KB_LEN])+len(answer_parts[:KB_LEN])} words.")
 
-print(f"Training...")
+print(f"Training dataset A...")
 
 # Initialize generator with annealing parameters
 generatorA = PatternRepeatingAnnealedHashWeightGenerator(
@@ -315,6 +315,8 @@ generatorA = PatternRepeatingAnnealedHashWeightGenerator(
     cooling_rate=0.95
 )
 generatorA.build_vocabulary(' '.join(question_parts[:KB_LEN]))
+
+print(f"Training dataset B...")
 
 # Initialize generator with annealing parameters
 generatorB = PatternRepeatingAnnealedHashWeightGenerator(
@@ -348,4 +350,3 @@ while True:
         break
 
      
-
