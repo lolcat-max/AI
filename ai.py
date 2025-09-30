@@ -10,7 +10,7 @@ import concurrent.futures
 from datasets import load_dataset # Hugging Face datasets
 
 
-KB_LEN = 9999
+KB_LEN = 1000
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -292,7 +292,7 @@ answer_parts = []
 
 if load_dataset:
     print("Loading dataset...")
-    dataset = load_dataset('facebook/natural_reasoning', split='train')
+    dataset = load_dataset('facebook/natural_reasoning', split=f'train[:{KB_LEN}]')
     
     def extract_field(item, field_name):
         return item.get(field_name, None)
@@ -304,7 +304,7 @@ if load_dataset:
         question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
         answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()]
 
-print(f"Corpus loaded successfully. Total size: {len(question_parts[:KB_LEN])+len(answer_parts[:KB_LEN])} words.")
+print(f"Corpus loaded successfully. Total size: {len(question_parts)+len(answer_parts)} words.")
 
 print(f"Training dataset A...")
 
@@ -314,7 +314,7 @@ generatorA = PatternRepeatingAnnealedHashWeightGenerator(
     min_temp=0.1,
     cooling_rate=0.95
 )
-generatorA.build_vocabulary(' '.join(question_parts[:KB_LEN]))
+generatorA.build_vocabulary(' '.join(question_parts))
 
 print(f"Training dataset B...")
 
@@ -324,7 +324,7 @@ generatorB = PatternRepeatingAnnealedHashWeightGenerator(
     min_temp=0.1,
     cooling_rate=0.95
 )
-generatorB.build_vocabulary(' '.join(answer_parts[:KB_LEN]))
+generatorB.build_vocabulary(' '.join(answer_parts))
 
 while True:
     try:
@@ -340,7 +340,7 @@ while True:
         generatorB.current_tempB = generatorB.initial_tempB
         generatorB.iterationB = 0
         
-        result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=1), max_words=500)
+        result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=500), max_words=500)
         optimized_result = optimize_curved_letters(result)
         print(f"Generated text: {optimized_result}")
         print(f"Final temperature: {generator.current_temp:.3f}")
