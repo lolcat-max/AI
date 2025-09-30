@@ -10,7 +10,7 @@ import concurrent.futures
 from datasets import load_dataset # Hugging Face datasets
 
 
-KB_LEN = 999
+KB_LEN = 9999
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -110,20 +110,24 @@ class AnnealedHashWeightGenerator:
         """Cool down the temperature after each iteration."""
         self.iteration += 1
         self.current_temp = max(self.min_temp, self.current_temp * self.cooling_rate)
-
+    
     def build_vocabulary(self, text):
         words = text.lower().split()
-        for i, w in enumerate(words):
+        
+        # Wrap the enumeration in tqdm to show progress
+        for i, w in enumerate(tqdm(words, desc="Building vocabulary")):
             self.unigram_counts[w] += 1
             self.vocabulary.add(w)
-            _ = []
-            for word in self.vocabulary:
-                _.append(self.hash_to_weight(word))
+            
+            # This list creation is not used, so I've commented it out
+            # _ = []
+            
             if i < len(words) - 1:
                 nxt = words[i + 1]
                 self.bigram_counts[w][nxt] += 1
                 self.word_transitions[w].append(nxt)
                 self.vocabulary.add(nxt)
+                
         self.total_unigrams = sum(self.unigram_counts.values())
         
         return len(self.vocabulary)
@@ -302,6 +306,7 @@ if load_dataset:
 
 print(f"Corpus loaded successfully. Total size: {len(question_parts[:KB_LEN])+len(answer_parts[:KB_LEN])} words.")
 
+print(f"Training...")
 
 # Initialize generator with annealing parameters
 generatorA = PatternRepeatingAnnealedHashWeightGenerator(
@@ -326,11 +331,11 @@ while True:
             break
         
         # Reset temperature for each new generation
-        generatorA.current_temp = generator.initial_temp
+        generatorA.current_temp = generatorA.initial_temp
         generatorA.iteration = 0
         
         # Reset temperature for each new generation
-        generatorB.current_tempB = generator.initial_tempB
+        generatorB.current_tempB = generatorB.initial_tempB
         generatorB.iterationB = 0
         
         result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=500), max_words=500)
