@@ -300,7 +300,7 @@ if load_dataset:
         question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
         answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()]
 
-print(f"Corpus loaded successfully. Total size: {len(question_parts[:KB_LEN])+len(answer_parts[:KB_LEN])} characters.")
+print(f"Corpus loaded successfully. Total size: {len(question_parts[:KB_LEN])+len(answer_parts[:KB_LEN])} words.")
 
 
 # Initialize generator with annealing parameters
