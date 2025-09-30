@@ -340,7 +340,7 @@ while True:
         generatorB.current_tempB = generatorB.initial_tempB
         generatorB.iterationB = 0
         
-        result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=500), max_words=500)
+        result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=50), max_words=50)
         optimized_result = optimize_curved_letters(result)
         print(f"Generated text: {optimized_result}")
         print(f"Final temperature: {generator.current_temp:.3f}")
