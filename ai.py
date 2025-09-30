@@ -10,7 +10,7 @@ import concurrent.futures
 from datasets import load_dataset # Hugging Face datasets
 
 
-KB_LEN = 9999
+KB_LEN = -1
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -348,3 +348,4 @@ while True:
         break
 
      
+
