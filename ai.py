@@ -303,15 +303,18 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
         words = text.lower().split()
         length = len(words)
         patterns = Counter()
-
-        for l in range(min_len, max_len + 1):
-            seen = defaultdict(int)
-            for start in range(length - l + 1):
-                subseq = tuple(words[start:start+l])
-                seen[subseq] += 1
-            for p, c in seen.items():
-                if c > 1:
-                    patterns[p] += l
+        for start in range(length + 1):
+            subseq = tuple(words[start:start+1])
+            for i in range(100):
+                seen = defaultdict(int)
+                for p, c in seen.items():
+                    if c > 1:
+                        patterns[p] += c
+                        for l in range(min_len, max_len + 1):
+                            for start in range(length - l + 1):
+                                subseq = tuple(words[start:start+l])
+                                seen[subseq] += 100*c
+                
         self.repeating_patterns = patterns
 
     def hash_to_weight(self, token, temp_schedule='A'):
