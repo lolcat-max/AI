@@ -7,8 +7,12 @@ import unicodedata
 import re
 from tqdm import tqdm
 import concurrent.futures
-from datasets import load_dataset # Hugging Face datasets
 
+try:
+    from datasets import load_dataset  # Hugging Face datasets
+except ImportError:
+    print("datasets library not found. Please install with 'pip install datasets'. Using fallback corpus.")
+    load_dataset = None
 
 KB_LEN = 1000
 
@@ -23,7 +27,7 @@ def is_connective(w):
     return w in CONNECTIVES
 
 class AnnealedHashWeightGenerator:
-    def __init__(self, alpha=0.15, beta=0.20, gamma=0.05, smoothing=1.0, rng=None, 
+    def __init__(self, alpha=0.15, beta=0.20, gamma=0.05, smoothing=1.0, rng=None,
                  initial_temp=10.0, min_temp=0.01, cooling_rate=0.98):
         self.word_weights = {}
         self.vocabulary = set()
@@ -33,20 +37,19 @@ class AnnealedHashWeightGenerator:
         self.total_unigrams = 0
         self.gen_unigram_counts = Counter()
         self.gen_bigram_counts = defaultdict(Counter)
-        
+
         # Annealing parameters
-        self.initial_temp = initial_temp
-        self.current_temp = initial_temp
-        self.min_temp = min_temp
-        self.cooling_rate = cooling_rate
-        self.iteration = 0
+        self.initial_temp_A = initial_temp
+        self.current_temp_A = initial_temp
+        self.min_temp_A = min_temp
+        self.cooling_rate_A = cooling_rate
+        self.iteration_A = 0
         
-        # Annealing parameters
-        self.initial_tempB = initial_temp
-        self.current_tempB = initial_temp
-        self.min_tempB = min_temp
-        self.cooling_rateB = cooling_rate
-        self.iterationB = 0
+        self.initial_temp_B = initial_temp
+        self.current_temp_B = initial_temp
+        self.min_temp_B = min_temp
+        self.cooling_rate_B = cooling_rate
+        self.iteration_B = 0
         
         s = float(alpha) + float(beta) + float(gamma)
         if s <= 0:
@@ -58,78 +61,76 @@ class AnnealedHashWeightGenerator:
         self.smoothing = float(smoothing)
         self.rng = np.random.default_rng(rng)
 
-    def anneal_hash_weight(self, token, base_weight):
+    def anneal_hash_weight(self, token, base_weight, temp_schedule='A'):
         """Apply simulated annealing to hash weights."""
-        if self.current_temp <= self.min_temp:
+        current_temp = self.current_temp_A if temp_schedule == 'A' else self.current_temp_B
+        min_temp = self.min_temp_A if temp_schedule == 'A' else self.min_temp_B
+        initial_temp = self.initial_temp_A if temp_schedule == 'A' else self.initial_temp_B
+
+        if current_temp <= min_temp:
             return base_weight
             
-        # Generate a neighbor weight by adding noise
         noise_factor = 0.1
-        neighbor_weight = base_weight + self.rng.normal(0, noise_factor * self.current_temp)
-        neighbor_weight = max(0.0, min(1.0, neighbor_weight))  # Clamp to [0,1]
-        
-        # Energy function (we want to maximize entropy in early stages)
+        neighbor_weight = base_weight + self.rng.normal(0, noise_factor * current_temp)
+        neighbor_weight = max(0.0, min(1.0, neighbor_weight))
+
         def energy(weight):
-            # Penalize weights too close to 0 or 1 when temperature is high
-            entropy_bonus = -abs(weight - 0.5) * self.current_temp / self.initial_temp
+            entropy_bonus = -abs(weight - 0.5) * current_temp / initial_temp
             return -weight + entropy_bonus
         
         current_energy = energy(base_weight)
         neighbor_energy = energy(neighbor_weight)
         
-        # Acceptance probability
         if neighbor_energy < current_energy:
             return neighbor_weight
         else:
-            acceptance_prob = math.exp((current_energy - neighbor_energy) / self.current_temp)
+            acceptance_prob = math.exp((current_energy - neighbor_energy) / current_temp)
             if self.rng.random() < acceptance_prob:
                 return neighbor_weight
             else:
                 return base_weight
 
-    def hash_to_weight(self, token):
+    def hash_to_weight(self, token, temp_schedule='A'):
         if token in self.word_weights:
             return self.word_weights[token]
         
-        # Base SHA256 hash weight
         h = hashlib.sha256(token.encode('utf-8')).hexdigest()
         iv = int(h[:16], 16)
         mv = int('f' * 16, 16)
         base_weight = iv / mv
         
-        # Apply annealing to the weight
-        annealed_weight = self.anneal_hash_weight(token, base_weight)
+        annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
         
         self.word_weights[token] = annealed_weight
         return annealed_weight
 
-    def context_hash_weight(self, prev_w, w):
-        return self.hash_to_weight(f"{prev_w}→{w}")
+    def context_hash_weight(self, prev_w, w, temp_schedule='A'):
+        return self.hash_to_weight(f"{prev_w}→{w}", temp_schedule)
 
-    def update_temperature(self):
+    def update_temperature(self, temp_schedule='A'):
         """Cool down the temperature after each iteration."""
-        self.iteration += 1
-        self.current_temp = max(self.min_temp, self.current_temp * self.cooling_rate)
-    
-    def build_vocabulary(self, text):
+        if temp_schedule == 'A':
+            self.iteration_A += 1
+            self.current_temp_A = max(self.min_temp_A, self.current_temp_A * self.cooling_rate_A)
+        else:
+            self.iteration_B += 1
+            self.current_temp_B = max(self.min_temp_B, self.current_temp_B * self.cooling_rate_B)
+
+    def build_vocabulary(self, text, temp_schedule='A'):
         words = text.lower().split()
-        
-        # Wrap the enumeration in tqdm to show progress
         for i, w in enumerate(tqdm(words, desc="Building vocabulary")):
             self.unigram_counts[w] += 1
             self.vocabulary.add(w)
-            
-            # This list creation is not used, so I've commented it out
-            # _ = []
-            
             if i < len(words) - 1:
                 nxt = words[i + 1]
                 self.bigram_counts[w][nxt] += 1
                 self.word_transitions[w].append(nxt)
                 self.vocabulary.add(nxt)
-                
-        self.total_unigrams = sum(self.unigram_counts.values())
         
+        for w in tqdm(self.vocabulary, desc="Calculating hash weights"):
+            self.hash_to_weight(w, temp_schedule)
+            
+        self.total_unigrams = sum(self.unigram_counts.values())
         return len(self.vocabulary)
 
     def get_corpus_bigram_prob(self, prev_w, w):
@@ -145,7 +146,7 @@ class AnnealedHashWeightGenerator:
         return (c_big + self.smoothing) / (c_prev + self.smoothing * V)
 
     def get_candidates_for_word(self, current_word, use_transitions=True, cap=64):
-        if use_transitions and self.word_transitions[current_word]:
+        if use_transitions and self.word_transitions.get(current_word):
             return sorted(set(self.word_transitions[current_word]))
         vocab = sorted(self.vocabulary)
         if len(vocab) <= cap:
@@ -165,20 +166,18 @@ class AnnealedHashWeightGenerator:
         Hmax = math.log(len(p))
         return 0.0 if Hmax == 0 else min(1.0, H / Hmax)
 
-    def compute_interpolated_probabilities(self, current_word, candidates):
+    def compute_interpolated_probabilities(self, current_word, candidates, temp_schedule='A'):
         corp = np.array([self.get_corpus_bigram_prob(current_word, c) for c in candidates], dtype=float)
         corp = self._normalize(corp)
 
         gen = np.array([self.get_generated_bigram_prob(current_word, c) for c in candidates], dtype=float)
         gen = self._normalize(gen)
 
-        # Apply annealed hash weights
-        h_tok = np.array([self.hash_to_weight(c) for c in candidates], dtype=float)
-        h_ctx = np.array([self.context_hash_weight(current_word, c) for c in candidates], dtype=float)
+        h_tok = np.array([self.hash_to_weight(c, temp_schedule) for c in candidates], dtype=float)
+        h_ctx = np.array([self.context_hash_weight(current_word, c, temp_schedule) for c in candidates], dtype=float)
         hashp = 0.5 * h_tok + 0.5 * h_ctx
         hashp = self._normalize(hashp)
 
-        c_prev = self.unigram_counts[current_word]
         out_deg = sum(self.bigram_counts[current_word].values())
 
         corp_ent = self._entropy01(corp)
@@ -193,9 +192,10 @@ class AnnealedHashWeightGenerator:
         gen_ev *= (1.0 + 0.15 * conn_ratio)
         hash_ev *= (1.0 - 0.25 * conn_ratio)
 
-        # Temperature-influenced gating
-        temp_influence = self.current_temp / self.initial_temp
-        hash_ev *= (1.0 + temp_influence)  # Give more weight to exploration at high temp
+        current_temp = self.current_temp_A if temp_schedule == 'A' else self.current_temp_B
+        initial_temp = self.initial_temp_A if temp_schedule == 'A' else self.initial_temp_B
+        temp_influence = current_temp / initial_temp
+        hash_ev *= (1.0 + temp_influence)
 
         gate_weights = np.array([corp_ev, gen_ev, hash_ev], dtype=float)
         gate = self._normalize(gate_weights)
@@ -205,33 +205,36 @@ class AnnealedHashWeightGenerator:
 
     def update_generated_counts(self, prev_w, w):
         self.gen_unigram_counts[prev_w] += 1
-        self.gen_unigram_counts[prev_w] = min(self.gen_unigram_counts[prev_w], 1)
         self.gen_unigram_counts[w] += 1
-        self.gen_unigram_counts[w] = min(self.gen_unigram_counts[w], 1)
         self.gen_bigram_counts[prev_w][w] += 1
-        self.gen_bigram_counts[prev_w][w] = min(self.gen_bigram_counts[prev_w][w], 1)
 
-    def generate_text(self, start_word, max_words=15, use_transitions=True):
+    def generate_text(self, start_prompt, max_words=15, use_transitions=True, temp_schedule='A'):
         if not self.vocabulary:
-            return ""
-        start = start_word.lower()
-        if start not in self.vocabulary:
-            start = random.choice(tuple(self.vocabulary))
-        current = start
-        generated = [current]
+            return start_prompt
         
-        for _ in range(max_words - 1):
+        start_words = start_prompt.lower().split()
+        if not start_words:
+            start_words = [random.choice(tuple(self.vocabulary))]
+            
+        generated = list(start_words)
+        
+        # Correctly set the initial 'current' word
+        current = generated[-1]
+
+        # Generate the remaining words
+        for _ in range(max_words - len(start_words)):
             cands = self.get_candidates_for_word(current, use_transitions=use_transitions)
             if not cands:
                 break
-            probs, gate = self.compute_interpolated_probabilities(current, cands)
+            probs, gate = self.compute_interpolated_probabilities(current, cands, temp_schedule)
             nxt = self.rng.choice(cands, p=probs)
             self.update_generated_counts(current, nxt)
             generated.append(nxt)
+            
+            # Correctly update 'current' to be the last generated word for the next loop
             current = nxt
             
-            # Update temperature after each word generation
-            self.update_temperature()
+            self.update_temperature(temp_schedule)
             
         return " ".join(generated)
 
@@ -268,85 +271,89 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
                     patterns[p] += l
         self.repeating_patterns = patterns
 
-    def hash_to_weight(self, token):
-        # Check if token is part of a repeating pattern first
+    def hash_to_weight(self, token, temp_schedule='A'):
         for pattern in self.repeating_patterns:
             if token in pattern:
                 pattern_str = " ".join(pattern)
                 h = hashlib.sha256(pattern_str.encode('utf-8')).digest()
                 float_weights = [(b / 255.0) for b in h]
                 base_weight = np.mean(float_weights)
-                # Apply annealing to pattern-based weights too
-                annealed_weight = self.anneal_hash_weight(token, base_weight)
+                annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
                 self.word_weights[token] = annealed_weight
                 return annealed_weight
-        return super().hash_to_weight(token)
+        return super().hash_to_weight(token, temp_schedule)
 
-    def build_vocabulary(self, text):
+    def build_vocabulary(self, text, temp_schedule='A'):
         self.find_repeating_patterns(text)
-        return super().build_vocabulary(text) 
+        return super().build_vocabulary(text, temp_schedule)
 
 # Load dataset and build corpus using multithreading
-question_parts = []
-answer_parts = []
+corpus_q = ""
+corpus_a = ""
+try:
+    if load_dataset:
+        print("Loading dataset...")
+        dataset = load_dataset('facebook/natural_reasoning', split=f'train[:{KB_LEN}]')
+        
+        def extract_field(item, field_name):
+            return item.get(field_name, None)
 
-if load_dataset:
-    print("Loading dataset...")
-    dataset = load_dataset('facebook/natural_reasoning', split=f'train[:{KB_LEN}]')
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            question_futures = {executor.submit(extract_field, item, 'question'): item for item in dataset}
+            answer_futures = {executor.submit(extract_field, item, 'reference_answer'): item for item in dataset}
+
+            question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
+            answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()]
+
+        corpus_q = " ".join(question_parts)
+        corpus_a = " ".join(answer_parts)
+        
+        if (not corpus_q or len(corpus_q.split()) < 20) or (not corpus_a or len(corpus_a.split()) < 20):
+            raise ValueError("Corpus too small or empty after loading dataset.")
+    else:
+        raise ImportError("datasets library not available")
+
+except Exception as e:
+    print(f"Error loading dataset or extracting text: {e}")
+    print("Falling back to sample text for demonstration.")
+    corpus_q = "What is the capital of France? Paris is the capital of France."
+    corpus_a = "Paris is known for its fashion and landmarks such as the Eiffel Tower."
     
-    def extract_field(item, field_name):
-        return item.get(field_name, None)
+print(f"Corpus loaded successfully. Total questions: {len(corpus_q)} chars, Total answers: {len(corpus_a)} chars.")
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        question_futures = {executor.submit(extract_field, item, 'question'): item for item in dataset}
-        answer_futures = {executor.submit(extract_field, item, 'reference_answer'): item for item in dataset}
+generatorA = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.7, min_temp=0.5, cooling_rate=0.25)
+generatorB = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.5, min_temp=0.5, cooling_rate=0.15)
 
-        question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
-        answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()]
+print("Training dataset A...")
+generatorA.build_vocabulary(corpus_q, 'A')
+print("Training dataset B...")
+generatorB.build_vocabulary(corpus_a, 'B')
 
-print(f"Corpus loaded successfully. Total size: {len(question_parts)+len(answer_parts)} words.")
-
-print(f"Training dataset A...")
-
-# Initialize generator with annealing parameters
-generatorA = PatternRepeatingAnnealedHashWeightGenerator(
-    initial_temp=5.0,
-    min_temp=0.1,
-    cooling_rate=0.95
-)
-generatorA.build_vocabulary(' '.join(question_parts))
-
-print(f"Training dataset B...")
-
-# Initialize generator with annealing parameters
-generatorB = PatternRepeatingAnnealedHashWeightGenerator(
-    initial_temp=5.0,
-    min_temp=0.1,
-    cooling_rate=0.95
-)
-generatorB.build_vocabulary(' '.join(answer_parts))
+print(f"Vocabulary A built: {len(generatorA.vocabulary)} words")
+print(f"Vocabulary B built: {len(generatorB.vocabulary)} words")
 
 while True:
     try:
-        start_word = input("USER: ")
-        if start_word.lower() in ['quit', 'exit']:
+        start_prompt = input("USER: ")
+        if start_prompt.lower() in ['quit', 'exit']:
             break
         
-        # Reset temperature for each new generation
-        generatorA.current_temp = generatorA.initial_temp
-        generatorA.iteration = 0
+        # Reset temperatures
+        generatorA.current_temp_A = generatorA.initial_temp_A
+        generatorA.iteration_A = 0
+        generatorB.current_temp_B = generatorB.initial_temp_B
+        generatorB.iteration_B = 0
         
-        # Reset temperature for each new generation
-        generatorB.current_tempB = generatorB.initial_tempB
-        generatorB.iterationB = 0
+        # Use the multi-word prompt to generate a starting phrase from generator A
+        result_A = generatorA.generate_text(start_prompt, max_words=len(start_prompt.split()) + 5, temp_schedule='A')
         
-        result = generatorB.generate_text(generatorA.generate_text(start_word, max_words=500), max_words=500)
-        optimized_result = optimize_curved_letters(result)
+        # Use the entire output of generator A as the prompt for generator B
+        final_result = generatorB.generate_text(result_A, max_words=500, temp_schedule='B')
+        
+        optimized_result = optimize_curved_letters(final_result)
         print(f"Generated text: {optimized_result}")
-        print(f"Final temperature: {generator.current_temp:.3f}")
+        print(f"Final temperatures: A={generatorA.current_temp_A:.3f}, B={generatorB.current_temp_B:.3f}")
         
     except (KeyboardInterrupt, EOFError):
         print("\nExiting program.")
         break
-
-     
