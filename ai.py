@@ -14,7 +14,7 @@ except ImportError:
     print("datasets library not found. Please install with 'pip install datasets'. Using fallback corpus.")
     load_dataset = None
 
-KB_LEN = 1000
+KB_LEN = 500
 
 CONNECTIVES = {
     ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
@@ -26,9 +26,26 @@ CONNECTIVES = {
 def is_connective(w):
     return w in CONNECTIVES
 
+def lambda_function(x, y, p, k, e_u):
+    """
+    λ(x,y) = p^k - e(u)^2 + dist(y|k)
+    
+    Args:
+        x: first input parameter
+        y: second input parameter
+        p: base value for power
+        k: exponent/key parameter
+        e_u: error or energy term u
+    
+    Returns:
+        computed lambda value
+    """
+    dist_y_given_k = np.linalg.norm(np.array(y) - np.array(k)) if hasattr(y, '__iter__') and hasattr(k, '__iter__') else abs(y - k)
+    return (p ** k) - (e_u ** 2) + dist_y_given_k
+
 class AnnealedHashWeightGenerator:
-    def __init__(self, alpha=0.15, beta=0.20, gamma=0.05, smoothing=1.0, rng=None,
-                 initial_temp=10.0, min_temp=0.01, cooling_rate=0.98):
+    def __init__(self, alpha=0.15, beta=0.70, gamma=0.75, smoothing=0.1, rng=None,
+                 initial_temp=100, min_temp=0.01, cooling_rate=0.18):
         self.word_weights = {}
         self.vocabulary = set()
         self.word_transitions = defaultdict(list)
@@ -60,6 +77,29 @@ class AnnealedHashWeightGenerator:
         self.base_gate = np.array([self.alpha, self.beta, self.gamma], dtype=float)
         self.smoothing = float(smoothing)
         self.rng = np.random.default_rng(rng)
+
+    def lambda_weight_adjustment(self, token, base_weight):
+        """
+        Apply lambda function to adjust weights based on token properties.
+        Uses λ(x,y) = p^k - e(u)^2 + dist(y|k)
+        """
+        # Extract numeric properties from token hash
+        h = hashlib.sha256(token.encode('utf-8')).digest()
+        x = h[0] / 255.0  # normalized hash byte
+        y = h[1] / 255.0  # normalized hash byte
+        
+        # Parameters derived from token
+        p = 1.5  # base parameter
+        k = min(len(token), 10) / 10.0  # normalized token length
+        e_u = abs(base_weight - 0.5)  # error from median weight
+        
+        lambda_val = lambda_function(x, y, p, k, e_u)
+        
+        # Normalize lambda_val to [0, 1] range and blend with base_weight
+        lambda_normalized = 1.0 / (1.0 + np.exp(-lambda_val))  # sigmoid
+        adjusted_weight = 0.7 * base_weight + 0.3 * lambda_normalized
+        
+        return np.clip(adjusted_weight, 0.0, 1.0)
 
     def anneal_hash_weight(self, token, base_weight, temp_schedule='A'):
         """Apply simulated annealing to hash weights."""
@@ -98,6 +138,9 @@ class AnnealedHashWeightGenerator:
         iv = int(h[:16], 16)
         mv = int('f' * 16, 16)
         base_weight = iv / mv
+        
+        # Apply lambda function adjustment
+        base_weight = self.lambda_weight_adjustment(token, base_weight)
         
         annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
         
@@ -278,6 +321,10 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
                 h = hashlib.sha256(pattern_str.encode('utf-8')).digest()
                 float_weights = [(b / 255.0) for b in h]
                 base_weight = np.mean(float_weights)
+                
+                # Apply lambda adjustment to pattern-based weights
+                base_weight = self.lambda_weight_adjustment(token, base_weight)
+                
                 annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
                 self.word_weights[token] = annealed_weight
                 return annealed_weight
@@ -290,47 +337,36 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
 # Load dataset and build corpus using multithreading
 corpus_q = ""
 corpus_a = ""
-try:
-    if load_dataset:
-        print("Loading dataset...")
-        dataset = load_dataset('facebook/natural_reasoning', split=f'train[:{KB_LEN}]')
-        
-        def extract_field(item, field_name):
-            return item.get(field_name, None)
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            question_futures = {executor.submit(extract_field, item, 'question'): item for item in dataset}
-            answer_futures = {executor.submit(extract_field, item, 'reference_answer'): item for item in dataset}
-
-            question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing Questions") if future.result()]
-            answer_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(answer_futures), total=len(dataset), desc="Processing Answers") if future.result()]
-
-        corpus_q = " ".join(question_parts)
-        corpus_a = " ".join(answer_parts)
-        
-        if (not corpus_q or len(corpus_q.split()) < 20) or (not corpus_a or len(corpus_a.split()) < 20):
-            raise ValueError("Corpus too small or empty after loading dataset.")
-    else:
-        raise ImportError("datasets library not available")
-
-except Exception as e:
-    print(f"Error loading dataset or extracting text: {e}")
-    print("Falling back to sample text for demonstration.")
-    corpus_q = "What is the capital of France? Paris is the capital of France."
-    corpus_a = "Paris is known for its fashion and landmarks such as the Eiffel Tower."
+if load_dataset:
+    print("Loading dataset...")
+    dataset = load_dataset('stanfordnlp/imdb', split=f'train[:{KB_LEN}]')
     
-print(f"Corpus loaded successfully. Total questions: {len(corpus_q)} chars, Total answers: {len(corpus_a)} chars.")
+    def extract_field(item, field_name):
+        return item.get(field_name, None)
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        question_futures = {executor.submit(extract_field, item, 'text'): item for item in dataset}
+
+        question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing data") if future.result()]
+
+    corpus_q = " ".join(question_parts)
+    
+    if (not corpus_q or len(corpus_q.split()) < 20):
+        raise ValueError("Corpus too small or empty after loading dataset.")
+else:
+    raise ImportError("datasets library not available")
+
+print(f"Corpus loaded successfully. Total questions: {len(corpus_q)} chars.")
 
 generatorA = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.7, min_temp=0.5, cooling_rate=0.25)
-generatorB = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.5, min_temp=0.5, cooling_rate=0.15)
 
 print("Training dataset A...")
 generatorA.build_vocabulary(corpus_q, 'A')
-print("Training dataset B...")
-generatorB.build_vocabulary(corpus_a, 'B')
+
 
 print(f"Vocabulary A built: {len(generatorA.vocabulary)} words")
-print(f"Vocabulary B built: {len(generatorB.vocabulary)} words")
+
 
 while True:
     try:
@@ -341,18 +377,16 @@ while True:
         # Reset temperatures
         generatorA.current_temp_A = generatorA.initial_temp_A
         generatorA.iteration_A = 0
-        generatorB.current_temp_B = generatorB.initial_temp_B
-        generatorB.iteration_B = 0
         
-        # Use the multi-word prompt to generate a starting phrase from generator A
-        result_A = generatorA.generate_text(start_prompt, max_words=len(start_prompt.split()) + 5, temp_schedule='A')
+        
+        
         
         # Use the entire output of generator A as the prompt for generator B
-        final_result = generatorB.generate_text(result_A, max_words=500, temp_schedule='B')
+        final_result = generatorA.generate_text(start_prompt, max_words=500, temp_schedule='B')
         
         optimized_result = optimize_curved_letters(final_result)
         print(f"Generated text: {optimized_result}")
-        print(f"Final temperatures: A={generatorA.current_temp_A:.3f}, B={generatorB.current_temp_B:.3f}")
+        print(f"Final temperatures: A={generatorA.current_temp_A:.3f}")
         
     except (KeyboardInterrupt, EOFError):
         print("\nExiting program.")
