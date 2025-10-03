@@ -29,16 +29,6 @@ def is_connective(w):
 def lambda_function(x, y, p, k, e_u):
     """
     λ(x,y) = p^k - e(u)^2 + dist(y|k)
-    
-    Args:
-        x: first input parameter
-        y: second input parameter
-        p: base value for power
-        k: exponent/key parameter
-        e_u: error or energy term u
-    
-    Returns:
-        computed lambda value
     """
     dist_y_given_k = np.linalg.norm(np.array(y) - np.array(k)) if hasattr(y, '__iter__') and hasattr(k, '__iter__') else abs(y - k)
     return (p ** k) - (e_u ** 2) + dist_y_given_k
@@ -78,25 +68,32 @@ class AnnealedHashWeightGenerator:
         self.smoothing = float(smoothing)
         self.rng = np.random.default_rng(rng)
 
+        # Define which letters are considered "curvy"
+        self.CURVY_LETTERS = set('ocsgebdapq')
+
+    def get_curviness_score(self, word):
+        """Calculates the ratio of 'curvy' letters in a word."""
+        if not word:
+            return 0.0
+        curvy_count = sum(1 for char in word.lower() if char in self.CURVY_LETTERS)
+        return curvy_count / len(word)
+
     def lambda_weight_adjustment(self, token, base_weight):
         """
         Apply lambda function to adjust weights based on token properties.
         Uses λ(x,y) = p^k - e(u)^2 + dist(y|k)
         """
-        # Extract numeric properties from token hash
         h = hashlib.sha256(token.encode('utf-8')).digest()
-        x = h[0] / 255.0  # normalized hash byte
-        y = h[1] / 255.0  # normalized hash byte
+        x = h[0] / 255.0
+        y = h[1] / 255.0
         
-        # Parameters derived from token
-        p = 1.5  # base parameter
-        k = min(len(token), 10) / 10.0  # normalized token length
-        e_u = abs(base_weight - 0.5)  # error from median weight
+        p = 1.5
+        k = min(len(token), 10) / 10.0
+        e_u = abs(base_weight - 0.5)
         
         lambda_val = lambda_function(x, y, p, k, e_u)
         
-        # Normalize lambda_val to [0, 1] range and blend with base_weight
-        lambda_normalized = 1.0 / (1.0 + np.exp(-lambda_val))  # sigmoid
+        lambda_normalized = 1.0 / (1.0 + np.exp(-lambda_val))
         adjusted_weight = 0.7 * base_weight + 0.3 * lambda_normalized
         
         return np.clip(adjusted_weight, 0.0, 1.0)
@@ -134,14 +131,12 @@ class AnnealedHashWeightGenerator:
         if token in self.word_weights:
             return self.word_weights[token]
         
-        h = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        h = hashlib.sha256(token.encode('utf-16')).hexdigest()
         iv = int(h[:16], 16)
         mv = int('f' * 16, 16)
         base_weight = iv / mv
         
-        # Apply lambda function adjustment
         base_weight = self.lambda_weight_adjustment(token, base_weight)
-        
         annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
         
         self.word_weights[token] = annealed_weight
@@ -209,7 +204,7 @@ class AnnealedHashWeightGenerator:
         Hmax = math.log(len(p))
         return 0.0 if Hmax == 0 else min(1.0, H / Hmax)
 
-    def compute_interpolated_probabilities(self, current_word, candidates, temp_schedule='A'):
+    def compute_interpolated_probabilities(self, current_word, candidates, temp_schedule='A', apply_curvy_bias=False):
         corp = np.array([self.get_corpus_bigram_prob(current_word, c) for c in candidates], dtype=float)
         corp = self._normalize(corp)
 
@@ -244,12 +239,21 @@ class AnnealedHashWeightGenerator:
         gate = self._normalize(gate_weights)
 
         mix = gate[0] * corp + gate[1] * gen + gate[2] * hashp
-        return self._normalize(mix), gate
+        final_probs = self._normalize(mix)
+
+        if apply_curvy_bias and candidates:
+            scores = sum(np.array([self.get_curviness_score(c) for c in candidates]))
+            # Boost probability based on curviness score. The '2.0' is a tuning factor.
+            bias_factor = 1.0 + 2.0 * scores
+            biased_probs = final_probs * bias_factor
+            final_probs = self._normalize(biased_probs)
+
+        return final_probs, gate
 
     def update_generated_counts(self, prev_w, w):
         self.gen_unigram_counts[prev_w] += 1
         self.gen_unigram_counts[w] += 1
-        self.gen_bigram_counts[prev_w][w] += 1
+        self.gen_bigram_counts[prev_w][w] += self.anneal_hash_weight(w, self.gen_unigram_counts[prev_w], 'A')
 
     def generate_text(self, start_prompt, max_words=15, use_transitions=True, temp_schedule='A'):
         if not self.vocabulary:
@@ -260,39 +264,39 @@ class AnnealedHashWeightGenerator:
             start_words = [random.choice(tuple(self.vocabulary))]
             
         generated = list(start_words)
-        
-        # Correctly set the initial 'current' word
         current = generated[-1]
 
-        # Generate the remaining words
-        for _ in range(max_words - len(start_words)):
+        # Set up the counter for applying the curvy bias
+        step = random.choice([6, 7])
+        # The index of the next word that should be curvy-biased
+        next_curvy_index = len(start_words) + step - 1
+
+        for i in range(max_words - len(start_words)):
+            current_word_index = i + len(start_words)
+            apply_bias = (current_word_index == next_curvy_index)
+
             cands = self.get_candidates_for_word(current, use_transitions=use_transitions)
             if not cands:
                 break
-            probs, gate = self.compute_interpolated_probabilities(current, cands, temp_schedule)
+            
+            # Pass the bias flag to the probability calculator
+            probs, gate = self.compute_interpolated_probabilities(
+                current, cands, temp_schedule, apply_curvy_bias=apply_bias
+            )
+
             nxt = self.rng.choice(cands, p=probs)
             self.update_generated_counts(current, nxt)
             generated.append(nxt)
-            
-            # Correctly update 'current' to be the last generated word for the next loop
             current = nxt
             
-            self.update_temperature(temp_schedule)
+            if apply_bias:
+                # Set the index for the next curvy word
+                step = random.choice([6, 7])
+                next_curvy_index += step
+
+            self.update_temperature(sum(np.array([self.get_curviness_score(c) for c in generated])))
             
         return " ".join(generated)
-
-def is_curved_letter(c):
-    return unicodedata.combining(c) != 0 or not c.isascii()
-
-repeated_char_pattern = re.compile(r'(.)\1+')
-
-def optimize_curved_letters(text):
-    def repl(m):
-        ch = m.group(1)
-        if is_curved_letter(ch):
-            return ch
-        return m.group(0)
-    return repeated_char_pattern.sub(repl, text)
 
 class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
     def __init__(self, *args, **kwargs):
@@ -311,10 +315,10 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
                     if c > 1:
                         patterns[p] += c
                         for l in range(min_len, max_len + 1):
-                            for start in range(length - l + 1):
-                                subseq = tuple(words[start:start+l])
-                                seen[subseq] += 100*c
-                
+                            for start_idx in range(length - l + 1):
+                                subseq_inner = tuple(words[start_idx:start_idx+l])
+                                seen[subseq_inner] += 100*c
+        
         self.repeating_patterns = patterns
 
     def hash_to_weight(self, token, temp_schedule='A'):
@@ -325,9 +329,7 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
                 float_weights = [(b / 255.0) for b in h]
                 base_weight = np.mean(float_weights)
                 
-                # Apply lambda adjustment to pattern-based weights
                 base_weight = self.lambda_weight_adjustment(token, base_weight)
-                
                 annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
                 self.word_weights[token] = annealed_weight
                 return annealed_weight
@@ -337,60 +339,50 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
         self.find_repeating_patterns(text)
         return super().build_vocabulary(text, temp_schedule)
 
-# Load dataset and build corpus using multithreading
-corpus_q = ""
-corpus_a = ""
+# --- Main Execution ---
+if __name__ == "__main__":
+    corpus_q = ""
+    if load_dataset:
+        print("Loading dataset...")
+        dataset = load_dataset('stanfordnlp/imdb', split=f'train[:{KB_LEN}]')
+        
+        def extract_field(item, field_name):
+            return item.get(field_name, None)
 
-if load_dataset:
-    print("Loading dataset...")
-    dataset = load_dataset('stanfordnlp/imdb', split=f'train[:{KB_LEN}]')
-    
-    def extract_field(item, field_name):
-        return item.get(field_name, None)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            question_futures = {executor.submit(extract_field, item, 'text'): item for item in dataset}
+            question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing data") if future.result()]
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        question_futures = {executor.submit(extract_field, item, 'text'): item for item in dataset}
+        corpus_q = " ".join(question_parts)
+        
+        if (not corpus_q or len(corpus_q.split()) < 20):
+            raise ValueError("Corpus too small or empty after loading dataset.")
+    else:
+        raise ImportError("datasets library not available")
 
-        question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing data") if future.result()]
+    print(f"Corpus loaded successfully. Total questions: {len(corpus_q)} chars.")
 
-    corpus_q = " ".join(question_parts)
-    
-    if (not corpus_q or len(corpus_q.split()) < 20):
-        raise ValueError("Corpus too small or empty after loading dataset.")
-else:
-    raise ImportError("datasets library not available")
+    generatorA = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.7, min_temp=0.5, cooling_rate=0.25)
 
-print(f"Corpus loaded successfully. Total questions: {len(corpus_q)} chars.")
+    print("Training dataset A...")
+    generatorA.build_vocabulary(corpus_q, 'A')
+    print(f"Vocabulary A built: {len(generatorA.vocabulary)} words")
 
-generatorA = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.7, min_temp=0.5, cooling_rate=0.25)
-
-print("Training dataset A...")
-generatorA.build_vocabulary(corpus_q, 'A')
-
-
-print(f"Vocabulary A built: {len(generatorA.vocabulary)} words")
-
-
-while True:
-    try:
-        start_prompt = input("USER: ")
-        if start_prompt.lower() in ['quit', 'exit']:
+    while True:
+        try:
+            start_prompt = input("USER: ")
+            if start_prompt.lower() in ['quit', 'exit']:
+                break
+            
+            generatorA.current_temp_A = generatorA.initial_temp_A
+            generatorA.iteration_A = 0
+            
+            final_result = generatorA.generate_text(start_prompt, max_words=500, temp_schedule='B')
+            
+            # No post-processing is needed, the logic is now inside the generator
+            print(f"Generated text: {final_result}")
+            print(f"Final temperatures: A={generatorA.current_temp_A:.3f}")
+            
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting program.")
             break
-        
-        # Reset temperatures
-        generatorA.current_temp_A = generatorA.initial_temp_A
-        generatorA.iteration_A = 0
-        
-        
-        
-        
-        # Use the entire output of generator A as the prompt for generator B
-        final_result = generatorA.generate_text(start_prompt, max_words=500, temp_schedule='B')
-        
-        optimized_result = optimize_curved_letters(final_result)
-        print(f"Generated text: {optimized_result}")
-        print(f"Final temperatures: A={generatorA.current_temp_A:.3f}")
-        
-    except (KeyboardInterrupt, EOFError):
-        print("\nExiting program.")
-        break
