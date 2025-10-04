@@ -1,4 +1,3 @@
-
 import hashlib
 import math
 import numpy as np
@@ -99,34 +98,21 @@ class AnnealedHashWeightGenerator:
         
         return np.clip(adjusted_weight, 0.0, 1.0)
 
-    def anneal_hash_weight(self, token, base_weight, temp_schedule='A'):
-        """Apply simulated annealing to hash weights."""
-        current_temp = self.current_temp_A if temp_schedule == 'A' else self.current_temp_B
-        min_temp = self.min_temp_A if temp_schedule == 'A' else self.min_temp_B
-        initial_temp = self.initial_temp_A if temp_schedule == 'A' else self.initial_temp_B
+    def anneal_hash_weight(self, token):
+            entropy_bonus = 1
+            for i, word in enumerate(self.vocabulary):
+                h = hashlib.sha256(token.encode('utf-16')).hexdigest()
 
-        if current_temp <= min_temp:
-            return base_weight
-            
-        noise_factor = 0.1
-        neighbor_weight = base_weight + self.rng.normal(0, noise_factor * current_temp)
-        neighbor_weight = max(0.0, min(1.0, neighbor_weight))
-
-        def energy(weight):
-            entropy_bonus = -abs(weight - 0.5) * current_temp / initial_temp
-            return -weight + entropy_bonus
-        
-        current_energy = energy(base_weight)
-        neighbor_energy = energy(neighbor_weight)
-        
-        if neighbor_energy < current_energy:
-            return neighbor_weight
-        else:
-            acceptance_prob = math.exp((current_energy - neighbor_energy) / current_temp)
-            if self.rng.random() < acceptance_prob:
-                return neighbor_weight
-            else:
-                return base_weight
+                h2 = hashlib.sha256(word.encode('utf-16')).hexdigest()
+                iv = int(h[:16], 16)* int(h2[:16], 16)
+                mv = int('f' * 16, 16)
+                base_weight = iv / mv
+                
+                
+                base_weight *= -abs(base_weight - 0.5) * base_weight / self.current_temp_A
+                if i == 6:
+                    break
+            return entropy_bonus
 
     def hash_to_weight(self, token, temp_schedule='A'):
         if token in self.word_weights:
@@ -136,12 +122,13 @@ class AnnealedHashWeightGenerator:
         iv = int(h[:16], 16)
         mv = int('f' * 16, 16)
         base_weight = iv / mv
-        
+        x = int(h[0], 16)
+        y = int(h[1], 16)
         base_weight = self.lambda_weight_adjustment(token, base_weight)
-        annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
+        annealed_weight = self.anneal_hash_weight(token)
         
         self.word_weights[token] = annealed_weight
-        return annealed_weight
+        return annealed_weight+x*y
 
     def context_hash_weight(self, prev_w, w, temp_schedule='A'):
         return self.hash_to_weight(f"{prev_w}→{w}", temp_schedule)
@@ -254,22 +241,56 @@ class AnnealedHashWeightGenerator:
     def update_generated_counts(self, prev_w, w):
         self.gen_unigram_counts[prev_w] += 1
         self.gen_unigram_counts[w] += 1
-        self.gen_bigram_counts[prev_w][w] += self.anneal_hash_weight(w, self.gen_unigram_counts[prev_w], 'A')
+        self.gen_bigram_counts[prev_w][w] += self.anneal_hash_weight(w)
+    def one_word_hash_probs_for_many(self, source_word, candidate_words):
+        # Step 1: Hash the source word and extract first 16 hex chars as integer
+        h = hashlib.sha256(source_word.encode('utf-16')).hexdigest()
+        base_int = int(h[:16], 16)  # 64-bit integer from first 16 hex digits
+
+        raw_weights = []
+        for i, word in enumerate(candidate_words):
+            # Defensive fallback for small index ranges on hashes
+            ch = hashlib.sha256(word.encode('utf-8')).hexdigest()
+            
+            # Safely slice hash string for candidate_int:
+            # Choose a slice of 2 hex digits starting at max(i-2, 0), max length 2 always
+            start_idx = max(i - 2, 0)
+            end_idx = start_idx + 2
+            hex_slice = ch[start_idx:end_idx]
+            
+            # Convert hex slice to int; fallback to 0 if empty or invalid
+            try:
+                candidate_int = int(hex_slice, 16)
+            except ValueError:
+                candidate_int = 0
+
+            # Combine base_int (source hash) with candidate_int and index using XOR and modulo for variation
+            combined = (base_int ^ candidate_int ^ (i * 0x1F)) % (2**32)
+
+            # Map to float in (0, 1], adding tiny offset to avoid 0 weights
+            weight = 1e-12 + (combined / float(2**32))
+            raw_weights.append(weight)
+
+        # Normalize weights to sum to 1 for probabilities
+        total = sum(raw_weights)
+        probs = [w / total for w in raw_weights]
+
+        return probs
+
+
 
     def generate_text(self, start_prompt, max_words=15, use_transitions=True, temp_schedule='A'):
         if not self.vocabulary:
             return start_prompt
-        
+
         start_words = start_prompt.lower().split()
         if not start_words:
             start_words = [random.choice(tuple(self.vocabulary))]
-            
+
         generated = list(start_words)
         current = generated[-1]
 
-        # Set up the counter for applying the curvy bias
         step = random.choice([6, 7])
-        # The index of the next word that should be curvy-biased
         next_curvy_index = len(start_words) + step - 1
 
         for i in range(max_words - len(start_words)):
@@ -279,25 +300,46 @@ class AnnealedHashWeightGenerator:
             cands = self.get_candidates_for_word(current, use_transitions=use_transitions)
             if not cands:
                 break
-            
-            # Pass the bias flag to the probability calculator
-            probs, gate = self.compute_interpolated_probabilities(
-                current, cands, temp_schedule, apply_curvy_bias=apply_bias
-            )
 
-            nxt = self.rng.choice(cands, p=probs)
+            # Compute corpus bigram probabilities
+            corp_probs = np.array([self.get_corpus_bigram_prob(current, c) for c in cands], dtype=float)
+            corp_probs = self._normalize(corp_probs)
+
+            # Compute generated bigram probabilities
+            gen_probs = np.array([self.get_generated_bigram_prob(current, c) for c in cands], dtype=float)
+            gen_probs = self._normalize(gen_probs)
+
+            # Compute hash-based probabilities using your method
+            hash_probs = np.array(self.one_word_hash_probs_for_many(current, cands), dtype=float)
+            hash_probs = self._normalize(hash_probs)
+
+            # Interpolate probabilities with weights - adjust these to tune influence
+            alpha, beta, gamma = 0.5, 0.3, 0.2
+            mixed_probs = alpha * corp_probs + beta * gen_probs + gamma * hash_probs
+            mixed_probs = self._normalize(mixed_probs)
+
+            # Optionally apply curvy word bias
+            if apply_bias and cands:
+                scores = np.array([self.get_curviness_score(c) for c in cands])
+                bias_factor = 1.0 + 2.0 * np.sum(scores) / len(scores)
+                mixed_probs *= bias_factor
+                mixed_probs = self._normalize(mixed_probs)
+
+            nxt = self.rng.choice(cands, p=mixed_probs)
             self.update_generated_counts(current, nxt)
+
             generated.append(nxt)
             current = nxt
-            
+
             if apply_bias:
-                # Set the index for the next curvy word
                 step = random.choice([6, 7])
                 next_curvy_index += step
 
-            self.update_temperature(sum(np.array([self.get_curviness_score(c) for c in generated])))
-            
+            # Update temperature on curviness of generated words
+            self.update_temperature(sum([self.get_curviness_score(c) for c in generated]))
+
         return " ".join(generated)
+
 
 class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
     def __init__(self, *args, **kwargs):
@@ -331,7 +373,7 @@ class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
                 base_weight = np.mean(float_weights)
                 
                 base_weight = self.lambda_weight_adjustment(token, base_weight)
-                annealed_weight = self.anneal_hash_weight(token, base_weight, temp_schedule)
+                annealed_weight = self.anneal_hash_weight(token)
                 self.word_weights[token] = annealed_weight
                 return annealed_weight
         return super().hash_to_weight(token, temp_schedule)
@@ -345,7 +387,7 @@ if __name__ == "__main__":
     corpus_q = ""
     if load_dataset:
         print("Loading dataset...")
-        dataset = load_dataset('stanfordnlp/imdb', split=f'train[:{KB_LEN}]')
+        dataset = load_dataset('ag_news', split=f'train[:{KB_LEN}]')
         
         def extract_field(item, field_name):
             return item.get(field_name, None)
