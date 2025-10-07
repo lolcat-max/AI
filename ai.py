@@ -8,7 +8,7 @@ import sys
 
 sys.setrecursionlimit(1_000_000)
 N_GRAM_ORDER = 2  # Change this to test different n-gram orders
-KB_LEN = 99999
+KB_LEN = -1
 
 # --- Signal Processing and ML ---
 
@@ -38,7 +38,7 @@ X = extract_features(signal_input)
 y = (X[:, 0] > 0.9).astype(int)
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
-clf = LogisticRegression(max_iter=1500)
+clf = LogisticRegression(max_iter=15000)
 clf.fit(X_train, y_train)
 y_pred = clf.predict(X_test)
 acc = accuracy_score(y_test, y_pred)
@@ -75,7 +75,7 @@ print(f"N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
 # --- 2D half-wave mixing helper ---
 
 def half_wave_rectify(matrix):
-    return np.maximum(0, matrix)
+    return np.mean(matrix)
 
 def two_d_half_wave_mix(mat1, mat2, alpha=0.1):
     mixed = alpha * mat1 + (1 - alpha) * mat2
@@ -126,7 +126,7 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
         inf_state_2 = two_d_half_wave_mix(inf_state_2, h2, alpha=0.8)
 
         logits = np.dot(V.T, inf_state_2).flatten()
-        e_logits = np.exp(logits - np.max(logits))
+        e_logits = np.exp(logits * np.max(logits))
         probs = e_logits / e_logits.sum()
 
         candidates = model.get(key, [])
@@ -164,21 +164,21 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
         yield next_word
 
 # --- Main interactive generation session ---
+while True:
+    print("\nEnter your seed text:")
+    seed_input = input().strip().lower()
+    seed_tokens = re.findall(r'\b\w+\b', seed_input)
+    if len(seed_tokens) < N_GRAM_ORDER:
+        while len(seed_tokens) < N_GRAM_ORDER:
+            seed_tokens.append(tokens[len(seed_tokens) % len(tokens)])
 
-print("\nEnter your seed text:")
-seed_input = input().strip().lower()
-seed_tokens = re.findall(r'\b\w+\b', seed_input)
-if len(seed_tokens) < N_GRAM_ORDER:
-    while len(seed_tokens) < N_GRAM_ORDER:
-        seed_tokens.append(tokens[len(seed_tokens) % len(tokens)])
+    start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
+    stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=360)
 
-start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
-stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=16)
-
-print("\n--- Streaming generated text ---\n")
-for _ in range(500):
-    try:
-        print(next(stream), end=' ', flush=True)
-    except StopIteration:
-        break
-print("\n")
+    print("\n--- Streaming generated text ---\n")
+    for _ in range(500):
+        try:
+            print(next(stream), end=' ', flush=True)
+        except StopIteration:
+            break
+    print("\n")
