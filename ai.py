@@ -7,7 +7,7 @@ import re
 import sys
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 2
+N_GRAM_ORDER = 2  # Change this to test different n-gram orders
 KB_LEN = 99999
 
 # --- Signal Processing and ML ---
@@ -52,14 +52,13 @@ with open(filename, 'r', encoding='utf-8') as f:
 if KB_LEN:
     text = text[:KB_LEN]
 
-#tokens = re.findall(r'\b\w+\b', text.lower())
 tokens = text.split()
 if len(tokens) < 50:
     raise ValueError("Corpus too short. Provide at least a few paragraphs.")
 
 print(f"Loaded corpus with {len(tokens):,} tokens from '{filename}'.")
 
-# --- Build simple N-gram model (no XOR fringe) ---
+# --- Build simple N-gram model (supports any order) ---
 
 def build_ngram_model(tokens, n=N_GRAM_ORDER):
     model = defaultdict(list)
@@ -76,7 +75,7 @@ print(f"N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
 # --- 2D half-wave mixing helper ---
 
 def half_wave_rectify(matrix):
-    return np.mean(matrix)
+    return np.maximum(0, matrix)
 
 def two_d_half_wave_mix(mat1, mat2, alpha=0.1):
     mixed = alpha * mat1 + (1 - alpha) * mat2
@@ -115,18 +114,15 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
         mean_val = sample[0]
         label = clf.predict([sample])[0]
 
-        # input vector
         x_vec = np.array([[mean_val], [label]])
         h1_in = np.dot(W1, x_vec) + np.dot(U1, inf_state_1)
         h1 = sigmoid(h1_in)
-        
-        # Half-wave mixing of h1 and previous state
+
         inf_state_1 = two_d_half_wave_mix(inf_state_1, h1, alpha=0.6)
-        
+
         h2_in = np.dot(W2, inf_state_1) + np.dot(U2, inf_state_2)
         h2 = sigmoid(h2_in)
-        
-        # Half-wave mixing for second state
+
         inf_state_2 = two_d_half_wave_mix(inf_state_2, h2, alpha=0.8)
 
         logits = np.dot(V.T, inf_state_2).flatten()
@@ -134,6 +130,7 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
         probs = e_logits / e_logits.sum()
 
         candidates = model.get(key, [])
+        
         if not candidates:
             fallback_key = model_keys[int(abs(mean_val) * 1000) % key_count]
             candidates = [fallback_key[-1]]
@@ -145,6 +142,7 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
 
         masked_probs = probs * mask
         total = masked_probs.sum()
+
         if total == 0:
             valid_idxs = [word_to_idx[c] for c in candidates if c in word_to_idx]
             masked_probs = np.zeros_like(probs)
@@ -178,7 +176,7 @@ start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
 stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=16)
 
 print("\n--- Streaming generated text ---\n")
-for _ in range(5000):
+for _ in range(500):
     try:
         print(next(stream), end=' ', flush=True)
     except StopIteration:
