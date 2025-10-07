@@ -1,431 +1,186 @@
-import hashlib
-import math
 import numpy as np
-import random
-from collections import defaultdict, Counter
-import unicodedata
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from collections import defaultdict
 import re
-from tqdm import tqdm
-import concurrent.futures
-
-try:
-    from datasets import load_dataset  # Hugging Face datasets
-except ImportError:
-    print("datasets library not found. Please install with 'pip install datasets'. Using fallback corpus.")
-    load_dataset = None
-
-KB_LEN = 500
-
-CONNECTIVES = {
-    ",", ".", ";", ":", "—", "-", "(", ")", "[", "]", "{", "}", "…",
-    "and", "or", "but", "so", "yet", "for", "nor",
-    "however", "therefore", "moreover", "meanwhile", "then", "thus",
-    "of", "to", "in", "on", "at"
-}
-
-def is_connective(w):
-    return w in CONNECTIVES
-
-def lambda_function(x, y, p, k, e_u):
-    """
-    λ(x,y) = p^k - e(u)^2 + dist(y|k)
-    """
-    dist_y_given_k = np.linalg.norm(np.array(y) - np.array(k)) if hasattr(y, '__iter__') and hasattr(k, '__iter__') else abs(y - k)
-    return (p ** k) - (e_u ** 2) + dist_y_given_k
-
-class AnnealedHashWeightGenerator:
-    def __init__(self, alpha=0.15, beta=0.70, gamma=0.75, smoothing=0.1, rng=None,
-                 initial_temp=100, min_temp=0.01, cooling_rate=0.18):
-        self.word_weights = {}
-        self.vocabulary = set()
-        self.word_transitions = defaultdict(list)
-        self.unigram_counts = Counter()
-        self.bigram_counts = defaultdict(Counter)
-        self.total_unigrams = 0
-        self.gen_unigram_counts = Counter()
-        self.gen_bigram_counts = defaultdict(Counter)
-
-        # Annealing parameters
-        self.initial_temp_A = initial_temp
-        self.current_temp_A = initial_temp
-        self.min_temp_A = min_temp
-        self.cooling_rate_A = cooling_rate
-        self.iteration_A = 0
-        
-        self.initial_temp_B = initial_temp
-        self.current_temp_B = initial_temp
-        self.min_temp_B = min_temp
-        self.cooling_rate_B = cooling_rate
-        self.iteration_B = 0
-        
-        s = float(alpha) + float(beta) + float(gamma)
-        if s <= 0:
-            raise ValueError("alpha+beta+gamma must be > 0")
-        self.alpha = float(alpha) / s
-        self.beta = float(beta) / s
-        self.gamma = float(gamma) / s
-        self.base_gate = np.array([self.alpha, self.beta, self.gamma], dtype=float)
-        self.smoothing = float(smoothing)
-        self.rng = np.random.default_rng(rng)
-
-        # Define which letters are considered "curvy"
-        self.CURVY_LETTERS = set('ocsgebdapq')
-
-    def get_curviness_score(self, word):
-        """Calculates the ratio of 'curvy' letters in a word."""
-        if not word:
-            return 0.0
-        curvy_count = sum(1 for char in word.lower() if char in self.CURVY_LETTERS)
-        return curvy_count / len(word)
-
-    def lambda_weight_adjustment(self, token, base_weight):
-        """
-        Apply lambda function to adjust weights based on token properties.
-        Uses λ(x,y) = p^k - e(u)^2 + dist(y|k)
-        """
-        h = hashlib.sha256(token.encode('utf-8')).digest()
-        x = h[0] / 255.0
-        y = h[1] / 255.0
-        
-        p = 1.5
-        k = min(len(token), 10) / 10.0
-        e_u = abs(base_weight - 0.5)
-        
-        lambda_val = lambda_function(x, y, p, k, e_u)
-        
-        lambda_normalized = 1.0 / (1.0 + np.exp(-lambda_val))
-        adjusted_weight = 0.7 * base_weight + 0.3 * lambda_normalized
-        
-        return np.clip(adjusted_weight, 0.0, 1.0)
-
-    def anneal_hash_weight(self, token):
-            entropy_bonus = 1
-            for i, word in enumerate(self.vocabulary):
-                h = hashlib.sha256(token.encode('utf-16')).hexdigest()
-
-                h2 = hashlib.sha256(word.encode('utf-16')).hexdigest()
-                iv = int(h[:16], 16)* int(h2[:16], 16)
-                mv = int('f' * 16, 16)
-                base_weight = iv / mv
-                
-                
-                base_weight *= -abs(base_weight - 0.5) * base_weight / self.current_temp_A
-                if i == 6:
-                    break
-            return entropy_bonus
-
-    def hash_to_weight(self, token, temp_schedule='A'):
-        if token in self.word_weights:
-            return self.word_weights[token]
-        
-        h = hashlib.sha256(token.encode('utf-16')).hexdigest()
-        iv = int(h[:16], 16)
-        mv = int('f' * 16, 16)
-        base_weight = iv / mv
-        x = int(h[0], 16)
-        y = int(h[1], 16)
-        base_weight = self.lambda_weight_adjustment(token, base_weight)
-        annealed_weight = self.anneal_hash_weight(token)
-        
-        self.word_weights[token] = annealed_weight
-        return annealed_weight+x*y
-
-    def context_hash_weight(self, prev_w, w, temp_schedule='A'):
-        return self.hash_to_weight(f"{prev_w}→{w}", temp_schedule)
-
-    def update_temperature(self, temp_schedule='A'):
-        """Cool down the temperature after each iteration."""
-        if temp_schedule == 'A':
-            self.iteration_A += 1
-            self.current_temp_A = max(self.min_temp_A, self.current_temp_A * self.cooling_rate_A)
-        else:
-            self.iteration_B += 1
-            self.current_temp_B = max(self.min_temp_B, self.current_temp_B * self.cooling_rate_B)
-
-    def build_vocabulary(self, text, temp_schedule='A'):
-        words = text.lower().split()
-        for i, w in enumerate(tqdm(words, desc="Building vocabulary")):
-            self.unigram_counts[w] += 1
-            self.vocabulary.add(w)
-            if i < len(words) - 1:
-                nxt = words[i + 1]
-                self.bigram_counts[w][nxt] += 1
-                self.word_transitions[w].append(nxt)
-                self.vocabulary.add(nxt)
-        
-        for w in tqdm(self.vocabulary, desc="Calculating hash weights"):
-            self.hash_to_weight(w, temp_schedule)
-            
-        self.total_unigrams = sum(self.unigram_counts.values())
-        return len(self.vocabulary)
-
-    def get_corpus_bigram_prob(self, prev_w, w):
-        c_big = self.bigram_counts[prev_w][w]
-        c_prev = self.unigram_counts[prev_w]
-        V = max(1, len(self.vocabulary))
-        return (c_big + self.smoothing) / (c_prev + self.smoothing * V)
-
-    def get_generated_bigram_prob(self, prev_w, w):
-        c_big = self.gen_bigram_counts[prev_w][w]
-        c_prev = self.gen_unigram_counts[prev_w]
-        V = max(1, len(self.vocabulary))
-        return (c_big + self.smoothing) / (c_prev + self.smoothing * V)
-
-    def get_candidates_for_word(self, current_word, use_transitions=True, cap=64):
-        if use_transitions and self.word_transitions.get(current_word):
-            return sorted(set(self.word_transitions[current_word]))
-        vocab = sorted(self.vocabulary)
-        if len(vocab) <= cap:
-            return vocab
-        step = max(1, len(vocab) // cap)
-        return vocab[::step][:cap]
-
-    def _normalize(self, arr):
-        s = float(np.sum(arr))
-        if s <= 0:
-            return np.ones_like(arr) / len(arr)
-        return arr / s
-
-    def _entropy01(self, p):
-        p = np.clip(p, 1e-12, 1.0)
-        H = -float(np.sum(p * np.log(p)))
-        Hmax = math.log(len(p))
-        return 0.0 if Hmax == 0 else min(1.0, H / Hmax)
-
-    def compute_interpolated_probabilities(self, current_word, candidates, temp_schedule='A', apply_curvy_bias=False):
-        corp = np.array([self.get_corpus_bigram_prob(current_word, c) for c in candidates], dtype=float)
-        corp = self._normalize(corp)
-
-        gen = np.array([self.get_generated_bigram_prob(current_word, c) for c in candidates], dtype=float)
-        gen = self._normalize(gen)
-
-        h_tok = np.array([self.hash_to_weight(c, temp_schedule) for c in candidates], dtype=float)
-        h_ctx = np.array([self.context_hash_weight(current_word, c, temp_schedule) for c in candidates], dtype=float)
-        hashp = 0.5 * h_tok + 0.5 * h_ctx
-        hashp = self._normalize(hashp)
-
-        out_deg = sum(self.bigram_counts[current_word].values())
-
-        corp_ent = self._entropy01(corp)
-        gen_ent = self._entropy01(gen)
-
-        corp_ev = (1.0 if out_deg > 0 else 0.35) * (1.0 - 0.6 * corp_ent)
-        gen_ev = (1.0 if self.gen_unigram_counts[current_word] > 0 else 0.5) * (1.0 - 0.6 * gen_ent)
-        hash_ev = 1.0
-
-        conn_ratio = sum(is_connective(c) for c in candidates) / max(1, len(candidates))
-        corp_ev *= (1.0 + 0.20 * conn_ratio)
-        gen_ev *= (1.0 + 0.15 * conn_ratio)
-        hash_ev *= (1.0 - 0.25 * conn_ratio)
-
-        current_temp = self.current_temp_A if temp_schedule == 'A' else self.current_temp_B
-        initial_temp = self.initial_temp_A if temp_schedule == 'A' else self.initial_temp_B
-        temp_influence = current_temp / initial_temp
-        hash_ev *= (1.0 + temp_influence)
-
-        gate_weights = np.array([corp_ev, gen_ev, hash_ev], dtype=float)
-        gate = self._normalize(gate_weights)
-
-        mix = gate[0] * corp + gate[1] * gen + gate[2] * hashp
-        final_probs = self._normalize(mix)
-
-        if apply_curvy_bias and candidates:
-            scores = sum(np.array([self.get_curviness_score(c) for c in candidates]))
-            # Boost probability based on curviness score. The '2.0' is a tuning factor.
-            bias_factor = 1.0 + 2.0 * scores
-            biased_probs = final_probs * bias_factor
-            final_probs = self._normalize(biased_probs)
-
-        return final_probs, gate
-
-    def update_generated_counts(self, prev_w, w):
-        self.gen_unigram_counts[prev_w] += 1
-        self.gen_unigram_counts[w] += 1
-        self.gen_bigram_counts[prev_w][w] += self.anneal_hash_weight(w)
-    def one_word_hash_probs_for_many(self, source_word, candidate_words):
-        # Step 1: Hash the source word and extract first 16 hex chars as integer
-        h = hashlib.sha256(source_word.encode('utf-16')).hexdigest()
-        base_int = int(h[:16], 16)  # 64-bit integer from first 16 hex digits
-
-        raw_weights = []
-        for i, word in enumerate(candidate_words):
-            # Defensive fallback for small index ranges on hashes
-            ch = hashlib.sha256(word.encode('utf-8')).hexdigest()
-            
-            # Safely slice hash string for candidate_int:
-            # Choose a slice of 2 hex digits starting at max(i-2, 0), max length 2 always
-            start_idx = max(i - 2, 0)
-            end_idx = start_idx + 2
-            hex_slice = ch[start_idx:end_idx]
-            
-            # Convert hex slice to int; fallback to 0 if empty or invalid
-            try:
-                candidate_int = int(hex_slice, 16)
-            except ValueError:
-                candidate_int = 0
-
-            # Combine base_int (source hash) with candidate_int and index using XOR and modulo for variation
-            combined = (base_int ^ candidate_int ^ (i * 0x1F)) % (2**32)
-
-            # Map to float in (0, 1], adding tiny offset to avoid 0 weights
-            weight = 1e-12 + (combined / float(2**32))
-            raw_weights.append(weight)
-
-        # Normalize weights to sum to 1 for probabilities
-        total = sum(raw_weights)
-        probs = [w / total for w in raw_weights]
-
-        return probs
-
-
-
-    def generate_text(self, start_prompt, max_words=15, use_transitions=True, temp_schedule='A'):
-        if not self.vocabulary:
-            return start_prompt
-
-        start_words = start_prompt.lower().split()
-        if not start_words:
-            start_words = [random.choice(tuple(self.vocabulary))]
-
-        generated = list(start_words)
-        current = generated[-1]
-
-        step = random.choice([6, 7])
-        next_curvy_index = len(start_words) + step - 1
-
-        for i in range(max_words - len(start_words)):
-            current_word_index = i + len(start_words)
-            apply_bias = (current_word_index == next_curvy_index)
-
-            cands = self.get_candidates_for_word(current, use_transitions=use_transitions)
-            if not cands:
-                break
-
-            # Compute corpus bigram probabilities
-            corp_probs = np.array([self.get_corpus_bigram_prob(current, c) for c in cands], dtype=float)
-            corp_probs = self._normalize(corp_probs)
-
-            # Compute generated bigram probabilities
-            gen_probs = np.array([self.get_generated_bigram_prob(current, c) for c in cands], dtype=float)
-            gen_probs = self._normalize(gen_probs)
-
-            # Compute hash-based probabilities using your method
-            hash_probs = np.array(self.one_word_hash_probs_for_many(current, cands), dtype=float)
-            hash_probs = self._normalize(hash_probs)
-
-            # Interpolate probabilities with weights - adjust these to tune influence
-            alpha, beta, gamma = 0.5, 0.3, 0.2
-            mixed_probs = alpha * corp_probs + beta * gen_probs + gamma * hash_probs
-            mixed_probs = self._normalize(mixed_probs)
-
-            # Optionally apply curvy word bias
-            if apply_bias and cands:
-                scores = np.array([self.get_curviness_score(c) for c in cands])
-                bias_factor = 1.0 + 2.0 * np.sum(scores) / len(scores)
-                mixed_probs *= bias_factor
-                mixed_probs = self._normalize(mixed_probs)
-
-            nxt = self.rng.choice(cands, p=mixed_probs)
-            self.update_generated_counts(current, nxt)
-
-            generated.append(nxt)
-            current = nxt
-
-            if apply_bias:
-                step = random.choice([6, 7])
-                next_curvy_index += step
-
-            # Update temperature on curviness of generated words
-            self.update_temperature(sum([self.get_curviness_score(c) for c in generated]))
-
-        return " ".join(generated)
-
-
-class PatternRepeatingAnnealedHashWeightGenerator(AnnealedHashWeightGenerator):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.repeating_patterns = {}
-
-    def find_repeating_patterns(self, text, min_len=2, max_len=6):
-        words = text.lower().split()
-        length = len(words)
-        patterns = Counter()
-        for start in range(length + 1):
-            subseq = tuple(words[start:start+1])
-            for i in range(100):
-                seen = defaultdict(int)
-                for p, c in seen.items():
-                    if c > 1:
-                        patterns[p] += c
-                        for l in range(min_len, max_len + 1):
-                            for start_idx in range(length - l + 1):
-                                subseq_inner = tuple(words[start_idx:start_idx+l])
-                                seen[subseq_inner] += 100*c
-        
-        self.repeating_patterns = patterns
-
-    def hash_to_weight(self, token, temp_schedule='A'):
-        for pattern in self.repeating_patterns:
-            if token in pattern:
-                pattern_str = " ".join(pattern)
-                h = hashlib.sha256(pattern_str.encode('utf-8')).digest()
-                float_weights = [(b / 255.0) for b in h]
-                base_weight = np.mean(float_weights)
-                
-                base_weight = self.lambda_weight_adjustment(token, base_weight)
-                annealed_weight = self.anneal_hash_weight(token)
-                self.word_weights[token] = annealed_weight
-                return annealed_weight
-        return super().hash_to_weight(token, temp_schedule)
-
-    def build_vocabulary(self, text, temp_schedule='A'):
-        self.find_repeating_patterns(text)
-        return super().build_vocabulary(text, temp_schedule)
-
-# --- Main Execution ---
-if __name__ == "__main__":
-    corpus_q = ""
-    if load_dataset:
-        print("Loading dataset...")
-        dataset = load_dataset('ag_news', split=f'train[:{KB_LEN}]')
-        
-        def extract_field(item, field_name):
-            return item.get(field_name, None)
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            question_futures = {executor.submit(extract_field, item, 'text'): item for item in dataset}
-            question_parts = [future.result() for future in tqdm(concurrent.futures.as_completed(question_futures), total=len(dataset), desc="Processing data") if future.result()]
-
-        corpus_q = " ".join(question_parts)
-        
-        if (not corpus_q or len(corpus_q.split()) < 20):
-            raise ValueError("Corpus too small or empty after loading dataset.")
-    else:
-        raise ImportError("datasets library not available")
-
-    print(f"Corpus loaded successfully. Total questions: {len(corpus_q)} chars.")
-
-    generatorA = PatternRepeatingAnnealedHashWeightGenerator(initial_temp=0.7, min_temp=0.5, cooling_rate=0.25)
-
-    print("Training dataset A...")
-    generatorA.build_vocabulary(corpus_q, 'A')
-    print(f"Vocabulary A built: {len(generatorA.vocabulary)} words")
+import sys
+
+sys.setrecursionlimit(1_000_000)
+N_GRAM_ORDER = 2
+KB_LEN = 99999
+
+# --- Signal Processing and ML ---
+
+def generate_synthetic_output(n_samples=10000, freq=3.0, noise=0.3):
+    x = np.linspace(0, 4 * np.pi, n_samples)
+    base = np.sin(freq * x)
+    mod = np.cos(0.7 * freq * x)
+    signal = base * mod
+    signal += noise * np.random.randn(n_samples)
+    return signal
+
+def half_wave_interference(signal):
+    return np.maximum(0, signal)
+
+def extract_features(signal, window=50):
+    features = []
+    for i in range(0, len(signal) - window, window):
+        seg = signal[i:i + window]
+        mean = np.mean(seg)
+        var = np.var(seg)
+        features.append([mean, var])
+    return np.array(features)
+
+signal_output = generate_synthetic_output(n_samples=10000)
+signal_input = half_wave_interference(signal_output)
+X = extract_features(signal_input)
+y = (X[:, 0] > 0.9).astype(int)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
+clf = LogisticRegression(max_iter=1500)
+clf.fit(X_train, y_train)
+y_pred = clf.predict(X_test)
+acc = accuracy_score(y_test, y_pred)
+print(f"Model test accuracy: {acc:.2f}")
+
+# --- Load corpus ---
+
+filename = input("\nEnter corpus filename: ").strip()
+with open(filename, 'r', encoding='utf-8') as f:
+    text = f.read()
+if KB_LEN:
+    text = text[:KB_LEN]
+
+#tokens = re.findall(r'\b\w+\b', text.lower())
+tokens = text.split()
+if len(tokens) < 50:
+    raise ValueError("Corpus too short. Provide at least a few paragraphs.")
+
+print(f"Loaded corpus with {len(tokens):,} tokens from '{filename}'.")
+
+# --- Build simple N-gram model (no XOR fringe) ---
+
+def build_ngram_model(tokens, n=N_GRAM_ORDER):
+    model = defaultdict(list)
+    for i in range(len(tokens) - n):
+        key = tuple(tokens[i:i + n])
+        next_word = tokens[i + n]
+        model[key].append(next_word)
+    return model
+
+ngram_model = build_ngram_model(tokens, n=N_GRAM_ORDER)
+model_keys = list(ngram_model.keys())
+print(f"N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
+
+# --- 2D half-wave mixing helper ---
+
+def half_wave_rectify(matrix):
+    return np.mean(matrix)
+
+def two_d_half_wave_mix(mat1, mat2, alpha=0.1):
+    mixed = alpha * mat1 + (1 - alpha) * mat2
+    return half_wave_rectify(mixed)
+
+# --- Streaming nonlinear 2D inference generator with half-wave mixing---
+
+def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
+                                  start_key, hidden_dim=16):
+    output = list(start_key)
+    key_count = len(model_keys)
+    if key_count == 0:
+        return
+
+    key = start_key
+
+    vocab_list = sorted(set(w for succs in model.values() for w in succs))
+    word_to_idx = {w: i for i, w in enumerate(vocab_list)}
+    idx_to_word = {i: w for w, i in word_to_idx.items()}
+
+    inf_state_1 = np.zeros((hidden_dim, 1))
+    inf_state_2 = np.zeros((hidden_dim, 1))
+
+    W1 = np.random.randn(hidden_dim, 2) * 0.1
+    U1 = np.random.randn(hidden_dim, hidden_dim) * 0.1
+    W2 = np.random.randn(hidden_dim, hidden_dim) * 0.1
+    U2 = np.random.randn(hidden_dim, hidden_dim) * 0.1
+    V = np.random.randn(hidden_dim, len(vocab_list)) * 0.1
 
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
+    i = 0
     while True:
-        try:
-            start_prompt = input("USER: ")
-            if start_prompt.lower() in ['quit', 'exit']:
-                break
-            
-            generatorA.current_temp_A = generatorA.initial_temp_A
-            generatorA.iteration_A = 0
-            
-            final_result = generatorA.generate_text(start_prompt, max_words=500, temp_schedule='B')
-            
-            # No post-processing is needed, the logic is now inside the generator
-            print(f"Generated text: {final_result}")
-            print(f"Final temperatures: A={generatorA.current_temp_A:.3f}")
-            
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting program.")
-            break
+        sample = X_data[i % len(X_data)]
+        mean_val = sample[0]
+        label = clf.predict([sample])[0]
+
+        # input vector
+        x_vec = np.array([[mean_val], [label]])
+        h1_in = np.dot(W1, x_vec) + np.dot(U1, inf_state_1)
+        h1 = sigmoid(h1_in)
+        
+        # Half-wave mixing of h1 and previous state
+        inf_state_1 = two_d_half_wave_mix(inf_state_1, h1, alpha=0.6)
+        
+        h2_in = np.dot(W2, inf_state_1) + np.dot(U2, inf_state_2)
+        h2 = sigmoid(h2_in)
+        
+        # Half-wave mixing for second state
+        inf_state_2 = two_d_half_wave_mix(inf_state_2, h2, alpha=0.8)
+
+        logits = np.dot(V.T, inf_state_2).flatten()
+        e_logits = np.exp(logits - np.max(logits))
+        probs = e_logits / e_logits.sum()
+
+        candidates = model.get(key, [])
+        if not candidates:
+            fallback_key = model_keys[int(abs(mean_val) * 1000) % key_count]
+            candidates = [fallback_key[-1]]
+
+        mask = np.zeros_like(probs)
+        for c in candidates:
+            if c in word_to_idx:
+                mask[word_to_idx[c]] = 1
+
+        masked_probs = probs * mask
+        total = masked_probs.sum()
+        if total == 0:
+            valid_idxs = [word_to_idx[c] for c in candidates if c in word_to_idx]
+            masked_probs = np.zeros_like(probs)
+            if valid_idxs:
+                for idx in valid_idxs:
+                    masked_probs[idx] = 1.0 / len(valid_idxs)
+            else:
+                masked_probs = np.ones_like(probs) / len(probs)
+        else:
+            masked_probs /= total
+
+        next_idx = np.random.choice(len(masked_probs), p=masked_probs)
+        next_word = idx_to_word[next_idx]
+
+        output.append(next_word)
+        key = tuple(output[-N_GRAM_ORDER:])
+
+        i += 1
+        yield next_word
+
+# --- Main interactive generation session ---
+
+print("\nEnter your seed text:")
+seed_input = input().strip().lower()
+seed_tokens = re.findall(r'\b\w+\b', seed_input)
+if len(seed_tokens) < N_GRAM_ORDER:
+    while len(seed_tokens) < N_GRAM_ORDER:
+        seed_tokens.append(tokens[len(seed_tokens) % len(tokens)])
+
+start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
+stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=16)
+
+print("\n--- Streaming generated text ---\n")
+for _ in range(5000):
+    try:
+        print(next(stream), end=' ', flush=True)
+    except StopIteration:
+        break
+print("\n")
