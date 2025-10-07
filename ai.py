@@ -21,7 +21,7 @@ def generate_synthetic_output(n_samples=10000, freq=3.0, noise=0.3):
     return signal
 
 def half_wave_interference(signal):
-    return np.maximum(0, signal)
+    return np.exp(signal)
 
 def extract_features(signal, window=50):
     features = []
@@ -182,3 +182,4 @@ while True:
         except StopIteration:
             break
     print("\n")
+
