@@ -8,7 +8,7 @@ import sys
 
 sys.setrecursionlimit(1_000_000)
 N_GRAM_ORDER = 2  # Change this to test different n-gram orders
-KB_LEN = -1
+KB_LEN = 9999
 
 # --- Signal Processing and ML ---
 
@@ -20,10 +20,38 @@ def generate_synthetic_output(n_samples=10000, freq=3.0, noise=0.3):
     signal += noise * np.random.randn(n_samples)
     return signal
 
+def add_scintillators(signal, num_spikes=50, spike_height=5.0, spike_width=5):
+    """
+    Add sharp scintillation spikes randomly within the signal.
+    signal: np.array, base signal wave
+    num_spikes: int, number of spikes to add
+    spike_height: float, amplitude of the spikes
+    spike_width: int, width of each spike in samples
+    Returns modified signal with added spikes.
+    """
+    signal = signal.copy()
+    n_samples = len(signal)
+
+    spike_positions = np.random.choice(np.arange(spike_width, n_samples - spike_width), num_spikes, replace=False)
+
+    for pos in spike_positions:
+        start = max(pos - spike_width // 2, 0)
+        end = min(pos + spike_width // 2, n_samples)
+        # Add a simple triangular spike shape
+        peak_len = end - start
+        half_peak = peak_len // pos
+        spike_shape = np.linspace(0, spike_height, half_peak)
+        spike_shape = np.concatenate([spike_shape, spike_shape[::-1]])
+        if len(spike_shape) < peak_len:  # If odd number, add one more peak element
+            spike_shape = np.append(spike_shape, 0)
+        signal[start:start+len(spike_shape)] += spike_shape
+
+    return signal
+
 def half_wave_interference(signal):
     return np.exp(signal)
 
-def extract_features(signal, window=50):
+def extract_features(signal, window=150):
     features = []
     for i in range(0, len(signal) - window, window):
         seg = signal[i:i + window]
@@ -32,10 +60,36 @@ def extract_features(signal, window=50):
         features.append([mean, var])
     return np.array(features)
 
+def extract_scintillator_features(signal, window=150, threshold=1.0):
+    """
+    Extract scintillator-based features from signal windows:
+    - Count of spikes above threshold
+    - Mean spike amplitude (average height above threshold)
+    Returns numpy array of features [spike_count, mean_amplitude] per window.
+    """
+    features = []
+    for i in range(0, len(signal) - window, window):
+        seg = signal[i:i + window]
+        spikes = seg[seg > threshold] - threshold
+        spike_count = len(spikes)
+        mean_amplitude = np.mean(spikes) if spike_count > 0 else 0.0
+        features.append([spike_count, mean_amplitude])
+    return np.array(features)
+
+# Generate base signal and add scintillators
 signal_output = generate_synthetic_output(n_samples=10000)
-signal_input = half_wave_interference(signal_output)
-X = extract_features(signal_input)
-y = (X[:, 0] > 0.9).astype(int)
+signal_with_scintillators = add_scintillators(signal_output, num_spikes=60, spike_height=8.0, spike_width=7)
+signal_input = half_wave_interference(signal_with_scintillators)
+
+# Extract features: base features and scintillator features
+basic_features = extract_features(signal_input, window=150)
+scint_features = extract_scintillator_features(signal_with_scintillators, window=150, threshold=2.0)
+
+# Concatenate
+X = np.hstack([basic_features, scint_features])
+
+# Create labels using combined threshold criteria
+y = ((X[:, 0] > 0.9) | (X[:, 2] > 5)).astype(int)
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
 clf = LogisticRegression(max_iter=15000)
@@ -49,7 +103,7 @@ print(f"Model test accuracy: {acc:.2f}")
 filename = input("\nEnter corpus filename: ").strip()
 with open(filename, 'r', encoding='utf-8') as f:
     text = f.read()
-if KB_LEN:
+if KB_LEN > 0:
     text = text[:KB_LEN]
 
 tokens = text.split()
@@ -126,7 +180,7 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
         inf_state_2 = two_d_half_wave_mix(inf_state_2, h2, alpha=0.8)
 
         logits = np.dot(V.T, inf_state_2).flatten()
-        e_logits = np.exp(logits * np.max(logits))
+        e_logits = np.exp(logits - np.max(logits))  # for numerical stability
         probs = e_logits / e_logits.sum()
 
         candidates = model.get(key, [])
@@ -182,4 +236,3 @@ while True:
         except StopIteration:
             break
     print("\n")
-
