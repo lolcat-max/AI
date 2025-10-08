@@ -8,7 +8,7 @@ import sys
 
 sys.setrecursionlimit(1_000_000)
 N_GRAM_ORDER = 2  # Change this to test different n-gram orders
-KB_LEN = 9999
+KB_LEN = 99999
 
 # --- Signal Processing and ML ---
 
@@ -20,7 +20,7 @@ def generate_synthetic_output(n_samples=10000, freq=3.0, noise=0.3):
     signal += noise * np.random.randn(n_samples)
     return signal
 
-def add_scintillators(signal, num_spikes=50, spike_height=5.0, spike_width=5):
+def add_scintillators(signal, num_spikes=1150, spike_height=5.0, spike_width=5):
     """
     Add sharp scintillation spikes randomly within the signal.
     signal: np.array, base signal wave
@@ -89,7 +89,7 @@ scint_features = extract_scintillator_features(signal_with_scintillators, window
 X = np.hstack([basic_features, scint_features])
 
 # Create labels using combined threshold criteria
-y = ((X[:, 0] > 0.9) | (X[:, 2] > 5)).astype(int)
+y = ((X[:, 0] > 0.9) ^ (X[:, 2] > 5)).astype(int)
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
 clf = LogisticRegression(max_iter=15000)
