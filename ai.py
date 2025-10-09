@@ -375,4 +375,5 @@ for question in questions:
     print("\n")
     with open("output.txt", "a") as f:
         f.write(' '.join(stream))
+        f.flush()
     
