@@ -365,15 +365,16 @@ for question in questions:
     stream = context_aware_inference_stream(
         ngram_model, context_map, model_keys, X, clf, start_key, tokens, max_length=500
     )
-    
+    generated = []
     print("\n--- Context-Aware Generated Text ---\n")
     for _ in range(500):
         try:
             print(next(stream), end=' ', flush=True)
+            generated.append(next(stream))
         except StopIteration:
             break
     print("\n")
-    with open("output.txt", "a") as f:
-        f.write(' '.join(stream))
+    with open("output.txt", "a",encoding="utf-8") as f:
+        f.write( question + ":\n" + ' '.join(generated))
         f.flush()
     
