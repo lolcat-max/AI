@@ -7,7 +7,7 @@ import re
 import sys
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 2  # Change this to test different n-gram orders
+N_GRAM_ORDER = 3  # Change this to test different n-gram orders
 KB_LEN = -1
 
 # --- Signal Processing and ML ---
@@ -217,3 +217,4 @@ while True:
         except StopIteration:
             break
     print("\n")
+
