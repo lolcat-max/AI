@@ -274,7 +274,7 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
 
-    print("\nTraining context-aware neural network with quantum features...")
+    print("\nTraining context-aware neural network...")
     
     clf = MLPClassifier(
         hidden_layer_sizes=(128, 64, 32),
@@ -505,5 +505,4 @@ while True:
         except StopIteration:
             break
     print("\n")
-
     

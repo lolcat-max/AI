@@ -10,7 +10,7 @@ import pickle
 import os
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 2  # Increased for better context
+N_GRAM_ORDER = 3  # Increased for better context
 KB_LEN = -1
 
 # --- Schrödinger Equation-Inspired Quantum Features ---
@@ -274,7 +274,7 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
 
-    print("\nTraining context-aware neural network with quantum features...")
+    print("\nTraining context-aware neural network...")
     
     clf = MLPClassifier(
         hidden_layer_sizes=(128, 64, 32),
@@ -512,4 +512,3 @@ for question in questions:
     with open("output.txt", "a", encoding="utf-8") as f:
         f.write(question + ":\n" + ' '.join(generated) + "\n\n")
         f.flush()
-
