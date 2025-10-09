@@ -332,7 +332,7 @@ def context_aware_inference_stream(model, context_map, model_keys, X_data, clf,
         
         yield next_word
 with open("questions.conf", 'r', encoding='utf-8') as f:
-    questions = f.read()
+    questions = f.readlines()
 # --- Main interactive generation ---
 print("\n" + "="*60)
 print("CONTEXT-AWARE TEXT GENERATION READY")
