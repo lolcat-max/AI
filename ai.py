@@ -8,7 +8,7 @@ import sys
 
 sys.setrecursionlimit(1_000_000)
 N_GRAM_ORDER = 2  # Change this to test different n-gram orders
-KB_LEN = 99999
+KB_LEN = -1
 
 # --- Signal Processing and ML ---
 
@@ -18,34 +18,6 @@ def generate_synthetic_output(n_samples=10000, freq=3.0, noise=0.3):
     mod = np.cos(0.7 * freq * x)
     signal = base * mod
     signal += noise * np.random.randn(n_samples)
-    return signal
-
-def add_scintillators(signal, num_spikes=1150, spike_height=5.0, spike_width=5):
-    """
-    Add sharp scintillation spikes randomly within the signal.
-    signal: np.array, base signal wave
-    num_spikes: int, number of spikes to add
-    spike_height: float, amplitude of the spikes
-    spike_width: int, width of each spike in samples
-    Returns modified signal with added spikes.
-    """
-    signal = signal.copy()
-    n_samples = len(signal)
-
-    spike_positions = np.random.choice(np.arange(spike_width, n_samples - spike_width), num_spikes, replace=False)
-
-    for pos in spike_positions:
-        start = max(pos - spike_width // 2, 0)
-        end = min(pos + spike_width // 2, n_samples)
-        # Add a simple triangular spike shape
-        peak_len = end - start
-        half_peak = peak_len // pos
-        spike_shape = np.linspace(0, spike_height, half_peak)
-        spike_shape = np.concatenate([spike_shape, spike_shape[::-1]])
-        if len(spike_shape) < peak_len:  # If odd number, add one more peak element
-            spike_shape = np.append(spike_shape, 0)
-        signal[start:start+len(spike_shape)] += spike_shape
-
     return signal
 
 def half_wave_interference(signal):
@@ -60,36 +32,10 @@ def extract_features(signal, window=150):
         features.append([mean, var])
     return np.array(features)
 
-def extract_scintillator_features(signal, window=150, threshold=1.0):
-    """
-    Extract scintillator-based features from signal windows:
-    - Count of spikes above threshold
-    - Mean spike amplitude (average height above threshold)
-    Returns numpy array of features [spike_count, mean_amplitude] per window.
-    """
-    features = []
-    for i in range(0, len(signal) - window, window):
-        seg = signal[i:i + window]
-        spikes = seg[seg > threshold] - threshold
-        spike_count = len(spikes)
-        mean_amplitude = np.mean(spikes) if spike_count > 0 else 0.0
-        features.append([spike_count, mean_amplitude])
-    return np.array(features)
-
-# Generate base signal and add scintillators
 signal_output = generate_synthetic_output(n_samples=10000)
-signal_with_scintillators = add_scintillators(signal_output, num_spikes=60, spike_height=8.0, spike_width=7)
-signal_input = half_wave_interference(signal_with_scintillators)
-
-# Extract features: base features and scintillator features
-basic_features = extract_features(signal_input, window=150)
-scint_features = extract_scintillator_features(signal_with_scintillators, window=150, threshold=2.0)
-
-# Concatenate
-X = np.hstack([basic_features, scint_features])
-
-# Create labels using combined threshold criteria
-y = ((X[:, 0] > 0.9) ^ (X[:, 2] > 5)).astype(int)
+signal_input = half_wave_interference(signal_output)
+X = extract_features(signal_input)
+y = (X[:, 0] > 0.9).astype(int)
 
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
 clf = LogisticRegression(max_iter=15000)
@@ -135,7 +81,13 @@ def two_d_half_wave_mix(mat1, mat2, alpha=0.1):
     mixed = alpha * mat1 + (1 - alpha) * mat2
     return half_wave_rectify(mixed)
 
-# --- Streaming nonlinear 2D inference generator with half-wave mixing---
+# --- Memory map topology matrix shifting ---
+
+def shift_matrix(mat, shift_x=1, shift_y=0):
+    # Cyclic shift matrix along x and y axes (topology shifting)
+    return np.roll(np.roll(mat, shift_x, axis=0), shift_y, axis=1)
+
+# --- Streaming nonlinear 2D inference generator with half-wave mixing and matrix shifting ---
 
 def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
                                   start_key, hidden_dim=16):
@@ -150,9 +102,18 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
     word_to_idx = {w: i for i, w in enumerate(vocab_list)}
     idx_to_word = {i: w for w, i in word_to_idx.items()}
 
-    inf_state_1 = np.zeros((hidden_dim, 1))
-    inf_state_2 = np.zeros((hidden_dim, 1))
+    # Initialize hidden states as 2D matrices for topology shifting
+    # Use square form for simplicity; adjust if hidden_dim not perfect square
+    state_dim = int(np.sqrt(hidden_dim))
+    if state_dim * state_dim != hidden_dim:
+        print(f"Warning: hidden_dim {hidden_dim} not a perfect square, adjusting to {state_dim**2}")
+        hidden_dim = state_dim**2
 
+    inf_state_1 = np.zeros((state_dim, state_dim))
+    inf_state_2 = np.zeros((state_dim, state_dim))
+
+    # Initialize random weight matrices for linear transformations
+    # Flatten states for dot products, then reshape back
     W1 = np.random.randn(hidden_dim, 2) * 0.1
     U1 = np.random.randn(hidden_dim, hidden_dim) * 0.1
     W2 = np.random.randn(hidden_dim, hidden_dim) * 0.1
@@ -169,18 +130,38 @@ def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
         label = clf.predict([sample])[0]
 
         x_vec = np.array([[mean_val], [label]])
-        h1_in = np.dot(W1, x_vec) + np.dot(U1, inf_state_1)
+
+        # Flatten inf_state_1 for matrix operations
+        inf_state_1_flat = inf_state_1.flatten()[:, None]
+        h1_in = np.dot(W1, x_vec) + np.dot(U1, inf_state_1_flat)
         h1 = sigmoid(h1_in)
+        h1_matrix = h1.reshape((state_dim, state_dim))
 
-        inf_state_1 = two_d_half_wave_mix(inf_state_1, h1, alpha=0.6)
+        # Apply matrix shift to inf_state_1 before mixing
+        shifted_inf_state_1 = shift_matrix(inf_state_1, shift_x=1, shift_y=0)
+        # Update inf_state_1 with half-wave mixing of shifted state and h1
+        inf_state_1 = shift_matrix(shifted_inf_state_1, shift_x=1, shift_y=0)
+        inf_state_1_val = two_d_half_wave_mix(inf_state_1, h1_matrix, alpha=0.6)
 
-        h2_in = np.dot(W2, inf_state_1) + np.dot(U2, inf_state_2)
+        # For inference state 2
+        inf_state_2_flat = inf_state_2.flatten()[:, None]
+        inf_state_1_flat = inf_state_1.flatten()[:, None]
+        h2_in = np.dot(W2, inf_state_1_flat) + np.dot(U2, inf_state_2_flat)
         h2 = sigmoid(h2_in)
+        h2_matrix = h2.reshape((state_dim, state_dim))
 
-        inf_state_2 = two_d_half_wave_mix(inf_state_2, h2, alpha=0.8)
+        # Apply matrix shift to inf_state_2 before mixing
+        shifted_inf_state_2 = shift_matrix(inf_state_2, shift_x=0, shift_y=1)
+        inf_state_2 = shift_matrix(shifted_inf_state_2, shift_x=0, shift_y=1)
+        inf_state_2_val = two_d_half_wave_mix(inf_state_2, h2_matrix, alpha=0.8)
 
-        logits = np.dot(V.T, inf_state_2).flatten()
-        e_logits = np.exp(logits - np.max(logits))  # for numerical stability
+        # Use mixed scalar values to update states as constant arrays
+        inf_state_1.fill(inf_state_1_val)
+        inf_state_2.fill(inf_state_2_val)
+
+        # Compute logits and convert to probabilities
+        logits = np.dot(V.T, inf_state_2.flatten()).flatten()
+        e_logits = np.exp(logits * np.max(logits))
         probs = e_logits / e_logits.sum()
 
         candidates = model.get(key, [])
@@ -227,7 +208,7 @@ while True:
             seed_tokens.append(tokens[len(seed_tokens) % len(tokens)])
 
     start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
-    stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=360)
+    stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=256)
 
     print("\n--- Streaming generated text ---\n")
     for _ in range(500):
