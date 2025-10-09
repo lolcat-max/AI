@@ -260,7 +260,7 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
     X, y, contexts = extract_context_aware_features(tokens, window=50, quantum_extractor=quantum_extractor)
     
     print(f"Extracted {len(X)} context-aware feature vectors")
-    print(f"Feature dimensions: {X.shape[1]}")
+    print(f"Feature dimensions: {X.shape[1]} (including quantum features)")
     print(f"Class distribution: {np.bincount(y)}")
     
     # Normalize features
@@ -463,13 +463,17 @@ def context_aware_inference_stream(model, context_map, model_keys, X_data, clf,
         
         yield next_word
 
+with open("questions.conf", 'r', encoding='utf-8') as f:
+    questions = f.readlines()
+
 # --- Main interactive generation ---
 print("\n" + "="*60)
 print("CONTEXT-AWARE TEXT GENERATION")
 print("="*60)
 
-while True:
-    seed_input = input("USER: ").strip().lower()
+for question in questions:
+    print(question)
+    seed_input = question.strip().lower()
     
     if seed_input == 'quit':
         break
@@ -505,4 +509,6 @@ while True:
         except StopIteration:
             break
     print("\n")
-    
+    with open("output.txt", "a", encoding="utf-8") as f:
+        f.write(question + ":\n" + ' '.join(generated) + "\n\n")
+        f.flush()
