@@ -10,7 +10,7 @@ import pickle
 import os
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 3  # Increased for better context
+N_GRAM_ORDER = 2  # Increased for better context
 KB_LEN = -1
 
 # --- Schrödinger Equation-Inspired Quantum Features ---
@@ -512,3 +512,4 @@ for question in questions:
     with open("output.txt", "a", encoding="utf-8") as f:
         f.write(question + ":\n" + ' '.join(generated) + "\n\n")
         f.flush()
+
