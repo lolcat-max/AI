@@ -10,7 +10,7 @@ import pickle
 import os
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 3  # Increased for better context
+N_GRAM_ORDER = 2  # Increased for better context
 KB_LEN = -1
 
 # --- Schrödinger Equation-Inspired Quantum Features ---
@@ -505,4 +505,5 @@ while True:
         except StopIteration:
             break
     print("\n")
+
     
