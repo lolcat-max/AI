@@ -331,15 +331,16 @@ def context_aware_inference_stream(model, context_map, model_keys, X_data, clf,
         generated_count += 1
         
         yield next_word
-
+with open("questions.conf", 'r', encoding='utf-8') as f:
+    questions = f.read()
 # --- Main interactive generation ---
 print("\n" + "="*60)
 print("CONTEXT-AWARE TEXT GENERATION READY")
 print("="*60)
 
-while True:
-    print("\nEnter your seed text (or 'quit' to exit):")
-    seed_input = input().strip().lower()
+for question in questions:
+    print(question)
+    seed_input = question.strip().lower()
     
     if seed_input == 'quit':
         break
@@ -372,3 +373,6 @@ while True:
         except StopIteration:
             break
     print("\n")
+    with open("output.txt", "a") as f:
+        f.write(' '.join(stream))
+    
