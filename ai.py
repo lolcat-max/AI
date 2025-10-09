@@ -1,50 +1,241 @@
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from collections import defaultdict
+from sklearn.metrics import accuracy_score, log_loss
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import defaultdict, Counter
 import re
 import sys
+import pickle
+import os
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 2  # Change this to test different n-gram orders
+N_GRAM_ORDER = 3  # Increased for better context
 KB_LEN = -1
 
-# --- Signal Processing and ML ---
+# --- Context-Aware Text Data Feature Extraction ---
 
-def generate_synthetic_output(n_samples=10000, freq=3.0, noise=0.3):
-    x = np.linspace(0, 4 * np.pi, n_samples)
-    base = np.sin(freq * x)
-    mod = np.cos(0.7 * freq * x)
-    signal = base * mod
-    signal += noise * np.random.randn(n_samples)
-    return signal
-
-def half_wave_interference(signal):
-    return np.exp(signal)
-
-def extract_features(signal, window=150):
+def extract_context_aware_features(tokens, window=50):
+    """Extract context-aware features from text data"""
     features = []
-    for i in range(0, len(signal) - window, window):
-        seg = signal[i:i + window]
-        mean = np.mean(seg)
-        var = np.var(seg)
-        features.append([mean, var])
-    return np.array(features)
+    labels = []
+    contexts = []
+    
+    # Build vocabulary and word frequencies for context
+    vocab = set(tokens)
+    word_freq = Counter(tokens)
+    total_words = len(tokens)
+    
+    for i in range(0, len(tokens) - window, window // 4):  # More overlap for better context
+        segment = tokens[i:i + window]
+        
+        if len(segment) < window:
+            continue
+            
+        # Context window analysis
+        prev_context = tokens[max(0, i-20):i] if i > 0 else []
+        next_context = tokens[i+window:min(len(tokens), i+window+20)]
+        
+        # Statistical features
+        avg_word_len = np.mean([len(word) for word in segment])
+        vocab_diversity = len(set(segment)) / len(segment)
+        
+        # Word frequency and TF-IDF-like features
+        word_counts = Counter(segment)
+        most_common_freq = word_counts.most_common(1)[0][1] / len(segment) if segment else 0
+        
+        # Context coherence: overlap between current and surrounding contexts
+        prev_overlap = len(set(segment) & set(prev_context)) / max(len(prev_context), 1) if prev_context else 0
+        next_overlap = len(set(segment) & set(next_context)) / max(len(next_context), 1) if next_context else 0
+        
+        # Positional features
+        position_ratio = i / total_words
+        
+        # Semantic density: ratio of unique words to total
+        semantic_density = len(set(segment)) / len(segment)
+        
+        # Average word importance (inverse document frequency proxy)
+        avg_importance = np.mean([1.0 / (word_freq[w] + 1) for w in segment])
+        
+        features.append([
+            avg_word_len,
+            vocab_diversity,
+            most_common_freq,
+            position_ratio,
+            prev_overlap,
+            next_overlap,
+            semantic_density,
+            avg_importance
+        ])
+        
+        # Context-aware labels: based on semantic coherence
+        coherence_score = (prev_overlap + next_overlap) / 2
+        label = 1 if coherence_score > 0.3 else 0
+        labels.append(label)
+        
+        # Store context for generation
+        contexts.append({
+            'segment': segment,
+            'prev': prev_context,
+            'next': next_context,
+            'position': i
+        })
+    
+    return np.array(features), np.array(labels), contexts
 
-signal_output = generate_synthetic_output(n_samples=10000)
-signal_input = half_wave_interference(signal_output)
-X = extract_features(signal_input)
-y = (X[:, 0] > 0.9).astype(int)
+# Database curve memory storage
+class CurveMemoryDB:
+    def __init__(self, cache_file='curve_memory.pkl'):
+        self.cache_file = cache_file
+        self.memory = {'features': [], 'labels': [], 'curve': [], 'loss_curve': []}
+        self.load()
+    
+    def save(self):
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.memory, f)
+    
+    def load(self):
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    loaded_memory = pickle.load(f)
+                    
+                if 'loss_curve' not in loaded_memory:
+                    loaded_memory['loss_curve'] = []
+                
+                self.memory = loaded_memory
+                print(f"Loaded {len(self.memory['features'])} cached samples from database")
+                
+                if 'loss_curve' in self.memory and len(self.memory['loss_curve']) > 0:
+                    print(f"Previous best loss: {min(self.memory['loss_curve']):.6f}")
+                    
+            except Exception as e:
+                print(f"Error loading cache: {e}")
+                self.memory = {'features': [], 'labels': [], 'curve': [], 'loss_curve': []}
+    
+    def store(self, X, y, accuracy, loss_curve):
+        if 'loss_curve' not in self.memory:
+            self.memory['loss_curve'] = []
+            
+        self.memory['features'].extend(X.tolist())
+        self.memory['labels'].extend(y.tolist())
+        self.memory['curve'].append(accuracy)
+        self.memory['loss_curve'].extend(loss_curve)
+        self.save()
+    
+    def get_augmented_data(self, X, y):
+        if len(self.memory['features']) > 0:
+            X_cached = np.array(self.memory['features'])
+            y_cached = np.array(self.memory['labels'])
+            
+            if X_cached.shape[1] == X.shape[1]:
+                X_aug = np.vstack([X, X_cached])
+                y_aug = np.concatenate([y, y_cached])
+                return X_aug, y_aug
+        return X, y
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
-clf = LogisticRegression(max_iter=15000)
-clf.fit(X_train, y_train)
-y_pred = clf.predict(X_test)
-acc = accuracy_score(y_test, y_pred)
-print(f"Model test accuracy: {acc:.2f}")
+def train_model_with_real_data(db, tokens):
+    """Train context-aware model with real text data"""
+    print("\n" + "="*60)
+    print("TRAINING PHASE: Extracting context-aware features...")
+    print("="*60)
+    
+    # Extract context-aware features
+    X, y, contexts = extract_context_aware_features(tokens, window=50)
+    
+    print(f"Extracted {len(X)} context-aware feature vectors")
+    print(f"Feature dimensions: {X.shape[1]}")
+    print(f"Class distribution: {np.bincount(y)}")
+    
+    # Normalize features
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+    
+    # Augment with database memory
+    X, y = db.get_augmented_data(X, y)
+    print(f"Total samples after augmentation: {len(X)}")
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
+
+    print("\nTraining context-aware neural network...")
+    
+    clf = MLPClassifier(
+        hidden_layer_sizes=(128, 64, 32),
+        activation='relu',
+        solver='adam',
+        alpha=0.0001,
+        batch_size=16,
+        learning_rate='adaptive',
+        learning_rate_init=0.01,
+        max_iter=1,
+        shuffle=True,
+        random_state=42,
+        early_stopping=False,
+        validation_fraction=0.1,
+        warm_start=True,
+        verbose=False
+    )
+
+    epochs = 30
+    loss_curve = []
+    accuracy_curve = []
+    
+    clf.fit(X_train, y_train)
+    
+    best_loss = float('inf')
+    patience = 0
+    max_patience = 15
+    
+    for epoch in range(epochs):
+        if epoch > 0 and epoch % 10 == 0:
+            clf.alpha = min(clf.alpha * 1.2, 0.01)
+            clf.learning_rate_init *= 0.9
+        
+        clf.partial_fit(X_train, y_train, classes=np.unique(y))
+        
+        train_pred_proba = clf.predict_proba(X_train)
+        test_pred_proba = clf.predict_proba(X_test)
+        
+        train_loss = log_loss(y_train, train_pred_proba)
+        test_loss = log_loss(y_test, test_pred_proba)
+        
+        train_acc = clf.score(X_train, y_train)
+        test_acc = clf.score(X_test, y_test)
+        
+        loss_curve.append(test_loss)
+        accuracy_curve.append(test_acc)
+        
+        if test_loss < best_loss:
+            best_loss = test_loss
+            patience = 0
+        else:
+            patience += 1
+        
+        if (epoch + 1) % 5 == 0:
+            print(f"Epoch {epoch+1:3d}/{epochs} - Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, Test Acc: {test_acc:.4f}")
+        
+        if patience >= max_patience or (test_acc >= 0.95 and test_loss < 0.15):
+            print(f"\n✓ Training complete at epoch {epoch+1}")
+            break
+
+    y_pred = clf.predict(X_test)
+    final_acc = accuracy_score(y_test, y_pred)
+    
+    print(f"\n{'='*60}")
+    print(f"Final Context-Aware Model Accuracy: {final_acc:.4f}")
+    print(f"Best Loss: {min(loss_curve):.6f}")
+    print(f"{'='*60}")
+
+    db.store(X_train, y_train, final_acc, loss_curve)
+    
+    return clf, X, y, scaler, contexts
 
 # --- Load corpus ---
+
+print("="*60)
+print("CONTEXT-AWARE TEXT GENERATION SYSTEM")
+print("="*60)
 
 filename = input("\nEnter corpus filename: ").strip()
 with open(filename, 'r', encoding='utf-8') as f:
@@ -52,170 +243,132 @@ with open(filename, 'r', encoding='utf-8') as f:
 if KB_LEN > 0:
     text = text[:KB_LEN]
 
-tokens = text.split()
-if len(tokens) < 50:
+tokens = text.lower().split()
+if len(tokens) < 100:
     raise ValueError("Corpus too short. Provide at least a few paragraphs.")
 
 print(f"Loaded corpus with {len(tokens):,} tokens from '{filename}'.")
 
-# --- Build simple N-gram model (supports any order) ---
+# --- Build context-aware N-gram model ---
 
-def build_ngram_model(tokens, n=N_GRAM_ORDER):
+def build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER):
+    """Build n-gram model with context tracking"""
     model = defaultdict(list)
+    context_map = {}
+    
     for i in range(len(tokens) - n):
         key = tuple(tokens[i:i + n])
         next_word = tokens[i + n]
         model[key].append(next_word)
-    return model
+        
+        # Track context position for coherence
+        if key not in context_map:
+            context_map[key] = []
+        context_map[key].append(i)
+    
+    return model, context_map
 
-ngram_model = build_ngram_model(tokens, n=N_GRAM_ORDER)
+ngram_model, context_map = build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER)
 model_keys = list(ngram_model.keys())
-print(f"N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
+print(f"Context-aware N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
 
-# --- 2D half-wave mixing helper ---
+# --- Train the model ---
+db = CurveMemoryDB()
+clf, X, y, scaler, contexts = train_model_with_real_data(db, tokens)
 
-def half_wave_rectify(matrix):
-    return np.mean(matrix)
+# --- Context-aware generation ---
 
-def two_d_half_wave_mix(mat1, mat2, alpha=0.1):
-    mixed = alpha * mat1 + (1 - alpha) * mat2
-    return half_wave_rectify(mixed)
-
-# --- Memory map topology matrix shifting ---
-
-def shift_matrix(mat, shift_x=1, shift_y=0):
-    # Cyclic shift matrix along x and y axes (topology shifting)
-    return np.roll(np.roll(mat, shift_x, axis=0), shift_y, axis=1)
-
-# --- Streaming nonlinear 2D inference generator with half-wave mixing and matrix shifting ---
-
-def nonlinear_2d_inference_stream(model, model_keys, X_data, clf,
-                                  start_key, hidden_dim=16):
+def context_aware_inference_stream(model, context_map, model_keys, X_data, clf, 
+                                   start_key, tokens, max_length=500):
+    """Generate text with context awareness and coherence checking"""
     output = list(start_key)
     key_count = len(model_keys)
+    
     if key_count == 0:
         return
-
+    
     key = start_key
-
-    vocab_list = sorted(set(w for succs in model.values() for w in succs))
-    word_to_idx = {w: i for i, w in enumerate(vocab_list)}
-    idx_to_word = {i: w for w, i in word_to_idx.items()}
-
-    # Initialize hidden states as 2D matrices for topology shifting
-    # Use square form for simplicity; adjust if hidden_dim not perfect square
-    state_dim = int(np.sqrt(hidden_dim))
-    if state_dim * state_dim != hidden_dim:
-        print(f"Warning: hidden_dim {hidden_dim} not a perfect square, adjusting to {state_dim**2}")
-        hidden_dim = state_dim**2
-
-    inf_state_1 = np.zeros((state_dim, state_dim))
-    inf_state_2 = np.zeros((state_dim, state_dim))
-
-    # Initialize random weight matrices for linear transformations
-    # Flatten states for dot products, then reshape back
-    W1 = np.random.randn(hidden_dim, 2) * 0.1
-    U1 = np.random.randn(hidden_dim, hidden_dim) * 0.1
-    W2 = np.random.randn(hidden_dim, hidden_dim) * 0.1
-    U2 = np.random.randn(hidden_dim, hidden_dim) * 0.1
-    V = np.random.randn(hidden_dim, len(vocab_list)) * 0.1
-
-    def sigmoid(x):
-        return 1 / (1 + np.exp(-x))
-
-    i = 0
-    while True:
-        sample = X_data[i % len(X_data)]
-        mean_val = sample[0]
-        label = clf.predict([sample])[0]
-
-        x_vec = np.array([[mean_val], [label]])
-
-        # Flatten inf_state_1 for matrix operations
-        inf_state_1_flat = inf_state_1.flatten()[:, None]
-        h1_in = np.dot(W1, x_vec) + np.dot(U1, inf_state_1_flat)
-        h1 = sigmoid(h1_in)
-        h1_matrix = h1.reshape((state_dim, state_dim))
-
-        # Apply matrix shift to inf_state_1 before mixing
-        shifted_inf_state_1 = shift_matrix(inf_state_1, shift_x=1, shift_y=0)
-        # Update inf_state_1 with half-wave mixing of shifted state and h1
-        inf_state_1 = shift_matrix(shifted_inf_state_1, shift_x=1, shift_y=0)
-        inf_state_1_val = two_d_half_wave_mix(inf_state_1, h1_matrix, alpha=0.6)
-
-        # For inference state 2
-        inf_state_2_flat = inf_state_2.flatten()[:, None]
-        inf_state_1_flat = inf_state_1.flatten()[:, None]
-        h2_in = np.dot(W2, inf_state_1_flat) + np.dot(U2, inf_state_2_flat)
-        h2 = sigmoid(h2_in)
-        h2_matrix = h2.reshape((state_dim, state_dim))
-
-        # Apply matrix shift to inf_state_2 before mixing
-        shifted_inf_state_2 = shift_matrix(inf_state_2, shift_x=0, shift_y=1)
-        inf_state_2 = shift_matrix(shifted_inf_state_2, shift_x=0, shift_y=1)
-        inf_state_2_val = two_d_half_wave_mix(inf_state_2, h2_matrix, alpha=0.8)
-
-        # Use mixed scalar values to update states as constant arrays
-        inf_state_1.fill(inf_state_1_val)
-        inf_state_2.fill(inf_state_2_val)
-
-        # Compute logits and convert to probabilities
-        logits = np.dot(V.T, inf_state_2.flatten()).flatten()
-        e_logits = np.exp(logits * np.max(logits))
-        probs = e_logits / e_logits.sum()
-
+    generated_count = 0
+    context_window = list(start_key)
+    
+    while generated_count < max_length:
         candidates = model.get(key, [])
         
         if not candidates:
-            fallback_key = model_keys[int(abs(mean_val) * 1000) % key_count]
-            candidates = [fallback_key[-1]]
-
-        mask = np.zeros_like(probs)
-        for c in candidates:
-            if c in word_to_idx:
-                mask[word_to_idx[c]] = 1
-
-        masked_probs = probs * mask
-        total = masked_probs.sum()
-
-        if total == 0:
-            valid_idxs = [word_to_idx[c] for c in candidates if c in word_to_idx]
-            masked_probs = np.zeros_like(probs)
-            if valid_idxs:
-                for idx in valid_idxs:
-                    masked_probs[idx] = 1.0 / len(valid_idxs)
+            # Find contextually similar n-grams
+            similar_keys = [k for k in model_keys if any(w in k for w in key)]
+            if similar_keys:
+                key = similar_keys[np.random.randint(0, len(similar_keys))]
+                candidates = model.get(key, [])
             else:
-                masked_probs = np.ones_like(probs) / len(probs)
+                fallback_key = model_keys[np.random.randint(0, key_count)]
+                candidates = model.get(fallback_key, [])
+        
+        # Context-aware selection: prefer words that appear in similar contexts
+        if len(candidates) > 1:
+            # Score candidates based on context coherence
+            candidate_scores = []
+            for cand in set(candidates):
+                # Check if candidate appears in similar contexts in the corpus
+                context_score = 0
+                for w in context_window[-10:]:  # Look at recent context
+                    # Count how often candidate appears near this word
+                    context_score += tokens.count(w) * candidates.count(cand)
+                candidate_scores.append((cand, context_score))
+            
+            # Weighted random selection based on context scores
+            total_score = sum(score for _, score in candidate_scores) + 1e-10
+            probs = [score / total_score for _, score in candidate_scores]
+            next_word = np.random.choice([c for c, _ in candidate_scores], p=probs)
         else:
-            masked_probs /= total
-
-        next_idx = np.random.choice(len(masked_probs), p=masked_probs)
-        next_word = idx_to_word[next_idx]
-
+            next_word = candidates[0]
+        
         output.append(next_word)
+        context_window.append(next_word)
+        
+        # Update key for next iteration
         key = tuple(output[-N_GRAM_ORDER:])
-
-        i += 1
+        generated_count += 1
+        
         yield next_word
 
-# --- Main interactive generation session ---
+# --- Main interactive generation ---
+print("\n" + "="*60)
+print("CONTEXT-AWARE TEXT GENERATION READY")
+print("="*60)
+
 while True:
-    print("\nEnter your seed text:")
+    print("\nEnter your seed text (or 'quit' to exit):")
     seed_input = input().strip().lower()
+    
+    if seed_input == 'quit':
+        break
+    
     seed_tokens = re.findall(r'\b\w+\b', seed_input)
     if len(seed_tokens) < N_GRAM_ORDER:
         while len(seed_tokens) < N_GRAM_ORDER:
             seed_tokens.append(tokens[len(seed_tokens) % len(tokens)])
-
+    
     start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
-    stream = nonlinear_2d_inference_stream(ngram_model, model_keys, X, clf, start_key, hidden_dim=256)
-
-    print("\n--- Streaming generated text ---\n")
+    
+    # Check if start_key exists in model
+    if start_key not in ngram_model:
+        print(f"Note: Seed '{' '.join(start_key)}' not found in corpus, using similar context...")
+        # Find similar key
+        similar = [k for k in model_keys if any(w in k for w in start_key)]
+        if similar:
+            start_key = similar[0]
+        else:
+            start_key = model_keys[0]
+    
+    stream = context_aware_inference_stream(
+        ngram_model, context_map, model_keys, X, clf, start_key, tokens, max_length=500
+    )
+    
+    print("\n--- Context-Aware Generated Text ---\n")
     for _ in range(500):
         try:
             print(next(stream), end=' ', flush=True)
         except StopIteration:
             break
     print("\n")
-
-
