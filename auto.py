@@ -237,7 +237,7 @@ class CurveMemoryDB:
         self.memory['labels'].extend(y.tolist())
         self.memory['curve'].append(accuracy)
         self.memory['loss_curve'].extend(loss_curve)
-        self.save()
+        #self.save()
     
     def get_augmented_data(self, X, y):
         if len(self.memory['features']) > 0:
@@ -512,3 +512,4 @@ for question in questions:
     with open("output.txt", "a", encoding="utf-8") as f:
         f.write(question + ":\n" + ' '.join(generated) + "\n\n")
         f.flush()
+
