@@ -237,7 +237,7 @@ class CurveMemoryDB:
         self.memory['labels'].extend(y.tolist())
         self.memory['curve'].append(accuracy)
         self.memory['loss_curve'].extend(loss_curve)
-        self.save()
+        #self.save()
     
     def get_augmented_data(self, X, y):
         if len(self.memory['features']) > 0:
@@ -505,4 +505,5 @@ while True:
         except StopIteration:
             break
     print("\n")
+
     
