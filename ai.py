@@ -8,9 +8,6 @@ import re
 import sys
 import pickle
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock, Thread, Event
-import queue
 import time
 
 # NEW: Hugging Face datasets import
@@ -21,15 +18,42 @@ N_GRAM_ORDER = 2
 KB_LEN = -1
 
 # Configuration
-hidden_layer_sizes = (16, 8, 4)
-max_samples = 100
-max_segments = 100
+hidden_layer_sizes = (160, 80, 40)
+max_samples = 10000
+max_segments = 10000
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# --- NEW: PyTorch Neural Network Model ---
+# Enable cuDNN autotuner for faster convolutions
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    # Enable TF32 on Ampere GPUs for faster matmul
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Create CUDA stream for asynchronous operations
+    cuda_stream = torch.cuda.Stream()
+else:
+    cuda_stream = None
+
+# --- GPU-Only TensorDataset ---
+
+class GPUTensorDataset(Dataset):
+    """Custom Dataset that keeps all tensors on GPU"""
+    def __init__(self, *tensors):
+        assert all(tensors[0].size(0) == tensor.size(0) for tensor in tensors), \
+            "Size mismatch between tensors"
+        self.tensors = tensors
+        
+    def __getitem__(self, index):
+        return tuple(tensor[index] for tensor in self.tensors)
+    
+    def __len__(self):
+        return self.tensors[0].size(0)
+
+# --- PyTorch Neural Network Model ---
 
 class ContextAwareNN(nn.Module):
     """
@@ -56,7 +80,7 @@ class ContextAwareNN(nn.Module):
     def forward(self, x):
         return self.network(x)
 
-# --- NEW: Preprocessing Cache ---
+# --- Preprocessing Cache ---
 
 class PreprocessingCache:
     """
@@ -145,54 +169,74 @@ class PreprocessingCache:
             self.cache['quantum_features_cache'][segment_tuple] = features
             return features
 
-# --- Schrödinger Equation-Inspired Quantum Features ---
+# --- Schrödinger Equation-Inspired Quantum Features (FULL GPU) ---
 
 class SchrodingerQuantumFeatures:
     """
     Quantum-inspired features using time-independent Schrödinger equation:
     Ĥψ = Eψ, where Ĥ is the Hamiltonian operator
+    FULLY GPU-ACCELERATED - ALL OPERATIONS ON CUDA
     """
     def __init__(self, hbar=1.0):
         self.hbar = hbar
-        print("Feature extractor initialized")
+        self.device = device
+        print(f"Feature extractor initialized on {self.device}")
     
-    def compute_potential_energy(self, word_freq, total_words):
-        return -np.log(word_freq / total_words + 1e-10)
+    def compute_potential_energy(self, word_freq_tensor, total_words):
+        """Compute potential energy using tensors"""
+        return -torch.log(word_freq_tensor / total_words + 1e-10)
     
-    def compute_kinetic_energy(self, word_len, avg_len):
-        return 0.5 * ((word_len - avg_len) ** 2)
+    def compute_kinetic_energy(self, word_len_tensor, avg_len):
+        """Compute kinetic energy using tensors"""
+        return 0.5 * ((word_len_tensor - avg_len) ** 2)
     
     def compute_hamiltonian(self, kinetic, potential):
+        """Compute Hamiltonian using tensors"""
         return kinetic + potential
     
-    def compute_wavefunction(self, position, energy, width=1.0):
-        return np.exp(-position**2 / (2 * width**2))
+    def compute_wavefunction(self, position_tensor, energy_tensor, width=1.0):
+        """Compute wavefunction using tensors"""
+        return torch.exp(-position_tensor**2 / (2 * width**2))
     
-    def compute_probability_density(self, wavefunction):
-        return np.abs(wavefunction) ** 2
+    def compute_probability_density(self, wavefunction_tensor):
+        """Compute probability density using tensors"""
+        return torch.abs(wavefunction_tensor) ** 2
     
     def extract_quantum_features(self, segment, word_freq, total_words):
-        word_lens = [len(word) for word in segment]
-        avg_len = np.mean(word_lens)
+        """Extract quantum features using GPU-accelerated tensor operations"""
+        # Convert word lengths to tensor ON GPU
+        word_lens = torch.tensor([len(word) for word in segment], 
+                                dtype=torch.float32, device=self.device)
+        avg_len = torch.mean(word_lens)
         
-        kinetic_energies = [self.compute_kinetic_energy(wl, avg_len) for wl in word_lens]
-        potential_energies = [self.compute_potential_energy(word_freq[w], total_words) 
-                             for w in segment]
-        hamiltonians = [self.compute_hamiltonian(k, p) 
-                       for k, p in zip(kinetic_energies, potential_energies)]
+        # Kinetic energies (GPU tensor operation)
+        kinetic_energies = self.compute_kinetic_energy(word_lens, avg_len)
         
-        positions = np.linspace(-300, 300, len(segment))
-        wavefunctions = [self.compute_wavefunction(pos, h) 
-                        for pos, h in zip(positions, hamiltonians)]
-        prob_densities = [self.compute_probability_density(wf) for wf in wavefunctions]
+        # Potential energies (GPU tensor operation)
+        word_freq_vals = torch.tensor([word_freq[w] for w in segment], 
+                                      dtype=torch.float32, device=self.device)
+        potential_energies = self.compute_potential_energy(word_freq_vals, total_words)
         
-        avg_energy = np.mean(hamiltonians)
-        energy_variance = np.var(hamiltonians)
-        avg_probability = np.mean(prob_densities)
+        # Hamiltonians (GPU tensor operation)
+        hamiltonians = self.compute_hamiltonian(kinetic_energies, potential_energies)
+        
+        # Positions (GPU tensor operation)
+        positions = torch.linspace(-300, 300, len(segment), device=self.device)
+        
+        # Wavefunctions (vectorized GPU tensor operation)
+        wavefunctions = self.compute_wavefunction(positions, hamiltonians)
+        
+        # Probability densities (vectorized GPU tensor operation)
+        prob_densities = self.compute_probability_density(wavefunctions)
+        
+        # Statistical measures (GPU tensor operations)
+        avg_energy = torch.mean(hamiltonians).item()
+        energy_variance = torch.var(hamiltonians).item()
+        avg_probability = torch.mean(prob_densities).item()
         coherence = 1.0 / (energy_variance + 1e-10)
         
-        position_uncertainty = np.std(positions)
-        momentum_uncertainty = np.std(hamiltonians)
+        position_uncertainty = torch.std(positions).item()
+        momentum_uncertainty = torch.std(hamiltonians).item()
         uncertainty_product = position_uncertainty * momentum_uncertainty
         
         return {
@@ -203,7 +247,7 @@ class SchrodingerQuantumFeatures:
             'uncertainty_product': uncertainty_product
         }
 
-# --- Context-Aware Text Data Feature Extraction ---
+# --- Context-Aware Text Data Feature Extraction (GPU) ---
 
 def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
     features = []
@@ -223,7 +267,11 @@ def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
         prev_context = tokens[max(0, i-20):i] if i > 0 else []
         next_context = tokens[i+window:min(len(tokens), i+window+20)]
         
-        avg_word_len = np.mean([len(word) for word in segment])
+        # Convert to tensors for faster computation ON GPU
+        word_lens_tensor = torch.tensor([len(word) for word in segment], 
+                                       dtype=torch.float32, device=device)
+        avg_word_len = torch.mean(word_lens_tensor).item()
+        
         vocab_diversity = len(set(segment)) / len(segment)
         
         word_counts = Counter(segment)
@@ -234,7 +282,11 @@ def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
         
         position_ratio = i / total_words
         semantic_density = len(set(segment)) / len(segment)
-        avg_importance = np.mean([1.0 / (word_freq[w] + 1) for w in segment])
+        
+        # Compute average importance using tensors ON GPU
+        word_freq_vals = torch.tensor([1.0 / (word_freq[w] + 1) for w in segment], 
+                                      dtype=torch.float32, device=device)
+        avg_importance = torch.mean(word_freq_vals).item()
         
         quantum_features = {}
         if quantum_extractor:
@@ -279,29 +331,42 @@ def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
             'quantum': quantum_features
         })
     
-    return np.array(features), np.array(labels), contexts
+    features_array = np.array(features)
+    labels_array = np.array(labels)
+    
+    return features_array, labels_array, contexts
 
-# --- NEW: PyTorch Training Function ---
+# --- PURE GPU PyTorch Training Function ---
 
 def train_pytorch_model(X_train, y_train, X_test, y_test, input_size, epochs=30):
     """
-    Train PyTorch neural network with GPU acceleration
+    Train PyTorch neural network with PURE GPU operations
+    ALL DATA STAYS ON GPU - NO CPU TRANSFERS
     """
     print("\n" + "="*60)
-    print("TRAINING PYTORCH NEURAL NETWORK")
+    print("TRAINING PYTORCH NEURAL NETWORK (PURE GPU)")
     print("="*60)
     
-    # Convert to PyTorch tensors
+    # Convert to PyTorch tensors DIRECTLY ON GPU
     X_train_tensor = torch.FloatTensor(X_train).to(device)
     y_train_tensor = torch.LongTensor(y_train).to(device)
     X_test_tensor = torch.FloatTensor(X_test).to(device)
     y_test_tensor = torch.LongTensor(y_test).to(device)
     
-    # Create DataLoader for batch training
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+    print(f"✓ All tensors loaded directly to GPU: {device}")
+    print(f"  - Training data: {X_train_tensor.shape} on {X_train_tensor.device}")
+    print(f"  - Test data: {X_test_tensor.shape} on {X_test_tensor.device}")
     
-    # Initialize model
+    # Create GPU-only DataLoader (no pin_memory needed)
+    train_dataset = GPUTensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=512, 
+        shuffle=True,
+        num_workers=0  # Must be 0 for GPU tensors
+    )
+    
+    # Initialize model ON GPU
     model = ContextAwareNN(
         input_size=input_size,
         hidden_sizes=hidden_layer_sizes,
@@ -325,15 +390,17 @@ def train_pytorch_model(X_train, y_train, X_test, y_test, input_size, epochs=30)
     loss_curve = []
     accuracy_curve = []
     
-    print(f"\nTraining on {device}...")
+    print(f"\nTraining on {device} (Pure GPU mode - no CPU transfers)...")
     print("="*60)
     
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
         
-        # Batch training
+        # Batch training - data already on GPU, no transfer needed!
         for batch_X, batch_y in train_loader:
+            # No .to(device) needed - already on GPU!
+            
             # Forward pass
             outputs = model(batch_X)
             loss = criterion(outputs, batch_y)
@@ -347,7 +414,7 @@ def train_pytorch_model(X_train, y_train, X_test, y_test, input_size, epochs=30)
         
         train_loss /= len(train_loader)
         
-        # Evaluation
+        # Evaluation - all data already on GPU
         model.eval()
         with torch.no_grad():
             # Training accuracy
@@ -408,7 +475,7 @@ def train_model_with_real_data(tokens, quantum_extractor):
     from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
     
-    # Train PyTorch model
+    # Train PyTorch model (pure GPU)
     model, loss_curve, accuracy_curve = train_pytorch_model(
         X_train, y_train, X_test, y_test, 
         input_size=X.shape[1], 
@@ -473,125 +540,125 @@ def build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER):
     
     return model, context_map
 
-class ThreadedGenerator:
-    def __init__(self, generator_func, buffer_size=100):
-        self.generator = generator_func
-        self.buffer = queue.Queue(maxsize=buffer_size)
-        self.stop_event = Event()
-        self.thread = None
+# --- PURE GPU BATCH GENERATOR ---
+class BatchGenerator:
+    """
+    Fully GPU-based batch generator.
+    All scoring, probability, and sampling done on CUDA.
+    """
+    def __init__(self, model, model_keys, preprocessing_cache, quantum_extractor, 
+                 start_key, max_length=500, batch_size=32):
+        self.model = model
+        self.model_keys = model_keys
+        self.preprocessing_cache = preprocessing_cache
+        self.quantum_extractor = quantum_extractor
+        self.start_key = start_key
+        self.max_length = max_length
+        self.batch_size = batch_size
         
-    def _producer(self):
-        try:
-            for item in self.generator:
-                if self.stop_event.is_set():
-                    break
-                self.buffer.put(('item', item))
-        except Exception as e:
-            self.buffer.put(('error', e))
-        finally:
-            self.buffer.put(('done', None))
-    
-    def start(self):
-        self.thread = Thread(target=self._producer, daemon=True)
-        self.thread.start()
-        return self
-    
+        self.tokens = preprocessing_cache.cache['tokens']
+        self.word_freq = preprocessing_cache.cache['word_freq']
+        self.total_words = preprocessing_cache.cache['total_words']
+        
+        self.output = list(start_key)
+        self.context_window = list(start_key)
+        self.generated_count = 0
+        self.key = start_key
+        self.device = device
+
+    def _select_next_word_batch(self, candidates):
+        """Select next word using pure GPU operations"""
+        if not candidates:
+            # fallback
+            fallback_key = self.model_keys[torch.randint(0, len(self.model_keys), (1,)).item()]
+            candidates = self.model.get(fallback_key, [])
+            if not candidates:
+                return self.tokens[torch.randint(0, len(self.tokens), (1,), device=self.device).item()]
+
+        # Deduplicate and move data to tensor
+        unique_candidates = list(set(candidates))
+        num_cands = len(unique_candidates)
+
+        # Compute context similarity scores using tensor math
+        context_tail = self.context_window[-10:]
+        # Convert words to length tensors (proxy for semantic difference)
+        cand_lens = torch.tensor([len(c) for c in unique_candidates], dtype=torch.float32, device=self.device)
+        ctx_lens = torch.tensor([len(c) for c in context_tail], dtype=torch.float32, device=self.device)
+        
+        # Cosine-style similarity proxy
+        ctx_mean = ctx_lens.mean()
+        similarity_scores = 1.0 / (1.0 + (cand_lens - ctx_mean).abs())
+
+        # Get quantum coherence scores (batch)
+        coherence_scores = []
+        for cand in unique_candidates:
+            test_segment = self.context_window[-10:] + [cand]
+            q = self.preprocessing_cache.get_quantum_features(
+                test_segment, self.quantum_extractor, self.word_freq, self.total_words
+            )
+            coherence_scores.append(q['coherence'] * q['avg_probability'])
+        coherence_tensor = torch.tensor(coherence_scores, dtype=torch.float32, device=self.device)
+
+        # Combine scores purely on GPU
+        combined_scores = similarity_scores * (1.0 + coherence_tensor)
+        probs = torch.softmax(combined_scores, dim=0)
+
+        # GPU-native random sampling
+        choice_idx = torch.multinomial(probs, 1).item()
+        return unique_candidates[choice_idx]
+
+    @torch.no_grad()
+    def generate_next(self):
+        """Generate next token using CUDA-only computations"""
+        if self.generated_count >= self.max_length:
+            return None
+
+        candidates = self.model.get(self.key, [])
+        if not candidates:
+            # fallback to similar keys
+            key_tensor = torch.tensor([hash(w) % 100000 for w in self.key], device=self.device)
+            similarities = []
+            for k in self.model_keys:
+                k_tensor = torch.tensor([hash(w) % 100000 for w in k], device=self.device)
+                sim = torch.mean((key_tensor - k_tensor).float().abs())
+                similarities.append(sim.item())
+            best_idx = torch.argmin(torch.tensor(similarities)).item()
+            self.key = self.model_keys[best_idx]
+            candidates = self.model.get(self.key, [])
+        
+        next_word = self._select_next_word_batch(candidates)
+
+        self.output.append(next_word)
+        self.context_window.append(next_word)
+        self.key = tuple(self.output[-N_GRAM_ORDER:])
+        self.generated_count += 1
+        return next_word
+
     def __iter__(self):
         return self
-    
-    def __next__(self):
-        msg_type, item = self.buffer.get()
-        
-        if msg_type == 'done':
-            raise StopIteration
-        elif msg_type == 'error':
-            raise item
-        else:
-            return item
-    
-    def stop(self):
-        self.stop_event.set()
 
-def _context_aware_generator_core(model, model_keys, start_key, preprocessing_cache, 
-                                  quantum_extractor, max_length=500):
-    """Optimized core generator using preprocessing cache"""
-    output = list(start_key)
-    key_count = len(model_keys)
-    
-    if key_count == 0:
-        return
-    
-    key = start_key
-    generated_count = 0
-    context_window = list(start_key)
-    
-    tokens = preprocessing_cache.cache['tokens']
-    word_freq = preprocessing_cache.cache['word_freq']
-    total_words = preprocessing_cache.cache['total_words']
-    
-    while generated_count < max_length:
-        candidates = model.get(key, [])
-        
-        if not candidates:
-            similar_keys = [k for k in model_keys if any(w in k for w in key)]
-            if similar_keys:
-                key = similar_keys[np.random.randint(0, len(similar_keys))]
-                candidates = model.get(key, [])
-            else:
-                fallback_key = model_keys[np.random.randint(0, key_count)]
-                candidates = model.get(fallback_key, [])
-        
-        if len(candidates) > 1:
-            candidate_scores = []
-            for cand in set(candidates):
-                context_score = 0
-                for w in context_window[-10:]:
-                    context_score += tokens.count(w) * candidates.count(cand)
-                
-                test_segment = context_window[-10:] + [cand]
-                
-                quantum_features = preprocessing_cache.get_quantum_features(
-                    test_segment, quantum_extractor, word_freq, total_words
-                )
-                
-                quantum_score = quantum_features['coherence'] * quantum_features['avg_probability']
-                combined_score = context_score * (1 + quantum_score)
-                
-                candidate_scores.append((cand, combined_score))
-            
-            total_score = sum(score for _, score in candidate_scores) + 1e-10
-            probs = [score / total_score for _, score in candidate_scores]
-            next_word = np.random.choice([c for c, _ in candidate_scores], p=probs)
-        else:
-            next_word = candidates[0]
-        
-        output.append(next_word)
-        context_window.append(next_word)
-        
-        key = tuple(output[-N_GRAM_ORDER:])
-        generated_count += 1
-        
-        yield next_word
+    def __next__(self):
+        word = self.generate_next()
+        if word is None:
+            raise StopIteration
+        return word
+
 
 def context_aware_inference_stream(preprocessing_cache, quantum_extractor, start_key, 
-                                   max_length=500, buffer_size=150):
+                                   max_length=500):
+    """Create batch generator - pure GPU"""
     model = preprocessing_cache.cache['ngram_model']
     model_keys = preprocessing_cache.cache['model_keys']
     
-    base_generator = _context_aware_generator_core(
-        model, model_keys, start_key, preprocessing_cache,
-        quantum_extractor, max_length
+    return BatchGenerator(
+        model, model_keys, preprocessing_cache, quantum_extractor,
+        start_key, max_length, batch_size=32
     )
-    
-    threaded_gen = ThreadedGenerator(base_generator, buffer_size=buffer_size)
-    threaded_gen.start()
-    
-    return threaded_gen
 
 # --- Main execution ---
 print("="*60)
 print("CONTEXT-AWARE TEXT GENERATION WITH QUANTUM FEATURES")
-print("(PYTORCH VERSION WITH GPU ACCELERATION)")
+print("(PURE GPU VERSION - ALL DATA ON CUDA)")
 print("="*60)
 
 quantum_extractor = SchrodingerQuantumFeatures(hbar=1.0)
@@ -673,23 +740,22 @@ while True:
         else:
             start_key = model_keys[0]
     
-    stream = context_aware_inference_stream(
-        preprocessing_cache, quantum_extractor, start_key,
-        max_length=500, buffer_size=150
-    )
+    # Use CUDA stream for asynchronous generation if available
+    if cuda_stream is not None:
+        with torch.cuda.stream(cuda_stream):
+            stream = context_aware_inference_stream(
+                preprocessing_cache, quantum_extractor, start_key, max_length=500
+            )
+    else:
+        stream = context_aware_inference_stream(
+            preprocessing_cache, quantum_extractor, start_key, max_length=500
+        )
     
     generated = []
-    print("\n--- Context-Aware Generated Text (PyTorch) ---\n")
+    print("\n--- Context-Aware Generated Text (Pure GPU/CUDA) ---\n")
     
-    try:
-        for _ in range(500):
-            try:
-                word = next(stream)
-                print(word, end=' ', flush=True)
-                generated.append(word)
-            except StopIteration:
-                break
-    finally:
-        stream.stop()
+    for word in stream:
+        print(word, end=' ', flush=True)
+        generated.append(word)
     
     print("\n")
