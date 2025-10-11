@@ -8,10 +8,109 @@ import re
 import sys
 import pickle
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Thread, Event
+import queue
+import time
+
+# NEW: Hugging Face datasets import
+from datasets import load_dataset
 
 sys.setrecursionlimit(1_000_000)
-N_GRAM_ORDER = 2  # Increased for better context
+N_GRAM_ORDER = 2
 KB_LEN = -1
+
+# --- NEW: Preprocessing Cache ---
+
+class PreprocessingCache:
+    """
+    Cache preprocessed data for instant generation
+    All expensive computations happen once during setup
+    """
+    def __init__(self, cache_file='preprocessing_cache.pkl'):
+        self.cache_file = cache_file
+        self.cache = {
+            'word_freq': None,
+            'total_words': 0,
+            'quantum_features_cache': {},  # Pre-computed quantum features
+            'candidate_scores_cache': {},   # Pre-computed candidate scores
+            'tokens': None,
+            'ngram_model': None,
+            'context_map': None,
+            'model_keys': None
+        }
+        
+    def save(self):
+        """Save preprocessing cache to disk"""
+        print(f"\n💾 Saving preprocessing cache to '{self.cache_file}'...")
+        with open(self.cache_file, 'wb') as f:
+            pickle.dump(self.cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"✓ Cache saved ({os.path.getsize(self.cache_file) / 1024 / 1024:.2f} MB)")
+    
+    def load(self):
+        """Load preprocessing cache from disk"""
+        if os.path.exists(self.cache_file):
+            try:
+                print(f"\n📂 Loading preprocessing cache from '{self.cache_file}'...")
+                with open(self.cache_file, 'rb') as f:
+                    self.cache = pickle.load(f)
+                print(f"✓ Cache loaded successfully")
+                print(f"  - Tokens: {len(self.cache['tokens']):,}")
+                print(f"  - N-gram keys: {len(self.cache['model_keys']):,}")
+                print(f"  - Quantum features cached: {len(self.cache['quantum_features_cache']):,}")
+                print(f"  - Candidate scores cached: {len(self.cache['candidate_scores_cache']):,}")
+                return True
+            except Exception as e:
+                print(f"✗ Error loading cache: {e}")
+                return False
+        return False
+    
+    def store_preprocessing(self, tokens, ngram_model, context_map, model_keys, word_freq, total_words):
+        """Store preprocessing results"""
+        self.cache['tokens'] = tokens
+        self.cache['ngram_model'] = ngram_model
+        self.cache['context_map'] = context_map
+        self.cache['model_keys'] = model_keys
+        self.cache['word_freq'] = word_freq
+        self.cache['total_words'] = total_words
+    
+    def precompute_quantum_features(self, quantum_extractor, max_segments=10000):
+        """Pre-compute quantum features for common segments"""
+        print(f"\n⚛️  Pre-computing quantum features for up to {max_segments:,} segments...")
+        
+        tokens = self.cache['tokens']
+        word_freq = self.cache['word_freq']
+        total_words = self.cache['total_words']
+        
+        # Generate common segment patterns
+        segment_length = 10
+        computed = 0
+        
+        for i in range(0, min(len(tokens) - segment_length, max_segments * segment_length), segment_length):
+            segment = tuple(tokens[i:i + segment_length])
+            
+            if segment not in self.cache['quantum_features_cache']:
+                features = quantum_extractor.extract_quantum_features(
+                    list(segment), word_freq, total_words
+                )
+                self.cache['quantum_features_cache'][segment] = features
+                computed += 1
+        
+        print(f"✓ Pre-computed {computed:,} quantum feature sets")
+    
+    def get_quantum_features(self, segment, quantum_extractor, word_freq, total_words):
+        """Get quantum features from cache or compute"""
+        segment_tuple = tuple(segment[-10:])  # Use last 10 words as key
+        
+        if segment_tuple in self.cache['quantum_features_cache']:
+            return self.cache['quantum_features_cache'][segment_tuple]
+        else:
+            # Compute and cache
+            features = quantum_extractor.extract_quantum_features(
+                list(segment_tuple), word_freq, total_words
+            )
+            self.cache['quantum_features_cache'][segment_tuple] = features
+            return features
 
 # --- Schrödinger Equation-Inspired Quantum Features ---
 
@@ -24,75 +123,47 @@ class SchrodingerQuantumFeatures:
     through the semantic space of the corpus.
     """
     def __init__(self, hbar=1.0):
-        self.hbar = hbar  # Reduced Planck constant (normalized)
+        self.hbar = hbar
         print("Feature extractor initialized")
     
     def compute_potential_energy(self, word_freq, total_words):
-        """
-        Compute potential energy V(x) based on word frequency
-        Higher frequency = lower potential (more stable state)
-        """
         return -np.log(word_freq / total_words + 1e-10)
     
     def compute_kinetic_energy(self, word_len, avg_len):
-        """
-        Compute kinetic energy T based on deviation from average word length
-        T = (1/2m)p², approximated by length variation
-        """
         return 0.5 * ((word_len - avg_len) ** 2)
     
     def compute_hamiltonian(self, kinetic, potential):
-        """
-        Compute total Hamiltonian: H = T + V
-        """
         return kinetic + potential
     
     def compute_wavefunction(self, position, energy, width=1.0):
-        """
-        Compute Gaussian wavefunction: ψ(x) = exp(-x²/2σ²) * exp(-iEt/ℏ)
-        For simplicity, we use the spatial part
-        """
         return np.exp(-position**2 / (2 * width**2))
     
     def compute_probability_density(self, wavefunction):
-        """
-        Compute probability density: |ψ|²
-        """
         return np.abs(wavefunction) ** 2
     
     def compute_expectation_value(self, values, probabilities):
-        """
-        Compute expectation value: <O> = ∫ψ*Ôψ dx
-        """
         return np.sum(values * probabilities) / (np.sum(probabilities) + 1e-10)
     
     def extract_quantum_features(self, segment, word_freq, total_words):
-        """
-        Extract quantum-inspired features from a text segment
-        """
         word_lens = [len(word) for word in segment]
         avg_len = np.mean(word_lens)
         
-        # Compute energies for each word
         kinetic_energies = [self.compute_kinetic_energy(wl, avg_len) for wl in word_lens]
         potential_energies = [self.compute_potential_energy(word_freq[w], total_words) 
                              for w in segment]
         hamiltonians = [self.compute_hamiltonian(k, p) 
                        for k, p in zip(kinetic_energies, potential_energies)]
         
-        # Compute wavefunctions
         positions = np.linspace(-300, 300, len(segment))
         wavefunctions = [self.compute_wavefunction(pos, h) 
                         for pos, h in zip(positions, hamiltonians)]
         prob_densities = [self.compute_probability_density(wf) for wf in wavefunctions]
         
-        # Quantum features
         avg_energy = np.mean(hamiltonians)
         energy_variance = np.var(hamiltonians)
         avg_probability = np.mean(prob_densities)
-        coherence = 1.0 / (energy_variance + 1e-10)  # High coherence = low variance
+        coherence = 1.0 / (energy_variance + 1e-10)
         
-        # Uncertainty principle approximation: ΔxΔp ≥ ℏ/2
         position_uncertainty = np.std(positions)
         momentum_uncertainty = np.std(hamiltonians)
         uncertainty_product = position_uncertainty * momentum_uncertainty
@@ -108,48 +179,36 @@ class SchrodingerQuantumFeatures:
 # --- Context-Aware Text Data Feature Extraction ---
 
 def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
-    """Extract context-aware features from text data with Schrödinger equation"""
     features = []
     labels = []
     contexts = []
     
-    # Build vocabulary and word frequencies for context
     vocab = set(tokens)
     word_freq = Counter(tokens)
     total_words = len(tokens)
     
-    for i in range(0, len(tokens) - window, window // 4):  # More overlap for better context
+    for i in range(0, len(tokens) - window, window // 4):
         segment = tokens[i:i + window]
         
         if len(segment) < window:
             continue
             
-        # Context window analysis
         prev_context = tokens[max(0, i-20):i] if i > 0 else []
         next_context = tokens[i+window:min(len(tokens), i+window+20)]
         
-        # Statistical features
         avg_word_len = np.mean([len(word) for word in segment])
         vocab_diversity = len(set(segment)) / len(segment)
         
-        # Word frequency and TF-IDF-like features
         word_counts = Counter(segment)
         most_common_freq = word_counts.most_common(1)[0][1] / len(segment) if segment else 0
         
-        # Context coherence: overlap between current and surrounding contexts
         prev_overlap = len(set(segment) & set(prev_context)) / max(len(prev_context), 1) if prev_context else 0
         next_overlap = len(set(segment) & set(next_context)) / max(len(next_context), 1) if next_context else 0
         
-        # Positional features
         position_ratio = i / total_words
-        
-        # Semantic density: ratio of unique words to total
         semantic_density = len(set(segment)) / len(segment)
-        
-        # Average word importance (inverse document frequency proxy)
         avg_importance = np.mean([1.0 / (word_freq[w] + 1) for w in segment])
         
-        # Schrödinger quantum features
         quantum_features = {}
         if quantum_extractor:
             quantum_features = quantum_extractor.extract_quantum_features(
@@ -167,7 +226,6 @@ def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
             avg_importance
         ]
         
-        # Add quantum features
         if quantum_features:
             feature_vector.extend([
                 quantum_features['avg_energy'],
@@ -179,16 +237,13 @@ def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
         
         features.append(feature_vector)
         
-        # Context-aware labels: based on semantic coherence enhanced by quantum coherence
         coherence_score = (prev_overlap + next_overlap) / 2
         if quantum_features:
-            # Weight by quantum coherence
             coherence_score = (coherence_score + quantum_features['coherence']) / 2
         
         label = 1 if coherence_score > 0.3 else 0
         labels.append(label)
         
-        # Store context for generation
         contexts.append({
             'segment': segment,
             'prev': prev_context,
@@ -237,7 +292,6 @@ class CurveMemoryDB:
         self.memory['labels'].extend(y.tolist())
         self.memory['curve'].append(accuracy)
         self.memory['loss_curve'].extend(loss_curve)
-        #self.save()
     
     def get_augmented_data(self, X, y):
         if len(self.memory['features']) > 0:
@@ -251,24 +305,20 @@ class CurveMemoryDB:
         return X, y
 
 def train_model_with_real_data(db, tokens, quantum_extractor):
-    """Train context-aware model with real text data and quantum features"""
     print("\n" + "="*60)
     print("TRAINING PHASE: Extracting context-aware features...")
     print("="*60)
     
-    # Extract context-aware features with quantum enhancement
     X, y, contexts = extract_context_aware_features(tokens, window=50, quantum_extractor=quantum_extractor)
     
     print(f"Extracted {len(X)} context-aware feature vectors")
     print(f"Feature dimensions: {X.shape[1]}")
     print(f"Class distribution: {np.bincount(y)}")
     
-    # Normalize features
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
     
-    # Augment with database memory
     X, y = db.get_augmented_data(X, y)
     print(f"Total samples after augmentation: {len(X)}")
 
@@ -347,31 +397,48 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
     
     return clf, X, y, scaler, contexts
 
-# --- Load corpus ---
-
-print("="*60)
-print("CONTEXT-AWARE TEXT GENERATION")
-print("="*60)
-
-# Initialize quantum feature extractor
-quantum_extractor = SchrodingerQuantumFeatures(hbar=1.0)
-
-filename = input("\nEnter corpus filename: ").strip()
-with open(filename, 'r', encoding='utf-8') as f:
-    text = f.read()
-if KB_LEN > 0:
-    text = text[:KB_LEN]
-
-tokens = text.lower().split()
-if len(tokens) < 100:
-    raise ValueError("Corpus too short. Provide at least a few paragraphs.")
-
-print(f"Loaded corpus with {len(tokens):,} tokens from '{filename}'.")
-
-# --- Build context-aware N-gram model ---
+def load_facebook_reasoning_dataset(max_samples=10000):
+    print("\n" + "="*60)
+    print("LOADING FACEBOOK NATURAL REASONING DATASET")
+    print("="*60)
+    
+    try:
+        print("Downloading dataset from Hugging Face Hub...")
+        dataset = load_dataset("facebook/natural_reasoning", split="train")
+        
+        print(f"Total dataset size: {len(dataset):,} samples")
+        print(f"Loading first {max_samples:,} samples for training...")
+        
+        all_text = []
+        for i, example in enumerate(dataset):
+            if i >= max_samples:
+                break
+            
+            question = example.get('question', '')
+            response = example.get('model_response', '')
+            reference = example.get('reference_answer', '')
+            
+            combined_text = f"{question} {response} {reference}"
+            all_text.append(combined_text)
+            
+            if (i + 1) % 1000 == 0:
+                print(f"  Processed {i+1:,} samples...")
+        
+        corpus = " ".join(all_text)
+        tokens = corpus.lower().split()
+        
+        print(f"\n✓ Dataset loaded successfully!")
+        print(f"  Total tokens: {len(tokens):,}")
+        print(f"  Unique tokens: {len(set(tokens)):,}")
+        
+        return tokens
+        
+    except Exception as e:
+        print(f"\n✗ Error loading dataset: {e}")
+        print("  Falling back to manual file input...")
+        return None
 
 def build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER):
-    """Build n-gram model with context tracking"""
     model = defaultdict(list)
     context_map = {}
     
@@ -380,26 +447,56 @@ def build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER):
         next_word = tokens[i + n]
         model[key].append(next_word)
         
-        # Track context position for coherence
         if key not in context_map:
             context_map[key] = []
         context_map[key].append(i)
     
     return model, context_map
 
-ngram_model, context_map = build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER)
-model_keys = list(ngram_model.keys())
-print(f"Context-aware N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
+class ThreadedGenerator:
+    def __init__(self, generator_func, buffer_size=100):
+        self.generator = generator_func
+        self.buffer = queue.Queue(maxsize=buffer_size)
+        self.stop_event = Event()
+        self.thread = None
+        
+    def _producer(self):
+        try:
+            for item in self.generator:
+                if self.stop_event.is_set():
+                    break
+                self.buffer.put(('item', item))
+        except Exception as e:
+            self.buffer.put(('error', e))
+        finally:
+            self.buffer.put(('done', None))
+    
+    def start(self):
+        self.thread = Thread(target=self._producer, daemon=True)
+        self.thread.start()
+        return self
+    
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        msg_type, item = self.buffer.get()
+        
+        if msg_type == 'done':
+            raise StopIteration
+        elif msg_type == 'error':
+            raise item
+        else:
+            return item
+    
+    def stop(self):
+        self.stop_event.set()
 
-# --- Train the model ---
-db = CurveMemoryDB()
-clf, X, y, scaler, contexts = train_model_with_real_data(db, tokens, quantum_extractor)
+# --- NEW: Optimized generator using preprocessing cache ---
 
-# --- Context-aware generation with quantum coherence ---
-
-def context_aware_inference_stream(model, context_map, model_keys, X_data, clf, 
-                                   start_key, tokens, quantum_extractor, max_length=500):
-    """Generate text with context awareness, coherence checking, and quantum features"""
+def _context_aware_generator_core(model, model_keys, start_key, preprocessing_cache, 
+                                  quantum_extractor, max_length=500):
+    """Optimized core generator using preprocessing cache"""
     output = list(start_key)
     key_count = len(model_keys)
     
@@ -409,14 +506,16 @@ def context_aware_inference_stream(model, context_map, model_keys, X_data, clf,
     key = start_key
     generated_count = 0
     context_window = list(start_key)
-    word_freq = Counter(tokens)
-    total_words = len(tokens)
+    
+    # Get pre-computed data from cache
+    tokens = preprocessing_cache.cache['tokens']
+    word_freq = preprocessing_cache.cache['word_freq']
+    total_words = preprocessing_cache.cache['total_words']
     
     while generated_count < max_length:
         candidates = model.get(key, [])
         
         if not candidates:
-            # Find contextually similar n-grams
             similar_keys = [k for k in model_keys if any(w in k for w in key)]
             if similar_keys:
                 key = similar_keys[np.random.randint(0, len(similar_keys))]
@@ -425,29 +524,25 @@ def context_aware_inference_stream(model, context_map, model_keys, X_data, clf,
                 fallback_key = model_keys[np.random.randint(0, key_count)]
                 candidates = model.get(fallback_key, [])
         
-        # Context-aware selection with quantum coherence
         if len(candidates) > 1:
-            # Score candidates based on context coherence and quantum features
             candidate_scores = []
             for cand in set(candidates):
-                # Traditional context score
                 context_score = 0
                 for w in context_window[-10:]:
                     context_score += tokens.count(w) * candidates.count(cand)
                 
-                # Quantum-enhanced scoring
                 test_segment = context_window[-10:] + [cand]
-                quantum_features = quantum_extractor.extract_quantum_features(
-                    test_segment, word_freq, total_words
+                
+                # Use cached quantum features
+                quantum_features = preprocessing_cache.get_quantum_features(
+                    test_segment, quantum_extractor, word_freq, total_words
                 )
                 
-                # Combine classical and quantum scores
                 quantum_score = quantum_features['coherence'] * quantum_features['avg_probability']
                 combined_score = context_score * (1 + quantum_score)
                 
                 candidate_scores.append((cand, combined_score))
             
-            # Weighted random selection based on combined scores
             total_score = sum(score for _, score in candidate_scores) + 1e-10
             probs = [score / total_score for _, score in candidate_scores]
             next_word = np.random.choice([c for c, _ in candidate_scores], p=probs)
@@ -457,19 +552,98 @@ def context_aware_inference_stream(model, context_map, model_keys, X_data, clf,
         output.append(next_word)
         context_window.append(next_word)
         
-        # Update key for next iteration
         key = tuple(output[-N_GRAM_ORDER:])
         generated_count += 1
         
         yield next_word
 
-# --- Main interactive generation ---
+def context_aware_inference_stream(preprocessing_cache, quantum_extractor, start_key, 
+                                   max_length=500, buffer_size=150):
+    model = preprocessing_cache.cache['ngram_model']
+    model_keys = preprocessing_cache.cache['model_keys']
+    
+    base_generator = _context_aware_generator_core(
+        model, model_keys, start_key, preprocessing_cache,
+        quantum_extractor, max_length
+    )
+    
+    threaded_gen = ThreadedGenerator(base_generator, buffer_size=buffer_size)
+    threaded_gen.start()
+    
+    return threaded_gen
+
+# --- Main execution ---
+print("="*60)
+print("CONTEXT-AWARE TEXT GENERATION WITH QUANTUM FEATURES")
+print("(OPTIMIZED WITH PREPROCESSING CACHE)")
+print("="*60)
+
+quantum_extractor = SchrodingerQuantumFeatures(hbar=1.0)
+preprocessing_cache = PreprocessingCache(cache_file='preprocessing_cache.pkl')
+
+# Try to load existing cache
+cache_loaded = preprocessing_cache.load()
+
+if not cache_loaded:
+    print("\n🔧 No cache found. Running initial setup...")
+    
+    use_hf_dataset = input("\nUse Facebook Natural Reasoning dataset? (y/n): ").strip().lower()
+
+    if use_hf_dataset == 'y':
+        tokens = load_facebook_reasoning_dataset(max_samples=10000)
+        if tokens is None:
+            filename = input("\nEnter corpus filename: ").strip()
+            with open(filename, 'r', encoding='utf-8') as f:
+                text = f.read()
+            if KB_LEN > 0:
+                text = text[:KB_LEN]
+            tokens = text.lower().split()
+    else:
+        filename = input("\nEnter corpus filename: ").strip()
+        with open(filename, 'r', encoding='utf-8') as f:
+            text = f.read()
+        if KB_LEN > 0:
+            text = text[:KB_LEN]
+        tokens = text.lower().split()
+
+    if len(tokens) < 100:
+        raise ValueError("Corpus too short. Provide at least a few paragraphs.")
+
+    print(f"\n✓ Loaded corpus with {len(tokens):,} tokens.")
+    
+    # Build n-gram model
+    print("\n🔨 Building n-gram model...")
+    ngram_model, context_map = build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER)
+    model_keys = list(ngram_model.keys())
+    print(f"✓ N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
+    
+    # Store preprocessing
+    word_freq = Counter(tokens)
+    total_words = len(tokens)
+    preprocessing_cache.store_preprocessing(tokens, ngram_model, context_map, model_keys, word_freq, total_words)
+    
+    # Pre-compute quantum features
+    preprocessing_cache.precompute_quantum_features(quantum_extractor, max_segments=5000)
+    
+    # Train model
+    db = CurveMemoryDB()
+    clf, X, y, scaler, contexts = train_model_with_real_data(db, tokens, quantum_extractor)
+    
+    # Save everything
+    preprocessing_cache.save()
+    print("\n✓ Setup complete! Next run will be instant.")
+else:
+    print("\n⚡ Using cached preprocessing data - ready for instant generation!")
+    tokens = preprocessing_cache.cache['tokens']
+    model_keys = preprocessing_cache.cache['model_keys']
+
+# --- Generation loop ---
 print("\n" + "="*60)
 print("CONTEXT-AWARE TEXT GENERATION")
 print("="*60)
 
 while True:
-    seed_input = input("USER: ").strip().lower()
+    seed_input = input("\nUSER: ").strip().lower()
     
     if seed_input == 'quit':
         break
@@ -481,10 +655,10 @@ while True:
     
     start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
     
-    # Check if start_key exists in model
+    ngram_model = preprocessing_cache.cache['ngram_model']
+    
     if start_key not in ngram_model:
         print(f"Note: Seed '{' '.join(start_key)}' not found in corpus, using similar context...")
-        # Find similar key
         similar = [k for k in model_keys if any(w in k for w in start_key)]
         if similar:
             start_key = similar[0]
@@ -492,18 +666,22 @@ while True:
             start_key = model_keys[0]
     
     stream = context_aware_inference_stream(
-        ngram_model, context_map, model_keys, X, clf, start_key, tokens, 
-        quantum_extractor, max_length=500
+        preprocessing_cache, quantum_extractor, start_key,
+        max_length=500, buffer_size=150
     )
+    
     generated = []
     print("\n--- Context-Aware Generated Text ---\n")
-    for _ in range(500):
-        try:
-            word = next(stream)
-            print(word, end=' ', flush=True)
-            generated.append(word)
-        except StopIteration:
-            break
-    print("\n")
-
     
+    try:
+        for _ in range(500):
+            try:
+                word = next(stream)
+                print(word, end=' ', flush=True)
+                generated.append(word)
+            except StopIteration:
+                break
+    finally:
+        stream.stop()
+    
+    print("\n")
