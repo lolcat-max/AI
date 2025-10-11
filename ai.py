@@ -1,8 +1,8 @@
 import numpy as np
-from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, log_loss
-from sklearn.feature_extraction.text import TfidfVectorizer
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from collections import defaultdict, Counter
 import re
 import sys
@@ -13,17 +13,48 @@ from threading import Lock, Thread, Event
 import queue
 import time
 
-
-hidden_layer_sizes=(16, 8, 4)
-max_samples = 100
-max_segments = 100
-
 # NEW: Hugging Face datasets import
 from datasets import load_dataset
 
 sys.setrecursionlimit(1_000_000)
 N_GRAM_ORDER = 2
 KB_LEN = -1
+
+# Configuration
+hidden_layer_sizes = (16, 8, 4)
+max_samples = 100
+max_segments = 100
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# --- NEW: PyTorch Neural Network Model ---
+
+class ContextAwareNN(nn.Module):
+    """
+    PyTorch Multi-Layer Perceptron for context-aware text classification
+    """
+    def __init__(self, input_size, hidden_sizes=(16, 8, 4), output_size=2, dropout=0.2):
+        super(ContextAwareNN, self).__init__()
+        
+        layers = []
+        prev_size = input_size
+        
+        # Build hidden layers
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(prev_size, hidden_size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_size = hidden_size
+        
+        # Output layer
+        layers.append(nn.Linear(prev_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.network(x)
 
 # --- NEW: Preprocessing Cache ---
 
@@ -37,8 +68,8 @@ class PreprocessingCache:
         self.cache = {
             'word_freq': None,
             'total_words': 0,
-            'quantum_features_cache': {},  # Pre-computed quantum features
-            'candidate_scores_cache': {},   # Pre-computed candidate scores
+            'quantum_features_cache': {},
+            'candidate_scores_cache': {},
             'tokens': None,
             'ngram_model': None,
             'context_map': None,
@@ -63,7 +94,6 @@ class PreprocessingCache:
                 print(f"  - Tokens: {len(self.cache['tokens']):,}")
                 print(f"  - N-gram keys: {len(self.cache['model_keys']):,}")
                 print(f"  - Quantum features cached: {len(self.cache['quantum_features_cache']):,}")
-                print(f"  - Candidate scores cached: {len(self.cache['candidate_scores_cache']):,}")
                 return True
             except Exception as e:
                 print(f"✗ Error loading cache: {e}")
@@ -87,7 +117,6 @@ class PreprocessingCache:
         word_freq = self.cache['word_freq']
         total_words = self.cache['total_words']
         
-        # Generate common segment patterns
         segment_length = 10
         computed = 0
         
@@ -105,12 +134,11 @@ class PreprocessingCache:
     
     def get_quantum_features(self, segment, quantum_extractor, word_freq, total_words):
         """Get quantum features from cache or compute"""
-        segment_tuple = tuple(segment[-10:])  # Use last 10 words as key
+        segment_tuple = tuple(segment[-10:])
         
         if segment_tuple in self.cache['quantum_features_cache']:
             return self.cache['quantum_features_cache'][segment_tuple]
         else:
-            # Compute and cache
             features = quantum_extractor.extract_quantum_features(
                 list(segment_tuple), word_freq, total_words
             )
@@ -123,9 +151,6 @@ class SchrodingerQuantumFeatures:
     """
     Quantum-inspired features using time-independent Schrödinger equation:
     Ĥψ = Eψ, where Ĥ is the Hamiltonian operator
-    
-    We model text coherence as a quantum wavefunction that evolves
-    through the semantic space of the corpus.
     """
     def __init__(self, hbar=1.0):
         self.hbar = hbar
@@ -145,9 +170,6 @@ class SchrodingerQuantumFeatures:
     
     def compute_probability_density(self, wavefunction):
         return np.abs(wavefunction) ** 2
-    
-    def compute_expectation_value(self, values, probabilities):
-        return np.sum(values * probabilities) / (np.sum(probabilities) + 1e-10)
     
     def extract_quantum_features(self, segment, word_freq, total_words):
         word_lens = [len(word) for word in segment]
@@ -259,124 +281,93 @@ def extract_context_aware_features(tokens, window=50, quantum_extractor=None):
     
     return np.array(features), np.array(labels), contexts
 
-# Database curve memory storage
-class CurveMemoryDB:
-    def __init__(self, cache_file='curve_memory.pkl'):
-        self.cache_file = cache_file
-        self.memory = {'features': [], 'labels': [], 'curve': [], 'loss_curve': []}
-        self.load()
-    
-    def save(self):
-        with open(self.cache_file, 'wb') as f:
-            pickle.dump(self.memory, f)
-    
-    def load(self):
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'rb') as f:
-                    loaded_memory = pickle.load(f)
-                    
-                if 'loss_curve' not in loaded_memory:
-                    loaded_memory['loss_curve'] = []
-                
-                self.memory = loaded_memory
-                print(f"Loaded {len(self.memory['features'])} cached samples from database")
-                
-                if 'loss_curve' in self.memory and len(self.memory['loss_curve']) > 0:
-                    print(f"Previous best loss: {min(self.memory['loss_curve']):.6f}")
-                    
-            except Exception as e:
-                print(f"Error loading cache: {e}")
-                self.memory = {'features': [], 'labels': [], 'curve': [], 'loss_curve': []}
-    
-    def store(self, X, y, accuracy, loss_curve):
-        if 'loss_curve' not in self.memory:
-            self.memory['loss_curve'] = []
-            
-        self.memory['features'].extend(X.tolist())
-        self.memory['labels'].extend(y.tolist())
-        self.memory['curve'].append(accuracy)
-        self.memory['loss_curve'].extend(loss_curve)
-    
-    def get_augmented_data(self, X, y):
-        if len(self.memory['features']) > 0:
-            X_cached = np.array(self.memory['features'])
-            y_cached = np.array(self.memory['labels'])
-            
-            if X_cached.shape[1] == X.shape[1]:
-                X_aug = np.vstack([X, X_cached])
-                y_aug = np.concatenate([y, y_cached])
-                return X_aug, y_aug
-        return X, y
+# --- NEW: PyTorch Training Function ---
 
-def train_model_with_real_data(db, tokens, quantum_extractor):
+def train_pytorch_model(X_train, y_train, X_test, y_test, input_size, epochs=30):
+    """
+    Train PyTorch neural network with GPU acceleration
+    """
     print("\n" + "="*60)
-    print("TRAINING PHASE: Extracting context-aware features...")
+    print("TRAINING PYTORCH NEURAL NETWORK")
     print("="*60)
     
-    X, y, contexts = extract_context_aware_features(tokens, window=50, quantum_extractor=quantum_extractor)
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.FloatTensor(X_train).to(device)
+    y_train_tensor = torch.LongTensor(y_train).to(device)
+    X_test_tensor = torch.FloatTensor(X_test).to(device)
+    y_test_tensor = torch.LongTensor(y_test).to(device)
     
-    print(f"Extracted {len(X)} context-aware feature vectors")
-    print(f"Feature dimensions: {X.shape[1]}")
-    print(f"Class distribution: {np.bincount(y)}")
+    # Create DataLoader for batch training
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
     
-    from sklearn.preprocessing import StandardScaler
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    # Initialize model
+    model = ContextAwareNN(
+        input_size=input_size,
+        hidden_sizes=hidden_layer_sizes,
+        output_size=2,
+        dropout=0.2
+    ).to(device)
     
-    X, y = db.get_augmented_data(X, y)
-    print(f"Total samples after augmentation: {len(X)}")
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
-
-    print("\nTraining context-aware neural network...")
+    print(f"\nModel Architecture:")
+    print(model)
+    print(f"\nTotal parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    clf = MLPClassifier(
-        hidden_layer_sizes=hidden_layer_sizes,
-        activation='relu',
-        solver='adam',
-        alpha=0.0001,
-        batch_size=512,
-        learning_rate='adaptive',
-        learning_rate_init=0.01,
-        max_iter=1,
-        shuffle=True,
-        random_state=42,
-        early_stopping=False,
-        validation_fraction=0.1,
-        warm_start=True,
-        verbose=False
-    )
-
-    epochs = 30
-    loss_curve = []
-    accuracy_curve = []
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
-    clf.fit(X_train, y_train)
-    
+    # Training loop
     best_loss = float('inf')
     patience = 0
     max_patience = 15
+    loss_curve = []
+    accuracy_curve = []
+    
+    print(f"\nTraining on {device}...")
+    print("="*60)
     
     for epoch in range(epochs):
-        if epoch > 0 and epoch % 10 == 0:
-            clf.alpha = min(clf.alpha * 1.2, 0.01)
-            clf.learning_rate_init *= 0.9
+        model.train()
+        train_loss = 0.0
         
-        clf.partial_fit(X_train, y_train, classes=np.unique(y))
+        # Batch training
+        for batch_X, batch_y in train_loader:
+            # Forward pass
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
         
-        train_pred_proba = clf.predict_proba(X_train)
-        test_pred_proba = clf.predict_proba(X_test)
+        train_loss /= len(train_loader)
         
-        train_loss = log_loss(y_train, train_pred_proba)
-        test_loss = log_loss(y_test, test_pred_proba)
-        
-        train_acc = clf.score(X_train, y_train)
-        test_acc = clf.score(X_test, y_test)
+        # Evaluation
+        model.eval()
+        with torch.no_grad():
+            # Training accuracy
+            train_outputs = model(X_train_tensor)
+            _, train_predicted = torch.max(train_outputs.data, 1)
+            train_acc = (train_predicted == y_train_tensor).sum().item() / len(y_train_tensor)
+            
+            # Test metrics
+            test_outputs = model(X_test_tensor)
+            test_loss = criterion(test_outputs, y_test_tensor).item()
+            _, test_predicted = torch.max(test_outputs.data, 1)
+            test_acc = (test_predicted == y_test_tensor).sum().item() / len(y_test_tensor)
         
         loss_curve.append(test_loss)
         accuracy_curve.append(test_acc)
         
+        # Learning rate scheduling
+        scheduler.step(test_loss)
+        
+        # Early stopping
         if test_loss < best_loss:
             best_loss = test_loss
             patience = 0
@@ -389,18 +380,42 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
         if patience >= max_patience or (test_acc >= 0.95 and test_loss < 0.15):
             print(f"\n✓ Training complete at epoch {epoch+1}")
             break
-
-    y_pred = clf.predict(X_test)
-    final_acc = accuracy_score(y_test, y_pred)
     
     print(f"\n{'='*60}")
-    print(f"Final Context-Aware Model Accuracy: {final_acc:.4f}")
+    print(f"Final Test Accuracy: {test_acc:.4f}")
     print(f"Best Loss: {min(loss_curve):.6f}")
     print(f"{'='*60}")
-
-    db.store(X_train, y_train, final_acc, loss_curve)
     
-    return clf, X, y, scaler, contexts
+    return model, loss_curve, accuracy_curve
+
+def train_model_with_real_data(tokens, quantum_extractor):
+    print("\n" + "="*60)
+    print("TRAINING PHASE: Extracting context-aware features...")
+    print("="*60)
+    
+    X, y, contexts = extract_context_aware_features(tokens, window=50, quantum_extractor=quantum_extractor)
+    
+    print(f"Extracted {len(X)} context-aware feature vectors")
+    print(f"Feature dimensions: {X.shape[1]}")
+    print(f"Class distribution: {np.bincount(y)}")
+    
+    # Normalize features
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
+    
+    # Split data
+    from sklearn.model_selection import train_test_split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=42)
+    
+    # Train PyTorch model
+    model, loss_curve, accuracy_curve = train_pytorch_model(
+        X_train, y_train, X_test, y_test, 
+        input_size=X.shape[1], 
+        epochs=30
+    )
+    
+    return model, X, y, scaler, contexts
 
 def load_facebook_reasoning_dataset(max_samples=100000):
     print("\n" + "="*60)
@@ -497,8 +512,6 @@ class ThreadedGenerator:
     def stop(self):
         self.stop_event.set()
 
-# --- NEW: Optimized generator using preprocessing cache ---
-
 def _context_aware_generator_core(model, model_keys, start_key, preprocessing_cache, 
                                   quantum_extractor, max_length=500):
     """Optimized core generator using preprocessing cache"""
@@ -512,7 +525,6 @@ def _context_aware_generator_core(model, model_keys, start_key, preprocessing_ca
     generated_count = 0
     context_window = list(start_key)
     
-    # Get pre-computed data from cache
     tokens = preprocessing_cache.cache['tokens']
     word_freq = preprocessing_cache.cache['word_freq']
     total_words = preprocessing_cache.cache['total_words']
@@ -538,7 +550,6 @@ def _context_aware_generator_core(model, model_keys, start_key, preprocessing_ca
                 
                 test_segment = context_window[-10:] + [cand]
                 
-                # Use cached quantum features
                 quantum_features = preprocessing_cache.get_quantum_features(
                     test_segment, quantum_extractor, word_freq, total_words
                 )
@@ -580,13 +591,12 @@ def context_aware_inference_stream(preprocessing_cache, quantum_extractor, start
 # --- Main execution ---
 print("="*60)
 print("CONTEXT-AWARE TEXT GENERATION WITH QUANTUM FEATURES")
-print("(OPTIMIZED WITH PREPROCESSING CACHE)")
+print("(PYTORCH VERSION WITH GPU ACCELERATION)")
 print("="*60)
 
 quantum_extractor = SchrodingerQuantumFeatures(hbar=1.0)
 preprocessing_cache = PreprocessingCache(cache_file='preprocessing_cache.pkl')
 
-# Try to load existing cache
 cache_loaded = preprocessing_cache.load()
 
 if not cache_loaded:
@@ -616,25 +626,19 @@ if not cache_loaded:
 
     print(f"\n✓ Loaded corpus with {len(tokens):,} tokens.")
     
-    # Build n-gram model
     print("\n🔨 Building n-gram model...")
     ngram_model, context_map = build_context_aware_ngram_model(tokens, n=N_GRAM_ORDER)
     model_keys = list(ngram_model.keys())
     print(f"✓ N-gram model built with {len(model_keys):,} {N_GRAM_ORDER}-word keys.")
     
-    # Store preprocessing
     word_freq = Counter(tokens)
     total_words = len(tokens)
     preprocessing_cache.store_preprocessing(tokens, ngram_model, context_map, model_keys, word_freq, total_words)
     
-    # Pre-compute quantum features
     preprocessing_cache.precompute_quantum_features(quantum_extractor, max_segments=max_segments)
     
-    # Train model
-    db = CurveMemoryDB()
-    clf, X, y, scaler, contexts = train_model_with_real_data(db, tokens, quantum_extractor)
+    model, X, y, scaler, contexts = train_model_with_real_data(tokens, quantum_extractor)
     
-    # Save everything
     preprocessing_cache.save()
     print("\n✓ Setup complete! Next run will be instant.")
 else:
@@ -642,7 +646,6 @@ else:
     tokens = preprocessing_cache.cache['tokens']
     model_keys = preprocessing_cache.cache['model_keys']
 
-# --- Generation loop ---
 print("\n" + "="*60)
 print("CONTEXT-AWARE TEXT GENERATION")
 print("="*60)
@@ -676,7 +679,7 @@ while True:
     )
     
     generated = []
-    print("\n--- Context-Aware Generated Text ---\n")
+    print("\n--- Context-Aware Generated Text (PyTorch) ---\n")
     
     try:
         for _ in range(500):
