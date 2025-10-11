@@ -81,7 +81,7 @@ class SchrodingerQuantumFeatures:
                        for k, p in zip(kinetic_energies, potential_energies)]
         
         # Compute wavefunctions
-        positions = np.linspace(-3, 3, len(segment))
+        positions = np.linspace(-300, 300, len(segment))
         wavefunctions = [self.compute_wavefunction(pos, h) 
                         for pos, h in zip(positions, hamiltonians)]
         prob_densities = [self.compute_probability_density(wf) for wf in wavefunctions]
