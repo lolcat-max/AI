@@ -13,6 +13,11 @@ from threading import Lock, Thread, Event
 import queue
 import time
 
+
+hidden_layer_sizes=(16, 8, 4)
+max_samples = 100
+max_segments = 100
+
 # NEW: Hugging Face datasets import
 from datasets import load_dataset
 
@@ -74,7 +79,7 @@ class PreprocessingCache:
         self.cache['word_freq'] = word_freq
         self.cache['total_words'] = total_words
     
-    def precompute_quantum_features(self, quantum_extractor, max_segments=10000):
+    def precompute_quantum_features(self, quantum_extractor, max_segments=100000):
         """Pre-compute quantum features for common segments"""
         print(f"\n⚛️  Pre-computing quantum features for up to {max_segments:,} segments...")
         
@@ -327,11 +332,11 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
     print("\nTraining context-aware neural network...")
     
     clf = MLPClassifier(
-        hidden_layer_sizes=(128, 64, 32),
+        hidden_layer_sizes=hidden_layer_sizes,
         activation='relu',
         solver='adam',
         alpha=0.0001,
-        batch_size=16,
+        batch_size=512,
         learning_rate='adaptive',
         learning_rate_init=0.01,
         max_iter=1,
@@ -397,7 +402,7 @@ def train_model_with_real_data(db, tokens, quantum_extractor):
     
     return clf, X, y, scaler, contexts
 
-def load_facebook_reasoning_dataset(max_samples=10000):
+def load_facebook_reasoning_dataset(max_samples=100000):
     print("\n" + "="*60)
     print("LOADING FACEBOOK NATURAL REASONING DATASET")
     print("="*60)
@@ -590,7 +595,7 @@ if not cache_loaded:
     use_hf_dataset = input("\nUse Facebook Natural Reasoning dataset? (y/n): ").strip().lower()
 
     if use_hf_dataset == 'y':
-        tokens = load_facebook_reasoning_dataset(max_samples=10000)
+        tokens = load_facebook_reasoning_dataset(max_samples=max_samples)
         if tokens is None:
             filename = input("\nEnter corpus filename: ").strip()
             with open(filename, 'r', encoding='utf-8') as f:
@@ -623,7 +628,7 @@ if not cache_loaded:
     preprocessing_cache.store_preprocessing(tokens, ngram_model, context_map, model_keys, word_freq, total_words)
     
     # Pre-compute quantum features
-    preprocessing_cache.precompute_quantum_features(quantum_extractor, max_segments=5000)
+    preprocessing_cache.precompute_quantum_features(quantum_extractor, max_segments=max_segments)
     
     # Train model
     db = CurveMemoryDB()
