@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -658,7 +659,6 @@ def context_aware_inference_stream(preprocessing_cache, quantum_extractor, start
 # --- Main execution ---
 print("="*60)
 print("CONTEXT-AWARE TEXT GENERATION WITH QUANTUM FEATURES")
-print("(PURE GPU VERSION - ALL DATA ON CUDA)")
 print("="*60)
 
 quantum_extractor = SchrodingerQuantumFeatures(hbar=1.0)
@@ -752,7 +752,7 @@ while True:
         )
     
     generated = []
-    print("\n--- Context-Aware Generated Text (Pure GPU/CUDA) ---\n")
+    print("\n--- Context-Aware Generated Text ---\n")
     
     for word in stream:
         print(word, end=' ', flush=True)
