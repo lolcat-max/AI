@@ -841,8 +841,8 @@ class TokenGeneratorFSM:
             )
             # Initialize in superposition of INIT and SELECT states
             self.quantum_state.mix_states({
-                GeneratorState.INIT: 0.7,
-                GeneratorState.SELECT_CANDIDATES: 0.3
+                GeneratorState.INIT: 10.7,
+                GeneratorState.SELECT_CANDIDATES: 10.3
             })
             print("🌀 Quantum state mixing ENABLED for token generation")
         else:
