@@ -860,8 +860,7 @@ def train_model_with_real_data(tokens, quantum_extractor):
     model, loss_curve, accuracy_curve = train_pytorch_model(
         X_train, y_train, X_test, y_test, 
         input_size=X.shape[1], 
-        epochs=1
-        50
+        epochs=150
     )
 
     return model, X, y, scaler, contexts
