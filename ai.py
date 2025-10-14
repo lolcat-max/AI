@@ -20,8 +20,8 @@ KB_LEN = -1
 
 # Configuration
 hidden_layer_sizes = (160, 80, 40)
-max_samples = 10000
-max_segments = 10000
+max_samples = 100000
+max_segments = 100000
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
