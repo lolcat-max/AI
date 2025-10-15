@@ -21,8 +21,8 @@ KB_LEN = -1
 
 # Configuration
 hidden_layer_sizes = (160, 80, 40)
-max_samples = 1000
-max_segments = 1000
+max_samples = 10000
+max_segments = 10000
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -36,6 +36,184 @@ if torch.cuda.is_available():
 else:
     cuda_stream = None
 
+
+# --- Answer-Based Q&A System ---
+class AnswerBasedQASystem:
+    """
+    Q&A system that generates DIRECTLY FROM ANSWERS.
+    Questions are ONLY for retrieval - generation uses answer content.
+    """
+    def __init__(self, device=device):
+        self.device = device
+        self.qa_pairs = []
+        self.qa_index = {}
+        self.answer_corpus = []
+        self.answer_tokens = []
+        self.answer_ngram_model = {}
+        self.qa_cache_file = 'qa_answer_cache.pkl'
+        print("📚 Answer-Based Q&A System initialized")
+
+    def load_qa_dataset(self, dataset_name='squad', max_samples=5000):
+        print(f"\n📖 Loading {dataset_name} (answer-focused)...")
+        try:
+            dataset = load_dataset('squad', split='train')
+            print(f"Loading {max_samples:,} Q&A pairs, extracting ANSWERS...")
+
+            for i, example in enumerate(dataset):
+                if i >= max_samples:
+                    break
+
+                question = example['question']
+                answers = example['answers']
+                context = example['context']
+
+                if answers and 'text' in answers and len(answers['text']) > 0:
+                    answer = answers['text'][0]
+                else:
+                    continue
+
+                if question and answer:
+                    self.qa_pairs.append({
+                        'question': question.lower(),
+                        'answer': answer.lower(),
+                        'context': context.lower() if context else "",
+                        'q_tokens': question.lower().split(),
+                        'a_tokens': answer.lower().split()
+                    })
+                    self.answer_corpus.append(answer.lower())
+                    self.answer_tokens.extend(answer.lower().split())
+
+                if (i + 1) % 500 == 0:
+                    print(f"  Loaded {i+1:,}...")
+
+            print(f"\n✓ Loaded {len(self.qa_pairs):,} Q&A pairs")
+            print(f"✓ Answer corpus: {len(self.answer_tokens):,} tokens")
+            return True
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            return False
+
+    def build_answer_ngram_model(self):
+        print("\n🔨 Building ANSWER-ONLY n-gram model...")
+        self.answer_ngram_model = defaultdict(list)
+
+        for qa in self.qa_pairs:
+            answer_tokens = qa['a_tokens']
+            for i in range(len(answer_tokens) - N_GRAM_ORDER):
+                key = tuple(answer_tokens[i:i+N_GRAM_ORDER])
+                next_token = answer_tokens[i+N_GRAM_ORDER]
+                self.answer_ngram_model[key].append(next_token)
+
+        print(f"✓ Answer n-gram model: {len(self.answer_ngram_model):,} keys")
+        return self.answer_ngram_model
+
+    def build_qa_index(self):
+        print("\n🔨 Building Q&A index...")
+        self.qa_index = defaultdict(list)
+        for idx, qa in enumerate(self.qa_pairs):
+            for token in qa['q_tokens']:
+                if len(token) > 3:
+                    self.qa_index[token].append(idx)
+            for token in qa['a_tokens']:
+                if len(token) > 3:
+                    self.qa_index[token].append(idx)
+        print(f"✓ Indexed {len(self.qa_index):,} keywords")
+
+    def comprehend_question(self, user_input):
+        tokens = user_input.lower().split()
+        question_words = {'what', 'when', 'where', 'who', 'why', 'how', 'which', 'whose'}
+        is_question = any(w in question_words for w in tokens)
+
+        question_type = None
+        for qw in question_words:
+            if qw in tokens:
+                question_type = qw
+                break
+
+        stop_words = {'the', 'is', 'are', 'was', 'were', 'will', 'would', 'could', 'should', 'have', 'has', 'had'}
+        key_entities = [w for w in tokens if len(w) > 3 and w not in stop_words]
+
+        return {
+            'is_question': is_question,
+            'question_type': question_type,
+            'key_entities': key_entities,
+            'tokens': tokens
+        }
+
+    def retrieve_relevant_qa_pairs(self, comprehension_result, top_k=5):
+        if not self.qa_pairs:
+            return []
+
+        key_entities = comprehension_result['key_entities']
+        tokens = comprehension_result['tokens']
+        qa_scores = []
+
+        for qa in self.qa_pairs:
+            score = 0.0
+            q_tokens_set = set(qa['q_tokens'])
+            a_tokens_set = set(qa['a_tokens'])
+
+            for entity in key_entities:
+                if entity in q_tokens_set:
+                    score += 2.0
+                if entity in a_tokens_set:
+                    score += 1.5
+
+            for token in tokens:
+                if token in q_tokens_set:
+                    score += 0.5
+                if token in a_tokens_set:
+                    score += 0.3
+
+            if score > 0:
+                qa_scores.append((qa, score))
+
+        qa_scores.sort(key=lambda x: x[1], reverse=True)
+        return qa_scores[:top_k]
+
+    def get_answer_seed(self, relevant_qa_pairs):
+        if not relevant_qa_pairs:
+            return []
+        top_qa, score = relevant_qa_pairs[0]
+        answer_tokens = top_qa['a_tokens']
+        return answer_tokens[:max(N_GRAM_ORDER, len(answer_tokens))]
+
+    def extract_answer_patterns(self, relevant_qa_pairs):
+        answer_tokens = []
+        for qa, score in relevant_qa_pairs:
+            for token in qa['a_tokens']:
+                answer_tokens.extend([token] * int(score + 1))
+        answer_freq = Counter(answer_tokens)
+        patterns = [token for token, count in answer_freq.most_common(20)]
+        return {'answer_tokens': answer_tokens, 'answer_patterns': patterns}
+
+    def save_cache(self):
+        cache_data = {
+            'qa_pairs': self.qa_pairs,
+            'qa_index': dict(self.qa_index),
+            'answer_ngram_model': dict(self.answer_ngram_model),
+            'answer_tokens': self.answer_tokens,
+            'timestamp': time.time()
+        }
+        with open(self.qa_cache_file, 'wb') as f:
+            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"\n✓ Q&A cache saved")
+
+    def load_cache(self):
+        if not os.path.exists(self.qa_cache_file):
+            return False
+        try:
+            with open(self.qa_cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+            self.qa_pairs = cache_data['qa_pairs']
+            self.qa_index = defaultdict(list, cache_data['qa_index'])
+            self.answer_ngram_model = defaultdict(list, cache_data.get('answer_ngram_model', {}))
+            self.answer_tokens = cache_data.get('answer_tokens', [])
+            print(f"\n✓ Q&A cache loaded: {len(self.qa_pairs):,} pairs")
+            return True
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            return False
 # --- State Definitions ---
 class SystemState(Enum):
     """FSM states for the text generation system"""
@@ -168,7 +346,6 @@ class HamiltonianTrainingSystem:
         print("\n" + "="*80)
         print("HAMILTONIAN EVOLUTION TRAINING SYSTEM")
         print("="*80)
-        print(f"Target accuracy threshold: {self.accuracy_threshold:.2%}")
         print(f"Cache file: {self.cache_file}")
         print("="*80 + "\n")
 
@@ -315,7 +492,9 @@ class HamiltonianTrainingSystem:
 
         return cache_data
 
-# --- Quantum State Mixing Engine ---
+
+# --- Question-Answer Comprehension System ---
+
 class QuantumStateSuperposition:
     """
     Implements quantum-inspired state superposition for FSMs.
@@ -860,7 +1039,7 @@ def train_model_with_real_data(tokens, quantum_extractor):
     model, loss_curve, accuracy_curve = train_pytorch_model(
         X_train, y_train, X_test, y_test, 
         input_size=X.shape[1], 
-        epochs=150
+        epochs=50
     )
 
     return model, X, y, scaler, contexts
@@ -960,7 +1139,7 @@ class TokenGeneratorFSM:
     State transitions: INIT -> SELECT -> COMPUTE -> SAMPLE -> UPDATE -> EMIT -> (SELECT or DONE)
     """
     def __init__(self, model, model_keys, preprocessing_cache, quantum_extractor,
-                 start_key, max_length=500, use_quantum_mixing=True):
+                 start_key, max_length=500, use_quantum_mixing=True, qa_context=None):
         self.model = model
         self.model_keys = model_keys
         self.preprocessing_cache = preprocessing_cache
@@ -968,6 +1147,7 @@ class TokenGeneratorFSM:
         self.start_key = start_key
         self.max_length = max_length
         self.use_quantum_mixing = use_quantum_mixing
+        self.qa_context = qa_context  # Q&A context for boosting relevant tokens
 
         self.tokens = preprocessing_cache.cache['tokens']
         self.word_freq = preprocessing_cache.cache['word_freq']
@@ -1115,16 +1295,30 @@ class TokenGeneratorFSM:
 
         coherence_tensor = torch.tensor(coherence_scores, dtype=torch.float32, device=self.device)
 
+        # Apply Q&A context boosting if available
+        qa_boost = torch.ones_like(similarity_scores)
+        if self.qa_context and self.qa_context['answer_patterns']:
+            answer_patterns = set(self.qa_context['answer_patterns'])
+            answer_tokens = set(self.qa_context['answer_tokens'])
+
+            for idx, cand in enumerate(unique_candidates):
+                # Strong boost for answer patterns
+                if cand in answer_patterns:
+                    qa_boost[idx] = 2.5
+                # Moderate boost for answer tokens
+                elif cand in answer_tokens:
+                    qa_boost[idx] = 1.5
+
         # Combine scores with quantum interference if enabled
         if self.use_quantum_mixing:
             # Get quantum state probabilities
             state_probs = self.quantum_state.get_probabilities()
             compute_prob = state_probs.get(GeneratorState.COMPUTE_SCORES, 1.0)
 
-            # Modulate scores by quantum probability (interference effect)
-            combined_scores = similarity_scores * (1.0 + coherence_tensor) * compute_prob
+            # Modulate scores by quantum probability, Q&A boost
+            combined_scores = similarity_scores * (1.0 + coherence_tensor) * compute_prob * qa_boost
         else:
-            combined_scores = similarity_scores * (1.0 + coherence_tensor)
+            combined_scores = similarity_scores * (1.0 + coherence_tensor) * qa_boost
 
         self.probs = torch.softmax(combined_scores, dim=0)
         self.unique_candidates = unique_candidates
@@ -1201,14 +1395,20 @@ class TokenGeneratorFSM:
 
 # --- System-Level FSM WITH QUANTUM MIXING ---
 class TextGenerationSystemFSM:
-    """Main system state machine with quantum state mixing"""
-    def __init__(self, use_quantum_mixing=True):
+    """Main system state machine with quantum state mixing and Q&A comprehension"""
+    def __init__(self, use_quantum_mixing=True, use_qa_system=True):
         self.state = SystemState.INIT
         self.quantum_extractor = None
         self.preprocessing_cache = None
         self.tokens = None
         self.model_keys = None
         self.use_quantum_mixing = use_quantum_mixing
+        self.use_qa_system = use_qa_system
+
+        # Q&A Comprehension System
+        self.qa_system = None
+        self.current_comprehension = None
+        self.current_qa_context = None
 
         # Quantum state superposition for system states
         if use_quantum_mixing:
@@ -1275,6 +1475,10 @@ class TextGenerationSystemFSM:
         self.quantum_extractor = SchrodingerQuantumFeatures(hbar=1.0)
         self.preprocessing_cache = PreprocessingCache(cache_file='preprocessing_cache.pkl')
 
+        # Initialize Q&A comprehension system
+        if self.use_qa_system:
+            self.qa_system = AnswerBasedQASystem(device=device)
+
         self.state = SystemState.LOAD_CACHE
         if self.use_quantum_mixing:
             self.quantum_state.mix_states({
@@ -1287,9 +1491,22 @@ class TextGenerationSystemFSM:
         """Try to load cache"""
         cache_loaded = self.preprocessing_cache.load()
 
+        # Try to load Q&A cache
+        qa_loaded = False
+        if self.use_qa_system and self.qa_system:
+            qa_loaded = self.qa_system.load_cache()
+
         if cache_loaded:
             self.tokens = self.preprocessing_cache.cache['tokens']
             self.model_keys = self.preprocessing_cache.cache['model_keys']
+
+            # Load Q&A dataset if cache not found
+            if self.use_qa_system and not qa_loaded:
+                print("\nLoading Q&A dataset...")
+                self.qa_system.load_qa_dataset('squad', max_samples=50000)
+                self.qa_system.build_qa_index()
+                self.qa_system.save_cache()
+
             print("\n⚡ Using cached preprocessing data - ready for instant generation!")
             self.state = SystemState.READY
             if self.use_quantum_mixing:
@@ -1331,6 +1548,13 @@ class TextGenerationSystemFSM:
             return 'error'
 
         print(f"\n✓ Loaded corpus with {len(self.tokens):,} tokens.")
+
+        # Load Q&A dataset
+        if self.use_qa_system and self.qa_system:
+            self.qa_system.load_qa_dataset('squad', max_samples=50000)
+            self.qa_system.build_qa_index()
+            self.qa_system.save_cache()
+
         self.state = SystemState.BUILD_NGRAM
         if self.use_quantum_mixing:
             self.quantum_state.mix_states({
@@ -1394,38 +1618,59 @@ class TextGenerationSystemFSM:
         return 'continue'
 
     def _state_await_input(self):
-        """Wait for user input"""
-        seed_input = input("\nUSER: ").strip().lower()
+        """Wait for user input and generate FROM ANSWERS"""
+        seed_input = input("\nUSER: ").strip()
 
-        if seed_input == 'quit':
+        if seed_input.lower() == 'quit':
             self.state = SystemState.COMPLETE
             if self.use_quantum_mixing:
                 self.quantum_state.set_state_amplitude(SystemState.COMPLETE, 1.0)
             return 'done'
 
-        seed_tokens = re.findall(r'\b\w+\b', seed_input)
+        if self.use_qa_system and self.qa_system and self.qa_system.qa_pairs:
+            print("\n🧠 Comprehending question (for retrieval only)...")
+            comprehension = self.qa_system.comprehend_question(seed_input)
 
-        if len(seed_tokens) < N_GRAM_ORDER:
-            while len(seed_tokens) < N_GRAM_ORDER:
-                seed_tokens.append(self.tokens[len(seed_tokens) % len(self.tokens)])
+            if comprehension['is_question']:
+                print(f"  Type: {comprehension['question_type']}")
+                print(f"  Entities: {', '.join(comprehension['key_entities'][:3])}")
 
-        self.start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
+            print("\n📚 Retrieving Q&A pairs...")
+            relevant_qa = self.qa_system.retrieve_relevant_qa_pairs(comprehension, top_k=5)
 
-        ngram_model = self.preprocessing_cache.cache['ngram_model']
+            if relevant_qa:
+                top_qa, top_score = relevant_qa[0]
+                print(f"  Best match:Q: {top_qa['question'][:60]}...A: {top_qa['answer'][:60]}... Score: {top_score:.1f}")
 
-        if self.start_key not in ngram_model:
-            print(f"Note: Seed '{' '.join(self.start_key)}' not found in corpus, using similar context...")
-            similar = [k for k in self.model_keys if any(w in k for w in self.start_key)]
-            if similar:
-                self.start_key = similar[0]
+                answer_seed = self.qa_system.get_answer_seed(relevant_qa)
+                print(f"\n  💡 Answer seed: {' '.join(answer_seed[:5])}")
+
+                answer_context = self.qa_system.extract_answer_patterns(relevant_qa)
+                self.current_qa_context = answer_context
+                self.current_qa_context['answer_seed'] = answer_seed
+
+                if answer_seed and len(answer_seed) >= N_GRAM_ORDER:
+                    print(f"\n  ✨ Generating FROM answer: {' '.join(answer_seed[:N_GRAM_ORDER])}")
+                    seed_tokens = answer_seed[:N_GRAM_ORDER]
+                else:
+                    seed_tokens = re.findall(r'\b\w+\b', seed_input.lower())[:N_GRAM_ORDER]
             else:
-                self.start_key = self.model_keys[0]
+                seed_tokens = re.findall(r'\b\w+\b', seed_input.lower())[:N_GRAM_ORDER]
+                self.current_qa_context = None
+        else:
+            seed_tokens = re.findall(r'\b\w+\b', seed_input.lower())[:N_GRAM_ORDER]
+            self.current_qa_context = None
+
+        while len(seed_tokens) < N_GRAM_ORDER:
+            seed_tokens.append(self.tokens[len(seed_tokens) % len(self.tokens)])
+
+        self.start_key = tuple(seed_tokens[:N_GRAM_ORDER])
+        print(f"\n  🌱 Seed: {' '.join(self.start_key)}")
 
         self.state = SystemState.GENERATE_TOKEN
         if self.use_quantum_mixing:
             self.quantum_state.set_state_amplitude(SystemState.GENERATE_TOKEN, 1.0)
         return 'continue'
-
     def _state_generate_token(self):
         """Generate tokens using FSM with quantum mixing"""
         # Create generator FSM with quantum mixing
@@ -1438,7 +1683,8 @@ class TextGenerationSystemFSM:
                     self.quantum_extractor,
                     self.start_key,
                     max_length=500,
-                    use_quantum_mixing=self.use_quantum_mixing
+                    use_quantum_mixing=self.use_quantum_mixing,
+                    qa_context=self.current_qa_context
                 )
         else:
             generator_fsm = TokenGeneratorFSM(
@@ -1448,13 +1694,14 @@ class TextGenerationSystemFSM:
                 self.quantum_extractor,
                 self.start_key,
                 max_length=500,
-                use_quantum_mixing=self.use_quantum_mixing
+                use_quantum_mixing=self.use_quantum_mixing,
+                qa_context=self.current_qa_context
             )
 
         print("\n--- Context-Aware Generated Text (Quantum-Mixed States) ---\n")
-
+        generated = list(self.start_key)
         # Generate all tokens using FSM
-        generated = generator_fsm.generate_all()
+        generated.append(' '.join(list(generator_fsm.generate_all())))
 
         # Output
         for word in generated:
@@ -1473,11 +1720,15 @@ class TextGenerationSystemFSM:
 
 # --- Main Execution (State Machine Driver) ---
 def main():
-    """Main entry point - drives the system FSM with quantum mixing"""
-    # Enable/disable quantum state mixing
+    """Main entry point - drives the system FSM with quantum mixing and Q&A"""
+    # Enable/disable quantum state mixing and Q&A system
     USE_QUANTUM_MIXING = True
+    USE_QA_SYSTEM = True
 
-    system_fsm = TextGenerationSystemFSM(use_quantum_mixing=USE_QUANTUM_MIXING)
+    system_fsm = TextGenerationSystemFSM(
+        use_quantum_mixing=USE_QUANTUM_MIXING,
+        use_qa_system=USE_QA_SYSTEM
+    )
     result = system_fsm.transition()
 
     while result == 'continue':
