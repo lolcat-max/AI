@@ -1699,7 +1699,7 @@ class TextGenerationSystemFSM:
             )
 
         print("\n--- Context-Aware Generated Text (Quantum-Mixed States) ---\n")
-        generated = list(self.start_key)
+        generated = list(self.current_qa_context['answer_seed'])
         # Generate all tokens using FSM
         generated.append(' '.join(list(generator_fsm.generate_all())))
 
