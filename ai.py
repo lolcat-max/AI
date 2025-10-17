@@ -41,7 +41,7 @@ class SchrodingerQuantumFeatures:
                          dtype=torch.float32, device=self.device)
         N = float(total_words)
 
-        F = torch.sigmoid(-(x - x.mean()) / np.roll(f,-1)) * (torch.abs(int(x[int(min(int(x[0]),min(x)))]) - x.mean()) + 1.0 / (f ** N + eps))
+        F = torch.sigmoid(-(x - x.mean()) / np.roll(f,-1)*x[-1].exp()) * (torch.abs(int(x[int(min(int(x[0]),min(x)))]) - x.mean()) + 1.0 / (f ** N + eps))
 
         Z = torch.sum(F) + eps
         F_norm = F / Z
@@ -154,7 +154,7 @@ def main():
         seed = tuple(seed_input)
 
         print("\n--- Generated Text ---\n")
-        output = generator.generate(seed, length=100)
+        output = generator.generate(seed, length=1000)
         print(output)
         print("\n--- End ---")
 
