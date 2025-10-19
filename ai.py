@@ -208,7 +208,7 @@ class ReasoningGenerator:
             lambda ctx, cands: len(ctx) > 3
         )
         
-        print("🤖 Reasoning Generator initialized with  AI techniques")
+        print("🤖 Reasoning Generator initialized with AI techniques")
 
     def generate(self, seed, length=100, show_reasoning=False):
         if seed not in self.model:
@@ -261,7 +261,6 @@ class ReasoningGenerator:
         print(f"   Procedures used:")
         for proc, count in stats['procedures_used'].items():
             print(f"      • {proc}: {count} times")
-
 
 # =====================================================================
 # MAIN
