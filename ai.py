@@ -3,7 +3,6 @@ import numpy as np
 from collections import Counter, defaultdict
 import math
 import os
-import xml.etree.ElementTree as ET
 from datetime import datetime
 
 # =====================================================================
@@ -316,4 +315,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
