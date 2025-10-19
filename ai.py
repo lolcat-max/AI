@@ -307,7 +307,7 @@ def main():
         show_reasoning = input("Show reasoning process? (y/n): ").lower() == 'y'
 
         print("\n--- Generated Text ---\n")
-        output = generator.generate(seed, length=1000, show_reasoning=show_reasoning)
+        output = generator.generate(seed, length=500, show_reasoning=show_reasoning)
         print(output)
         print("\n--- End ---")
         
@@ -316,3 +316,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
