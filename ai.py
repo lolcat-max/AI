@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 import math
 import os
 from datetime import datetime
+from datasets import load_dataset
 
 # =====================================================================
 # CONFIGURATION
@@ -531,68 +532,39 @@ class ReasoningGenerator:
 # =====================================================================
 # MAIN
 # =====================================================================
-
 def main():
-    print("\n=== AI with Neural Truth Table Washing ===")
-    print(f"Precision: {torch_dtype}, TF32: {ENABLE_TF32 and not USE_FLOAT64}\n")
+    print("\n=== AI with Neural Truth Table Washing and Facebook Natural Reasoning Dataset ===")
+    print(f"Precision: {torch_dtype}, TF32 enabled: {ENABLE_TF32 and not USE_FLOAT64}\n")
 
-    # Load text corpus
-    filename = input("Enter text file: ").strip()
-    if not os.path.exists(filename):
-        print("File not found.")
-        return
+    # Load facebook natural_reasoning dataset
+    print("Loading facebook/natural_reasoning dataset...")
+    dataset = load_dataset("facebook/natural_reasoning", split='train[:50000]')  # Load first 50k samples for demo
 
-    text = open(filename, 'r', encoding='utf-8').read().lower()
-    tokens = text.split()
-    print(f"Loaded {len(tokens):,} tokens.")
+    # Preprocess text: concatenate questions, tokenize by whitespace
+    all_questions = [item['question'].lower() for item in dataset]
+    text_corpus = " ".join(all_questions)
+    tokens = text_corpus.split()
+    
+    print(f"Loaded {len(dataset)} samples, corpus size: {len(tokens):,} tokens.")
 
-    print("Building n-gram model...")
+    # Build n-gram model for generation
     model = build_ngram_model(tokens)
     print(f"N-gram model size: {len(model):,} keys.")
 
-    # Initialize with reasoning and truth washing
+    # Initialize feature extractor and reasoning generator
     extractor = SchrodingerQuantumFeatures()
     generator = ReasoningGenerator(tokens, model, extractor)
-    
-    while True:
-        seed_input = input("\nEnter start words (or 'quit', 'stats', 'test-wash'): ").lower().strip()
-        
-        if seed_input == 'quit':
-            break
-        
-        if seed_input == 'stats':
-            generator.show_reasoning_stats()
-            continue
-        
-        if seed_input == 'test-wash':
-            # Demonstration of truth table washing
-            print("\n🧪 Testing Truth Table Washing")
-            washer = NeuralTruthTableWasher()
-            
-            T_contaminated = [0.15, 0.22, 0.18, 0.85]
-            T_expected = [0, 0, 0, 1]  # AND gate
-            
-            T_clean, metrics = washer.wash(T_contaminated, T_expected, verbose=True)
-            print(f"\nCleaned truth table: {[f'{v:.4f}' for v in T_clean]}")
-            continue
-            
-        seed_input = seed_input.split()[:N_GRAM_ORDER]
-        while len(seed_input) < N_GRAM_ORDER:
-            seed_input.append(tokens[len(seed_input) % len(tokens)])
-        seed = tuple(seed_input)
 
-        # Ask configuration
-        show_reasoning = input("Show reasoning process? (y/n): ").lower() == 'y'
-        wash_interval_input = input("Truth washing interval (default 10): ").strip()
-        wash_interval = int(wash_interval_input) if wash_interval_input.isdigit() else 10
+    # Example seed input from dataset start tokens
+    seed_input = tuple(tokens[:N_GRAM_ORDER])
 
-        print("\n--- Generated Text with Truth Table Washing ---\n")
-        output = generator.generate(seed, length=500, show_reasoning=show_reasoning, 
-                                   wash_interval=wash_interval)
-        print(output)
-        print("\n--- End ---")
-        
-    # Show final stats
+    # Generate example text with truth table washing enabled
+    print("\n--- Generated Text with Truth Table Washing ---\n")
+    output_text = generator.generate(seed_input, length=100, show_reasoning=True, wash_interval=10)
+    print(output_text)
+    print("\n--- End ---")
+
+    # Show reasoning stats after generation
     generator.show_reasoning_stats()
 
 if __name__ == "__main__":
