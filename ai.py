@@ -12,7 +12,7 @@ from datetime import datetime
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-N_GRAM_ORDER = 2
+N_GRAM_ORDER = 4
 
 # Precision configuration
 USE_FLOAT64 = True
@@ -128,22 +128,24 @@ class NeuralTruthTableWasher:
         Single washing iteration using gradient descent
         """
         T_new = []
-        for i in range(len(T)):
-            # Calculate gradient
-            gradient = 2 * (T[i] - T_expected[i])
-            
-            # Update with learning rate
-            new_value = T[i] - eta * gradient
-            
-            # Apply constraints (clamp to [0, 1])
-            new_value = max(0.0, min(1.0, new_value))
-            
-            # Snap to binary if very close
-            if abs(new_value - T_expected[i]) < 0.05:
-                new_value = T_expected[i]
-            
-            T_new.append(new_value)
         
+        for i in range(len(T)):
+            for j in range(len(T)):
+                # Calculate gradient
+                gradient = 2 * (T[i] - T_expected[j])
+                
+                # Update with learning rate
+                new_value = T[i] - eta * gradient
+                
+                # Apply constraints (clamp to [0, 1])
+                new_value += max(0.0, min(1.0, new_value))
+                
+                # Snap to binary if very close
+                if abs(new_value - T_expected[i]) < 0.05:
+                    new_value += T_expected[i]
+                
+            T_new.append(new_value)
+            
         return T_new
     
     def wash(self, T_contaminated, T_expected, verbose=False):
