@@ -295,41 +295,43 @@ class ReasoningEngine:
         T_clean, metrics = self.truth_washer.wash(T_contaminated, T_expected, verbose=verbose)
         
         return T_clean, metrics
-    
+
     def reason_about_candidates(self, candidates, context, coherence_scores):
         """
-        Enhanced reasoning with truth table validation
+        Enhanced reasoning with truth table validation and washing 
+        integrated directly into reasoning process
         """
         reasoning_chain = []
         
-        # Step 1: Analyze context
-        reasoning_chain.append(f"Context analysis: {len(context)} words in current sequence")
+        reasoning_chain.append(f"Context analysis: {len(context)} words in sequence")
         
-        # Step 2: Evaluate candidate quality
         if len(candidates) > 0:
             avg_coherence = np.mean(coherence_scores)
             reasoning_chain.append(f"Coherence evaluation: {len(candidates)} candidates, avg={avg_coherence:.4f}")
         
-        # Step 3: Truth table washing for logical consistency
+        # *** Perform truth table washing inside reasoning ***
         if len(coherence_scores) >= 4:
-            T_clean, metrics = self.validate_logic_consistency(coherence_scores[:4])
-            reasoning_chain.append(f"Truth washing: {metrics['iterations']} iterations, " +
-                                 f"error reduction: {metrics['error_reduction']:.4f}")
+            T_clean, metrics = self.validate_logic_consistency(coherence_scores[:4], verbose=False)
+            reasoning_chain.append(f"Truth washing applied: {metrics['iterations']} iterations, error reduced by {metrics['error_reduction']:.4f}")
+            
+            # Replace coherence with washed/cleaned values
+            for i in range(min(4, len(coherence_scores))):
+                coherence_scores[i] = T_clean[i]
         
-        # Step 4: Apply procedural knowledge
+        # Continue applying procedural knowledge and decision
         for proc_name, proc_data in self.procedure_cache.items():
             if proc_data['condition'](context, candidates):
                 reasoning_chain.append(f"Applied procedure: {proc_name}")
                 proc_data['usage_count'] += 1
         
-        # Step 5: Make decision with reasoning
         if coherence_scores:
-            max_coherence = max(coherence_scores)
-            best_idx = coherence_scores.index(max_coherence)
-            reasoning_chain.append(f"Selected candidate {best_idx} with coherence {max_coherence:.4f}")
+            max_coh = max(coherence_scores)
+            best_idx = coherence_scores.index(max_coh)
+            reasoning_chain.append(f"Selected candidate {best_idx} with coherence {max_coh:.4f}")
         
         self.reasoning_history.append(reasoning_chain)
         return reasoning_chain
+
     
     def get_reasoning_stats(self):
         """Return comprehensive reasoning statistics"""
