@@ -12,7 +12,7 @@ from datetime import datetime
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-N_GRAM_ORDER = 4
+N_GRAM_ORDER = 2
 
 # Precision configuration
 USE_FLOAT64 = True
