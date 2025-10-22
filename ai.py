@@ -537,7 +537,7 @@ def main():
     print(f"Precision: {torch_dtype}, TF32 enabled: {ENABLE_TF32 and not USE_FLOAT64}\n")
 
     # Load facebook natural_reasoning dataset
-    dataset = load_dataset("stanfordnlp/imdb", split='train[:50000]')  # Load first 50k samples for demo
+    dataset = load_dataset("roneneldan/TinyStories", split='train[:50000]')  # Load first 50k samples for demo
 
     # Preprocess text: concatenate questions, tokenize by whitespace
     all_questions = [item['text'].lower() for item in dataset]
