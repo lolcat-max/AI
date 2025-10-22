@@ -554,18 +554,18 @@ def main():
     # Initialize feature extractor and reasoning generator
     extractor = SchrodingerQuantumFeatures()
     generator = ReasoningGenerator(tokens, model, extractor)
+    while True:
+        # Example seed input from dataset start tokens
+        seed_input = input("USER: ")
 
-    # Example seed input from dataset start tokens
-    seed_input = tuple(tokens[:N_GRAM_ORDER])
+        # Generate example text with truth table washing enabled
+        print("\n--- Generated Text with Truth Table Washing ---\n")
+        output_text = generator.generate(seed_input, length=500, show_reasoning=True, wash_interval=10)
+        print(output_text)
+        print("\n--- End ---")
 
-    # Generate example text with truth table washing enabled
-    print("\n--- Generated Text with Truth Table Washing ---\n")
-    output_text = generator.generate(seed_input, length=100, show_reasoning=True, wash_interval=10)
-    print(output_text)
-    print("\n--- End ---")
-
-    # Show reasoning stats after generation
-    generator.show_reasoning_stats()
+        # Show reasoning stats after generation
+        generator.show_reasoning_stats()
 
 if __name__ == "__main__":
     main()
