@@ -1,0 +1,1 @@
+AI systems being "safe", you never know until you try. The AI I have doesn't have cybernetic control, surprisingly, much more processing power to solve the end context, which in my view, transitions to that are markovian to say the least.
