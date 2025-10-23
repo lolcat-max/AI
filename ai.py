@@ -16,6 +16,30 @@ print(f"Using {device}, precision {torch_dtype}")
 
 
 # ================================================================
+# SINE RESISTANCE MODULATION
+# ================================================================
+
+def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
+    """
+    Rhythmic resistance function to modulate acceptance of novel tokens.
+    
+    Args:
+        step: Current generation step
+        novelty: [0,1] scale where 0 = frequent word, 1 = unseen/rare word
+        freq: Oscillation frequency
+        amp: Amplitude of resistance effect
+        phase: Phase offset
+    
+    Returns:
+        Scaling multiplier to reduce coherence for high-novelty tokens
+    """
+    oscillation = np.sin(2 * np.pi * freq * step + phase)
+    # Resistance increases with novelty and inhibits during positive oscillation peaks
+    resistance = 1.0 - amp * novelty * max(0.0, oscillation)
+    return max(0.1, resistance)  # Keep minimum at 0.1 to avoid complete suppression
+
+
+# ================================================================
 # EIGENVALUE ISOMORPHISM MODEL
 # ================================================================
 
@@ -100,7 +124,7 @@ class ReasoningEngine:
     def __init__(self):
         self.truth_washer = NeuralTruthTableWasher()
         self.eigen_system = EigenIsomorphism()
-        print("🧠 Reasoning Engine initialized.")
+        print("🧠 Reasoning Engine initialized with sine resistance.")
 
     def reason_step(self, coherence_scores, input_vector):
         eigvals, eigvecs = self.eigen_system.update(input_vector)
@@ -153,7 +177,7 @@ def build_ngram_model(tokens, n=2):
 
 
 # ================================================================
-# REASONING GENERATOR
+# REASONING GENERATOR WITH SINE RESISTANCE
 # ================================================================
 
 class ReasoningGenerator:
@@ -165,22 +189,46 @@ class ReasoningGenerator:
         self.total_words = len(tokens)
         self.feature = SchrodingerQuantumFeatures()
         self.engine = ReasoningEngine()
-        print("🤖 Generator ready with reactive eigenvalue logic")
+        
+        # Sine resistance parameters
+        self.sine_freq = 0.08
+        self.sine_amp = 0.6
+        self.sine_phase = 0.0
+        
+        print("🤖 Generator ready with reactive eigenvalue logic + sine resistance")
+        print(f"   🌊 Sine resistance: freq={self.sine_freq}, amp={self.sine_amp}")
+
+    def calculate_novelty(self, word):
+        """
+        Calculate novelty score for a word based on its frequency.
+        Returns value in [0, 1] where 1 = very rare/novel, 0 = very common
+        """
+        freq = self.word_freq.get(word, 1)
+        # Normalize using logarithm to handle frequency distribution
+        novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
+        return float(np.clip(novelty, 0, 1))
 
     def generate(self, seed, length=50):
+        # Parse seed into tuple
+        seed_words = seed.lower().split()[:2]
+        while len(seed_words) < 2:
+            seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
+        seed = tuple(seed_words)
+        
         if seed not in self.model:
             seed = self.keys[np.random.randint(len(self.keys))]
+        
         output = list(seed)
         
-        print("\n🌀 Generation Mode:")
-        print("   • Type text to influence eigenvalues")
+        print(f"\n🌀 Generating {length} words with sine resistance modulation...")
+        print(f"   Seed: {' '.join(seed)}\n")
         
         step_count = 0
         
         while len(output) < length:
-            # Handle user input
-            user = ' '.join(output[:-2])
-            input_vec = np.zeros(4)
+            # Convert recent output to input vector for eigenvalue modulation
+            recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
+            input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
 
             # Get candidates and filter punctuation
             candidates = self.model.get(seed, [])
@@ -190,15 +238,36 @@ class ReasoningGenerator:
                 seed = self.keys[np.random.randint(len(self.keys))]
                 continue
 
-            # Calculate coherence scores
+            # Calculate coherence scores with sine resistance
             coherence_scores = []
+            novelty_scores = []
+            resistance_factors = []
+            
             for cand in candidates:
+                # Base coherence from quantum features
                 q = self.feature.extract_quantum_features(
                     list(seed) + [cand], 
                     self.word_freq, 
                     self.total_words
                 )
-                coherence_scores.append(q["coherence"])
+                base_coherence = q["coherence"]
+                
+                # Calculate novelty and apply sine resistance
+                novelty = self.calculate_novelty(cand)
+                resistance_factor = sine_resistance(
+                    step_count, 
+                    novelty, 
+                    freq=self.sine_freq, 
+                    amp=self.sine_amp, 
+                    phase=self.sine_phase
+                )
+                
+                # Apply resistance to coherence
+                adjusted_coherence = base_coherence * resistance_factor
+                
+                coherence_scores.append(adjusted_coherence)
+                novelty_scores.append(novelty)
+                resistance_factors.append(resistance_factor)
 
             # Apply reasoning and eigenvalue modulation
             modulated, eigmean, metrics = self.engine.reason_step(coherence_scores, input_vec)
@@ -208,6 +277,8 @@ class ReasoningGenerator:
                 min_len = min(len(modulated), len(candidates))
                 modulated = modulated[:min_len]
                 candidates = candidates[:min_len]
+                novelty_scores = novelty_scores[:min_len]
+                resistance_factors = resistance_factors[:min_len]
             
             if not modulated or not candidates:
                 seed = self.keys[np.random.randint(len(self.keys))]
@@ -223,9 +294,21 @@ class ReasoningGenerator:
 
             # Select next word
             next_word = np.random.choice(candidates, p=probs)
+            selected_idx = candidates.index(next_word)
+            
             output.append(next_word)
             seed = tuple(output[-2:])
             step_count += 1
+
+            # Display generation info every 10 steps
+            if step_count % 10 == 0:
+                sine_phase_deg = (2 * np.pi * self.sine_freq * step_count) % (2 * np.pi)
+                sine_phase_deg = np.degrees(sine_phase_deg)
+                novelty = novelty_scores[selected_idx]
+                resistance = resistance_factors[selected_idx]
+                print(f"[{len(output)}/{length}] λ̄={eigmean:.3f}, err={metrics['final_error']:.5f}, nov={novelty:.2f}, res={resistance:.2f}, φ={sine_phase_deg:.0f}°")
+                print(f"   Last 10: {' '.join(output[-10:])}")
+
         return " ".join(output)
 
 
@@ -234,7 +317,7 @@ class ReasoningGenerator:
 # ================================================================
 
 def main():
-    print("\n=== Eigenvalue-Isomorphic Neural Reasoner ===")
+    print("\n=== Eigenvalue-Isomorphic Neural Reasoner with Sine Resistance ===")
     path = input("Enter text file: ").strip()
     if not os.path.exists(path):
         print("File not found.")
@@ -245,12 +328,16 @@ def main():
     print(f"Loaded {len(corpus):,} tokens, model size: {len(model):,}")
 
     generator = ReasoningGenerator(corpus, model)
+    
     while True:
-        seed = input("USER: ")
+        seed = input("\nUSER: ")
+        if seed.lower() in ['quit', 'exit']:
+            break
+            
         generated = generator.generate(seed, length=500)
-        print("\n=== Final Output ===\n")
+        print("\n=== AI Response ===\n")
         print(generated)
-        print(f"\nTotal words: {len(generated.split())}")
+        print(f"\n[Total: {len(generated.split())} words]")
 
 
 if __name__ == "__main__":
