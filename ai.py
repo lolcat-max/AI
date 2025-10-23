@@ -245,11 +245,12 @@ def main():
     print(f"Loaded {len(corpus):,} tokens, model size: {len(model):,}")
 
     generator = ReasoningGenerator(corpus, model)
-    seed = input("USER: ")
-    generated = generator.generate(seed, length=500)
-    print("\n=== Final Output ===\n")
-    print(generated)
-    print(f"\nTotal words: {len(generated.split())}")
+    while True:
+        seed = input("USER: ")
+        generated = generator.generate(seed, length=500)
+        print("\n=== Final Output ===\n")
+        print(generated)
+        print(f"\nTotal words: {len(generated.split())}")
 
 
 if __name__ == "__main__":
