@@ -1,609 +1,370 @@
-
-
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from collections import defaultdict, Counter
+import numpy as np
+from collections import Counter, defaultdict
+import os
 import re
 import sys
 import pickle
-import os
 import time
-from datasets import load_dataset
-from enum import Enum, auto
 import math
-import cmath
 import serial
 import serial.tools.list_ports
 import threading
-from datetime import datetime
 
+# ================================================================
+# CONFIGURATION
+# ================================================================
 sys.setrecursionlimit(1_000_000)
 N_GRAM_ORDER = 2
-KB_LEN = -1
+CACHE_FILENAME = 'preprocessing_cache.pkl'
 
-hidden_layer_sizes = (160, 80, 40)
-max_samples = 10000000
-max_segments = 10000000
-
+# Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+USE_FLOAT64 = True
+torch_dtype = torch.float64 if USE_FLOAT64 else torch.float32
 
+print(f"Using device: {device}, precision: {torch_dtype}")
+
+# CUDA performance settings
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    cuda_stream = torch.cuda.Stream()
-else:
-    cuda_stream = None
 
-# --- State Definitions ---
 
-class SystemState(Enum):
-    INIT = auto()
-    LOAD_CACHE = auto()
-    LOAD_DATASET = auto()
-    BUILD_NGRAM = auto()
-    EXTRACT_FEATURES = auto()
-    TRAIN_MODEL = auto()
-    SAVE_CACHE = auto()
-    READY = auto()
-    AWAIT_INPUT = auto()
-    GENERATE_TOKEN = auto()
-    OUTPUT_TOKEN = auto()
-    COMPLETE = auto()
-    ERROR = auto()
+# ================================================================
+# SINE RESISTANCE MODULATION
+# ================================================================
+def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
+    """Rhythmic resistance function to modulate acceptance of novel tokens."""
+    oscillation = np.sin(2 * np.pi * freq * step + phase)
+    resistance = 1.0 - amp * novelty * max(0.0, oscillation)
+    return max(0.1, resistance)
 
-class GeneratorState(Enum):
-    INIT = auto()
-    SELECT_CANDIDATES = auto()
-    COMPUTE_SCORES = auto()
-    SAMPLE_TOKEN = auto()
-    UPDATE_CONTEXT = auto()
-    EMIT = auto()
-    DONE = auto()
 
-# --- Signal Detection ---
+# ================================================================
+# CORE REASONING COMPONENTS
+# ================================================================
+class EigenIsomorphism:
+    """Maintains an eigenbasis mapping for reasoning states."""
+    def __init__(self, dim=4):
+        self.dim = dim
+        self.W = np.eye(dim)
+        print("⚛️ Eigenvalue Isomorphism Engine initialized")
 
+    def update(self, input_vector):
+        eigvals, eigvecs = np.linalg.eig(self.W)
+        delta = np.tanh(0.6 * np.dot(eigvecs.T, input_vector[:self.dim]))
+        new_eigvals = eigvals + 0.05 * delta[:len(eigvals)]
+        self.W = eigvecs @ np.diag(new_eigvals) @ np.linalg.inv(eigvecs)
+        return np.real(new_eigvals), np.real(eigvecs)
+
+class NeuralTruthTableWasher:
+    """Cleans probabilistic decision scores to maintain logical consistency."""
+    def __init__(self, eta_0=0.3, alpha=0.1, delta=1e-3, max_iterations=30):
+        self.eta_0 = eta_0
+        self.alpha = alpha
+        self.delta = delta
+        self.max_iterations = max_iterations
+        self.dtype = torch_dtype
+        self.device = device
+
+    def calculate_error(self, T, T_expected):
+        T_tensor = torch.tensor(T, dtype=self.dtype, device=self.device)
+        T_exp_tensor = torch.tensor(T_expected, dtype=self.dtype, device=self.device)
+        return torch.sum((T_tensor - T_exp_tensor) ** 2).item()
+
+    def wash(self, T_contaminated, T_expected):
+        T_current = T_contaminated.copy()
+        for k in range(self.max_iterations):
+            eta = self.eta_0 * np.exp(-self.alpha * k)
+            grad = 2 * (np.array(T_current) - np.array(T_expected))
+            T_next = np.clip(T_current - eta * grad, 0.0, 1.0).tolist()
+            error = self.calculate_error(T_next, T_expected)
+            if error < self.delta:
+                return T_next, {"final_error": error, "iterations": k + 1}
+            T_current = T_next
+        return T_current, {"final_error": self.calculate_error(T_current, T_expected), "iterations": self.max_iterations}
+
+class ReasoningEngine:
+    """Combines truth washing and eigenvalue isomorphism for a full reasoning step."""
+    def __init__(self):
+        self.truth_washer = NeuralTruthTableWasher()
+        self.eigen_system = EigenIsomorphism()
+        self.arduino = ArduinoInterfaceStreaming(baudrate=9600)
+        print("🧠 Reasoning Engine initialized.")
+
+    def reason_step(self, coherence_scores, input_vector):
+        eigvals, _ = self.eigen_system.update(input_vector)
+        
+        padded_scores = coherence_scores[:4] + [0.5] * (4 - len(coherence_scores[:4]))
+        expected = [self.arduino.get_normalized_value() if c > 0.5 else 0.0 for c in padded_scores]
+        
+        washed, metrics = self.truth_washer.wash(padded_scores, expected)
+        
+        scale = 1 + 0.1 * np.mean(eigvals)
+        modulated = [float(np.clip((washed[i] if i < len(washed) else s) * scale, 0, 1)) for i, s in enumerate(coherence_scores)]
+        
+        return modulated, np.mean(eigvals), metrics
+
+class SchrodingerQuantumFeatures:
+    """Simplified feature extractor for word coherence."""
+    def extract_quantum_features(self, segment, word_freq, total_words):
+        if not segment: return {"coherence": 0.5}
+        xs = np.array([len(w) for w in segment])
+        fs = np.array([word_freq.get(w, 1) for w in segment])
+        var = np.var(xs / (fs + 1e-6))
+        return {"coherence": 1.0 / (1.0 + var)}
+
+
+# ================================================================
+# HARDWARE & STREAMING COMPONENTS
+# ================================================================
 class SignalDetector:
-    """Detects electrode signal events"""
-    def __init__(self, threshold_low=200, threshold_high=800, hysteresis=50):
+    """Detects discrete events from a continuous electrode signal."""
+    def __init__(self, threshold_low=140, threshold_high=145, hysteresis=50):
         self.threshold_low = threshold_low
         self.threshold_high = threshold_high
         self.hysteresis = hysteresis
-        self.signal_state = "IDLE"
-        self.last_value = 512.0  # Start at midpoint
-        self.event_count = 0
+        self.last_value = 512.0
         
-    def detect(self, electrode_value):
-        """Detect signal events"""
+    def detect(self, value):
         event = None
-        prev_state = self.signal_state
-        
-        # Detect rising edge (spike)
-        if self.last_value < self.threshold_high - self.hysteresis and electrode_value >= self.threshold_high:
+        if self.last_value < self.threshold_high - self.hysteresis and value >= self.threshold_high:
             event = 'SPIKE'
-            self.signal_state = "HIGH_SIGNAL"
-            self.event_count += 1
-        
-        # Detect falling edge (drop)
-        elif self.last_value > self.threshold_low + self.hysteresis and electrode_value <= self.threshold_low:
+        elif self.last_value > self.threshold_low + self.hysteresis and value <= self.threshold_low:
             event = 'DROP'
-            self.signal_state = "LOW_SIGNAL"
-            self.event_count += 1
-        
-        # Sustained high
-        elif electrode_value > self.threshold_high:
-            if prev_state != "HIGH_SIGNAL":
-                event = 'HIGH'
-                self.signal_state = "HIGH_SIGNAL"
-        
-        # Sustained low
-        elif electrode_value < self.threshold_low:
-            if prev_state != "LOW_SIGNAL":
-                event = 'LOW'
-                self.signal_state = "LOW_SIGNAL"
-        
-        # Back to idle
-        else:
-            if prev_state != "IDLE":
-                event = 'IDLE'
-            self.signal_state = "IDLE"
-        
-        self.last_value = electrode_value
+        self.last_value = value
         return event
-    
-    def get_signal_intensity(self, electrode_value):
-        """Get signal intensity description"""
-        normalized = electrode_value / 1023.0
-        
-        if normalized > 0.9:
-            return "MAXIMUM"
-        elif normalized > 0.7:
-            return "STRONG"
-        elif normalized > 0.5:
-            return "MODERATE"
-        elif normalized > 0.3:
-            return "WEAK"
-        elif normalized > 0.1:
-            return "MINIMAL"
-        else:
-            return "ABSENT"
-
-# --- Arduino Interface ---
 
 class ArduinoInterfaceStreaming:
-    """Arduino interface for streaming"""
+    """Manages the connection and data streaming from an Arduino."""
     def __init__(self, port=None, baudrate=9600):
         self.port = port
         self.baudrate = baudrate
         self.serial_conn = None
-        self.electrode_value = 512.0  # Start at midpoint
+        self.electrode_value = 512.0
+        self.stats = {'min': 1023, 'max': 0, 'current': 512}
         self.running = False
         self.lock = threading.Lock()
-        self.read_count = 0
-        self.error_count = 0
         self.connected = False
-        self.callbacks = []
-        
-    @staticmethod
-    def list_ports():
-        ports = serial.tools.list_ports.comports()
-        available_ports = []
-        
-        print("\n📡 Available Serial Ports:")
-        for i, port in enumerate(ports):
-            print(f"  [{i}] {port.device} - {port.description}")
-            available_ports.append(port.device)
-        
-        return available_ports
-    
+
     @staticmethod
     def find_arduino_port():
         ports = serial.tools.list_ports.comports()
-        arduino_keywords = ['Arduino', 'CH340', 'CP2102', 'USB Serial', 'USB-SERIAL']
-        
+        arduino_keywords = ['Arduino', 'CH340', 'CP2102', 'USB Serial']
         for port in ports:
-            desc = port.description.upper()
-            if any(keyword.upper() in desc for keyword in arduino_keywords):
-                print(f"✓ Found Arduino: {port.device} ({port.description})")
+            if any(keyword.upper() in port.description.upper() for keyword in arduino_keywords):
                 return port.device
-        
         return None
-    
-    def add_callback(self, callback):
-        self.callbacks.append(callback)
-    
-    def connect(self, timeout=5, retries=3):
+
+    def connect(self, retries=3):
+        if not self.port: self.port = self.find_arduino_port()
         if not self.port:
-            print("\n🔍 Auto-detecting Arduino...")
-            self.port = self.find_arduino_port()
-            
-            if not self.port:
-                print("✗ No Arduino found.")
-                available = self.list_ports()
-                
-                if available:
-                    try:
-                        choice = int(input(f"\nSelect port [0-{len(available)-1}]: "))
-                        if 0 <= choice < len(available):
-                            self.port = available[choice]
-                        else:
-                            return False
-                    except ValueError:
-                        return False
-                else:
-                    return False
+            print("✗ No Arduino found.")
+            return False
         
         for attempt in range(retries):
             try:
-                print(f"\n🔌 Connecting to {self.port}...")
+                print(f"\n🔌 Attempting to connect to {self.port} at {self.baudrate} baud (Attempt {attempt + 1}/{retries})...")
+                self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=2)
+                time.sleep(2)  # Wait for Arduino to reset
+                self.serial_conn.flushInput()
                 
-                self.serial_conn = serial.Serial(
-                    port=self.port,
-                    baudrate=self.baudrate,
-                    timeout=timeout
-                )
-                
-                time.sleep(2.5)
-                self.serial_conn.reset_input_buffer()
-                self.serial_conn.reset_output_buffer()
-                
+                # Wait for the "ARDUINO:READY" signal
                 start_time = time.time()
-                received = False
-                
-                while time.time() - start_time < 5:
+                while time.time() - start_time < 5: # 5-second timeout
                     if self.serial_conn.in_waiting > 0:
                         line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
-                        print(f"   {line}")
-                        
-                        if "READY" in line or "ELECTRODE" in line:
-                            received = True
-                            break
-                    time.sleep(0.1)
+                        self.connected = True
+                        return True
                 
-                if received:
-                    print(f"✓ Connected!")
-                    self.connected = True
-                    return True
-                    
+                print("✗ Timed out waiting for Arduino READY signal.")
+                self.serial_conn.close()
+
             except Exception as e:
-                print(f"✗ Error: {e}")
-                if attempt < retries - 1:
-                    time.sleep(2)
-        
+                print(f"✗ Connection Error: {e}")
+                time.sleep(2)
         return False
-    
-    def start_reading(self):
-        if not self.connected:
-            return False
         
+    def start_reading(self):
+        if not self.connected: return False
         self.running = True
-        self.thread = threading.Thread(target=self._read_loop, daemon=True)
-        self.thread.start()
+        threading.Thread(target=self._read_loop, daemon=True).start()
         print("🔌 Reading electrode data...")
         return True
-    
+
     def _read_loop(self):
         while self.running:
-            try:
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
+            if self.serial_conn and self.serial_conn.in_waiting > 0:
+                try:
                     line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
-                    
                     if line.startswith("ELECTRODE:"):
-                        try:
-                            value = float(line.split(":")[1])
-                            
-                            with self.lock:
-                                self.electrode_value = value
-                                self.read_count += 1
-                            
-                            for callback in self.callbacks:
-                                try:
-                                    callback(value)
-                                except:
-                                    pass
-                        except:
-                            pass
-                            
-            except Exception as e:
-                with self.lock:
-                    self.error_count += 1
-                time.sleep(0.1)
-    
-    def get_electrode_value(self):
-        with self.lock:
-            return self.electrode_value
-    
+                        with self.lock: self.eta_0 = float(line.split(":")[1])
+                              
+                except (IOError, ValueError):
+                    time.sleep(0.1)
+
     def get_normalized_value(self):
-        return self.get_electrode_value() / 1023.0
+        with self.lock: return self.electrode_value / 1023.0
     
+    def get_stats(self):
+        with self.lock: return self.stats.copy()
+
     def stop(self):
         self.running = False
-        if hasattr(self, 'thread') and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-        print(f"\n🔌 Closed (reads: {self.read_count}, errors: {self.error_count})")
+        if self.serial_conn: self.serial_conn.close()
+        print("\n🔌 Connection closed.")
 
-# --- Quantum Classes (Simplified) ---
 
-class QuantumStateSuperposition:
-    def __init__(self, states, hbar=1.0, arduino_interface=None):
-        self.states = list(states)
-        self.n_states = len(states)
-        self.hbar = hbar
-        self.device = device
-        self.arduino = arduino_interface
-        
-        self.amplitudes = torch.ones(self.n_states, dtype=torch.complex64, device=self.device) / math.sqrt(self.n_states)
-        self.base_decoherence_rate = 0.1
-        self.decoherence_rate = self.base_decoherence_rate
+# ================================================================
+# INTEGRATED GENERATOR & MAIN APPLICATION
+# ================================================================
+def create_or_load_cache(cache_filename=CACHE_FILENAME):
+    """Loads cache from file or creates it if it doesn't exist."""
+    if os.path.exists(cache_filename):
+        try:
+            with open(cache_filename, 'rb') as f:
+                cache_data = pickle.load(f)
+            print(f"✓ Cache loaded successfully with {len(cache_data.get('tokens', [])):,} tokens.")
+            return cache_data
+        except Exception as e:
+            print(f"✗ Error loading cache: {e}. Rebuilding.")
     
-    def get_normalized_value(self):
-        if self.arduino:
-            return self.arduino.get_normalized_value()
-        return 0.5
-    
-    def evolve(self, hamiltonian_weights=None, dt=0.1):
-        if hamiltonian_weights is None:
-            hamiltonian_weights = torch.ones(self.n_states, dtype=torch.float32, device=self.device)
-        else:
-            hamiltonian_weights = torch.tensor(hamiltonian_weights, dtype=torch.float32, device=self.device)
+    print("\n--- Cache not found. Starting creation process. ---")
+    source_file = input("Enter path to your source text file (e.g., 'corpus.txt'): ").strip()
+    if not os.path.exists(source_file):
+        print(f"✗ File not found: '{source_file}'")
+        return None
+
+    with open(source_file, 'r', encoding='utf-8') as f: text = f.read().lower()
+    tokens = re.findall(r'\b\w+\b', text)
+    if not tokens:
+        print("✗ No tokens found in file.")
+        return None
         
-        if self.arduino:
-            electrode_factor = self.get_normalized_value()
-            hamiltonian_weights = hamiltonian_weights * (0.5 + electrode_factor)
-        
-        phase_evolution = torch.exp(-1j * hamiltonian_weights * dt / self.hbar)
-        self.amplitudes = self.amplitudes * phase_evolution
-        
-        norm = torch.sqrt(torch.sum(torch.abs(self.amplitudes)**2))
-        if norm > 1e-10:
-            self.amplitudes = self.amplitudes / norm
+    print(f"Building {N_GRAM_ORDER}-gram model...")
+    model = defaultdict(list)
+    for i in range(len(tokens) - N_GRAM_ORDER):
+        model[tuple(tokens[i:i + N_GRAM_ORDER])].append(tokens[i + N_GRAM_ORDER])
 
-# --- Preprocessing Cache (Essential parts only) ---
+    cache_data = {
+        'tokens': tokens, 'ngram_model': model, 'model_keys': list(model.keys()),
+        'word_freq': Counter(tokens), 'total_words': len(tokens),
+    }
 
-class PreprocessingCache:
-    def __init__(self, cache_file='preprocessing_cache.pkl'):
-        self.cache_file = cache_file
-        self.cache = {
-            'word_freq': None,
-            'total_words': 0,
-            'quantum_features_cache': {},
-            'tokens': None,
-            'ngram_model': None,
-            'model_keys': None
-        }
-    
-    def load(self):
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'rb') as f:
-                    self.cache = pickle.load(f)
-                print(f"✓ Cache loaded: {len(self.cache['tokens']):,} tokens")
-                return True
-            except Exception as e:
-                print(f"✗ Error loading cache: {e}")
-                return False
-        return False
+    print(f"💾 Saving new cache to '{cache_filename}'...")
+    with open(cache_filename, 'wb') as f: pickle.dump(cache_data, f)
+    print("✓ Cache created successfully!")
+    return cache_data
 
-# --- Simple Token Generator ---
-
-class SimpleTokenGenerator:
-    """Simplified token generator that actually works"""
-    def __init__(self, ngram_model, model_keys, word_freq, total_words, start_key, arduino=None):
-        self.model = ngram_model
-        self.model_keys = model_keys
-        self.word_freq = word_freq
-        self.total_words = total_words
+class AdvancedReasoningGenerator:
+    """The integrated generator combining all advanced reasoning components."""
+    def __init__(self, cache, start_key, arduino=None):
+        self.model = cache['ngram_model']
+        self.model_keys = cache['model_keys']
+        self.word_freq = cache['word_freq']
+        self.total_words = cache['total_words']
         self.key = start_key
         self.arduino = arduino
         self.output = list(start_key)
-        self.device = device
-    
+
+        self.feature_extractor = SchrodingerQuantumFeatures()
+        self.reasoning_engine = ReasoningEngine()
+        self.sine_freq, self.sine_amp, self.step_count = 0.08, 0.6, 0
+        print("🤖 Advanced Reasoning Generator Initialized.")
+
+    def calculate_novelty(self, word):
+        return 1.0 - np.log(self.word_freq.get(word, 1) + 1) / np.log(self.total_words + 1)
+
     def generate_one_word(self):
-        """Generate a single word"""
-        # Get candidates
-        candidates = self.model.get(self.key, [])
-        
+        candidates = [w for w in self.model.get(self.key, []) if any(c.isalnum() for c in w)]
         if not candidates:
-            # Fallback to random key
             self.key = self.model_keys[torch.randint(0, len(self.model_keys), (1,)).item()]
-            candidates = self.model.get(self.key, [])
+            return self.key[0]
+        
+        coherence_scores = [
+            self.feature_extractor.extract_quantum_features(list(self.key) + [c], self.word_freq, self.total_words)["coherence"]
+            * sine_resistance(self.step_count, self.calculate_novelty(c), self.sine_freq, self.sine_amp)
+            for c in candidates
+        ]
             
-            if not candidates:
-                # Final fallback - return random word
-                all_words = list(self.word_freq.keys())
-                return all_words[torch.randint(0, len(all_words), (1,)).item()]
+        input_vec = (np.array([self.arduino.get_normalized_value()] * 4) if self.arduino and self.arduino.connected 
+                     else np.array([ord(c) % 97 / 25 for c in ' '.join(self.output[-4:]).ljust(4)[:4]]))
         
-        # Simple scoring based on frequency
-        unique_candidates = list(set(candidates))
+        modulated, _, _ = self.reasoning_engine.reason_step(coherence_scores, input_vec)
+
+        if len(modulated) != len(candidates):
+            min_len = min(len(modulated), len(candidates))
+            modulated, candidates = modulated[:min_len], candidates[:min_len]
         
-        # Calculate scores
-        scores = []
-        for word in unique_candidates:
-            freq = self.word_freq.get(word, 1)
-            score = 1.0 / (freq + 1)  # Rarer words get higher scores
-            scores.append(score)
+        if not modulated: return self.key[0]
+
+        probs = torch.softmax(torch.tensor(modulated, dtype=torch_dtype), dim=0).cpu().numpy()
+        probs /= probs.sum()
         
-        scores_tensor = torch.tensor(scores, dtype=torch.float32, device=self.device)
+        next_word = np.random.choice(candidates, p=probs)
         
-        # Apply electrode modulation if available
-        if self.arduino:
-            electrode_val = self.arduino.get_normalized_value()
-            # Modulate scores
-            scores_tensor = scores_tensor * (0.5 + electrode_val)
-        
-        # Sample
-        probs = torch.softmax(scores_tensor, dim=0)
-        choice_idx = torch.multinomial(probs, 1).item()
-        selected_word = unique_candidates[choice_idx]
-        
-        # Update key for next generation
-        self.output.append(selected_word)
+        self.output.append(next_word)
         self.key = tuple(self.output[-N_GRAM_ORDER:])
-        
-        return selected_word
+        self.step_count += 1
+        return next_word
 
-# --- Streaming Text Generator ---
-
-class StreamingTextGenerator:
-    """Generates text continuously based on electrode signals"""
+class LiveStreamingGenerator:
+    """Generates and prints text live to the console, triggered by Arduino signals."""
     def __init__(self, arduino, signal_detector, generator):
-        self.arduino = arduino
-        self.signal_detector = signal_detector
-        self.generator = generator
+        self.arduino, self.signal_detector, self.generator = arduino, signal_detector, generator
         self.running = False
-        self.lock = threading.Lock()
-        self.generated_words = []
-        self.total_words = 0
         
-    def start_streaming(self):
-        """Start streaming text generation"""
+    def start(self):
         self.running = True
-        self.thread = threading.Thread(target=self._stream_loop, daemon=True)
-        self.thread.start()
-        print("\n🌊 STREAMING MODE ACTIVE")
-        print("="*60)
-    
+        threading.Thread(target=self._stream_loop, daemon=True).start()
+        print("\n🌊 LIVE STREAMING MODE ACTIVE")
+        print("   Text will be generated and printed in real-time based on electrode signals.")
+        print("   Press Ctrl+C to stop.")
+
     def _stream_loop(self):
-        """Main streaming loop"""
-        last_event_time = time.time()
-        event_cooldown = 0.3  # Minimum time between events
-        
+        last_event = time.time()
         while self.running:
-            try:
-                if self.arduino:
-                    electrode_value = self.arduino.get_electrode_value()
-                    
-                    # Detect signal event
-                    event = self.signal_detector.detect(electrode_value)
-                    
-                    if event and (time.time() - last_event_time) > event_cooldown:
-                        last_event_time = time.time()
-                        
-                        intensity = self.signal_detector.get_signal_intensity(electrode_value)
-                        
-                        # Generate text based on event
-                        if event == 'SPIKE':
-                            print(f"\n⚡ SPIKE ({intensity}) → ", end='', flush=True)
-                            self._generate_burst(3)
-                        
-                        elif event == 'DROP':
-                            print(f"\n📉 DROP ({intensity}) → ", end='', flush=True)
-                            self._generate_burst(2)
-                        
-                        elif event == 'HIGH':
-                            print(f"\n🔥 HIGH ({intensity}) → ", end='', flush=True)
-                            self._generate_burst(5)
-                        
-                        elif event == 'LOW':
-                            print(f"\n❄️  LOW ({intensity}) → ", end='', flush=True)
-                            self._generate_burst(1)
-                
-                time.sleep(0.05)  # 20Hz
-                
-            except Exception as e:
-                print(f"\n⚠️  Error: {e}")
-                time.sleep(0.5)
-    
-    def _generate_burst(self, num_words=3):
-        """Generate burst of words"""
-        with self.lock:
-            for i in range(num_words):
-                try:
-                    word = self.generator.generate_one_word()
-                    print(word, end=' ', flush=True)
-                    self.generated_words.append(word)
-                    self.total_words += 1
-                except Exception as e:
-                    print(f"[error: {e}]", end=' ', flush=True)
+            if self.arduino and self.arduino.connected and (time.time() - last_event) > 0.3:
+                event = self.signal_detector.detect(self.arduino.get_normalized_value() * 1023)
+                generated_chunk = [self.generator.generate_one_word()]
+                print(' '.join(generated_chunk), end=' ', flush=True)
+
+            time.sleep(0.05)
     
     def stop(self):
-        """Stop streaming"""
         self.running = False
-        if hasattr(self, 'thread') and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-        
-        print(f"\n\n🌊 Stopped. Generated {self.total_words} words total.")
-        
-        if self.generated_words:
-            print(f"\nLast 20 words: {' '.join(self.generated_words[-20:])}")
+        print("\n🌊 Stream stopped.")
 
-# --- Main Function ---
-
-def main_streaming():
-    """Streaming mode main"""
-    print("\n" + "="*60)
-    print("SIGNAL-TRIGGERED STREAMING TEXT GENERATOR")
-    print("="*60)
+def main():
+    print("\n" + "="*60 + "\n      ADVANCED NEUROMORPHIC TEXT GENERATOR\n" + "="*60)
     
-    # Connect Arduino
-    arduino = None
-    use_arduino = input("\nUse Arduino? (y/n): ").strip().lower()
-    
-    if use_arduino == 'y':
-        arduino = ArduinoInterfaceStreaming(baudrate=9600)
-        
-        if arduino.connect(timeout=5, retries=3):
-            if arduino.start_reading():
-                print("✓ Arduino ready")
-                time.sleep(2)
-            else:
-                arduino = None
-        else:
-            print("⚠️  Continuing without Arduino...")
-            arduino = None
-    
-    # Load cache
-    print("\n" + "="*60)
-    print("LOADING SYSTEM...")
-    print("="*60)
-    
-    cache = PreprocessingCache(cache_file='preprocessing_cache.pkl')
-    
-    if not cache.load():
-        print("\n✗ No cache found. Run training mode first.")
+    cache = create_or_load_cache()
+    if not cache:
+        print("\n✗ System cannot start without data. Exiting.")
         return
-    
-    tokens = cache.cache['tokens']
-    ngram_model = cache.cache['ngram_model']
-    model_keys = cache.cache['model_keys']
-    word_freq = cache.cache['word_freq']
-    total_words = cache.cache['total_words']
-    
-    # Get seed
-    seed_input = input("\nEnter seed phrase: ").strip().lower()
-    seed_tokens = re.findall(r'\b\w+\b', seed_input)
-    
-    if len(seed_tokens) < N_GRAM_ORDER:
-        while len(seed_tokens) < N_GRAM_ORDER:
-            seed_tokens.append(tokens[len(seed_tokens) % len(tokens)])
-    
-    start_key = tuple(seed_tokens[-N_GRAM_ORDER:])
-    
-    if start_key not in ngram_model:
-        similar = [k for k in model_keys if any(w in k for w in start_key)]
-        if similar:
-            start_key = similar[0]
-        else:
-            start_key = model_keys[0]
-    
-    print(f"Starting: {' '.join(start_key)}")
-    
-    # Create generator
-    generator = SimpleTokenGenerator(
-        ngram_model=ngram_model,
-        model_keys=model_keys,
-        word_freq=word_freq,
-        total_words=total_words,
-        start_key=start_key,
-        arduino=arduino
-    )
-    
-    # Create signal detector
-    signal_detector = SignalDetector(
-        threshold_low=151,
-        threshold_high=160,
-        hysteresis=50
-    )
-    
-    # Create streaming generator
-    streaming_gen = StreamingTextGenerator(
-        arduino=arduino,
-        signal_detector=signal_detector,
-        generator=generator
-    )
-    
-    # Start
-    print("\n" + "="*60)
-    print("Thresholds: Low={}, High={}".format(
-        signal_detector.threshold_low,
-        signal_detector.threshold_high
-    ))
-    print("Press Ctrl+C to stop...")
-    print("="*60)
-    
-    streaming_gen.start_streaming()
-    
-    try:
-        while True:
-            time.sleep(1)
-    
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Stopping...")
-        streaming_gen.stop()
         
-        if arduino:
-            arduino.stop()
-        
-        print("\n✓ Complete.")
+    arduino = ArduinoInterfaceStreaming(baudrate=9600) if input("\nUse Arduino for live input? (y/n): ").lower() == 'y' else None
+    if arduino and arduino.connect():
+        arduino.start_reading()
+    else:
+        arduino = None
+            
+    seed_input = input("\nEnter a seed phrase: ").lower()
+    start_key = tuple((re.findall(r'\b\w+\b', seed_input) + cache['tokens'])[:N_GRAM_ORDER])
+
+    generator = AdvancedReasoningGenerator(cache, start_key, arduino)
+    
+    streamer = LiveStreamingGenerator(arduino, SignalDetector(151, 160, 50), generator) if arduino else None
+    if streamer:
+        streamer.start()
+    while True:
+        id
+    if streamer: streamer.stop()
+    if arduino: arduino.stop()
+    print("\n✓ Complete.")
 
 if __name__ == "__main__":
-    main_streaming()
-
-
+    main()

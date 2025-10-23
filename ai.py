@@ -306,8 +306,8 @@ class ReasoningGenerator:
                 sine_phase_deg = np.degrees(sine_phase_deg)
                 novelty = novelty_scores[selected_idx]
                 resistance = resistance_factors[selected_idx]
-                print(f"[{len(output)}/{length}] λ̄={eigmean:.3f}, err={metrics['final_error']:.5f}, nov={novelty:.2f}, res={resistance:.2f}, φ={sine_phase_deg:.0f}°")
-                print(f"   Last 10: {' '.join(output[-10:])}")
+                #print(f"[{len(output)}/{length}] λ̄={eigmean:.3f}, err={metrics['final_error']:.5f}, nov={novelty:.2f}, res={resistance:.2f}, φ={sine_phase_deg:.0f}°")
+                #print(f"   Last 10: {' '.join(output[-10:])}")
 
         return " ".join(output)
 
