@@ -404,6 +404,16 @@ def build_ngram_model(tokens, n=N_GRAM_ORDER):
         model[key].append(tokens[i + n])
     return model
 
+def sine_resistance(step, novelty, freq=0.1, amp=0.5, phase=0.0):
+    """
+    Rhythmic resistance function to modulate acceptance of novel tokens.
+    novelty: [0,1] scale where 0 = frequent word, 1 = unseen/rare word
+    Returns a scaling multiplier to reduce coherence for high-novelty tokens asynchronously.
+    """
+    oscillation = np.sin(2 * np.pi * freq * step + phase)
+    # Resistance increases with novelty and inhibits during positive oscillation peaks
+    resistance = 1.0 - amp * novelty * max(0.0, oscillation)
+    return max(0.0, resistance)
 
 # =====================================================================
 # TEXT GENERATOR WITH REASONING AND TRUTH WASHING
@@ -472,7 +482,16 @@ class ReasoningGenerator:
             for cand in candidates:
                 seg = segment + [cand]
                 q = self.feature_extractor.extract_quantum_features(seg, self.word_freq, self.total_words)
-                coherence_scores.append(q['coherence'])
+                base_coherence = q['coherence']
+                
+                # Novelty = 1 - normalized frequency
+                novelty = 1.0 - np.log(self.word_freq.get(cand, 1) + 1) / np.log(self.total_words + 1)
+                
+                # Apply sine resistance
+                resistance_factor = sine_resistance(step, novelty)
+                adjusted_coherence = base_coherence * resistance_factor
+                coherence_scores.append(adjusted_coherence)
+
 
             # Periodic truth table washing
             if step % wash_interval == 0 and len(coherence_scores) >= 4:
@@ -537,7 +556,7 @@ def main():
     print(f"Precision: {torch_dtype}, TF32 enabled: {ENABLE_TF32 and not USE_FLOAT64}\n")
 
     # Load facebook natural_reasoning dataset
-    dataset = load_dataset("euclaise/writingprompts", split='train[:50000]')  # Load first 50k samples for demo
+    dataset = load_dataset("euclaise/writingprompts", split='train[:15000]')  # Load first 50k samples for demo
 
     # Preprocess text: concatenate questions, tokenize by whitespace
     all_questions = [item['story'].lower() for item in dataset]
