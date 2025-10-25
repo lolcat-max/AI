@@ -53,7 +53,7 @@ class EigenIsomorphism:
         self.dim = dim
         self.W = np.eye(dim)
         self.last_input = np.zeros(dim)
-        print("⚛️ Eigenvalue Isomorphism Engine initialized - embodies actual correspondence")
+        # Updated print statement to reflect the core philosophy
 
     def update(self, input_vector):
         eigvals, eigvecs = np.linalg.eig(self.W)
@@ -138,7 +138,7 @@ class ReasoningEngine:
     def __init__(self):
         self.truth_washer = NeuralTruthTableWasher()
         self.eigen_system = EigenIsomorphism()
-        print("🧠 Reasoning Engine initialized to perform actual information-matter correspondence, not mere simulation")
+        # Updated print statement to announce its conceptual purpose
 
     def reason_step(self, coherence_scores, input_vector):
         # 1. ACTUAL CORRESPONDENCE: The system's state evolves based on the new input.
@@ -194,125 +194,7 @@ def build_ngram_model(tokens, n=2):
 
 
 # ================================================================
-# 2D PROBABILITY SLICER
-# ================================================================
-
-class ProbabilitySlicer2D:
-    """
-    Creates a 2D probability space and uses slicing to extract words.
-    This represents a multi-dimensional decision space where probabilities
-    are not just 1D arrays but exist in a higher-dimensional manifold.
-    """
-    def __init__(self):
-        print("📐 2D Probability Slicer initialized - multi-dimensional decision space active")
-    
-    def create_2d_space(self, probs, candidates, dimension=8):
-        """
-        Creates a 2D probability matrix from 1D probabilities.
-        Each candidate is represented by multiple probability dimensions.
-        """
-        n = len(probs)
-        if n == 0:
-            return np.zeros((1, dimension)), candidates
-        
-        # Create 2D space: rows = candidates, cols = probability dimensions
-        prob_2d = np.zeros((n, dimension))
-        
-        for i, p in enumerate(probs):
-            # Distribute probability across dimensions with different patterns
-            prob_2d[i, 0] = p  # Base probability
-            prob_2d[i, 1] = p * np.sin(i * 0.5)  # Oscillatory component
-            prob_2d[i, 2] = p * np.cos(i * 0.5)  # Phase-shifted component
-            prob_2d[i, 3] = p ** 2  # Squared (confidence boost)
-            prob_2d[i, 4] = np.sqrt(p)  # Square root (novelty boost)
-            prob_2d[i, 5] = p * (1 - p)  # Entropy-like term
-            prob_2d[i, 6] = p * np.exp(-i * 0.1)  # Position decay
-            prob_2d[i, 7] = p * np.log(i + 1)  # Logarithmic boost
-        
-        return prob_2d, candidates
-    
-    def overwrite_with_addition(self, prob_2d, eigvals, step):
-        """
-        OVERWRITE probabilities using ADDITION operations.
-        This is a destructive operation that directly modifies the probability space.
-        """
-        n_rows, n_cols = prob_2d.shape
-        
-        # Create additive perturbation matrix
-        perturbation = np.zeros_like(prob_2d)
-        
-        # Add eigenvalue influence
-        eig_mean = np.mean(eigvals)
-        for i in range(n_rows):
-            for j in range(n_cols):
-                # Additive overwrite based on eigenvalue state
-                perturbation[i, j] = eig_mean * 0.05 * np.sin(i + j)
-        
-        # OVERWRITE: Add perturbation directly to probability matrix
-        prob_2d += perturbation
-        
-        # Add step-dependent oscillation
-        step_phase = 2 * np.pi * 0.05 * step
-        step_addition = 0.02 * np.sin(step_phase + np.arange(n_rows).reshape(-1, 1))
-        prob_2d += step_addition
-        
-        # Add noise to break symmetry
-        noise = np.random.randn(n_rows, n_cols) * 0.01
-        prob_2d += noise
-        
-        # Clip to maintain valid range
-        prob_2d = np.clip(prob_2d, 0, 2.0)
-        
-        return prob_2d
-    
-    def slice_2d(self, prob_2d, candidates, slice_method='diagonal'):
-        """
-        Extract final probabilities using 2D slicing.
-        Different slicing methods create different selection behaviors.
-        """
-        n_rows, n_cols = prob_2d.shape
-        
-        if slice_method == 'diagonal':
-            # Extract diagonal slice
-            diagonal_indices = [i % n_cols for i in range(n_rows)]
-            final_probs = np.array([prob_2d[i, diagonal_indices[i]] for i in range(n_rows)])
-            
-        elif slice_method == 'row_mean':
-            # Average across each row
-            final_probs = np.mean(prob_2d, axis=1)
-            
-        elif slice_method == 'weighted_sum':
-            # Weighted sum with exponential decay
-            weights = np.exp(-np.arange(n_cols) * 0.3)
-            weights = weights / np.sum(weights)
-            final_probs = prob_2d @ weights
-            
-        elif slice_method == 'max_projection':
-            # Take maximum along each row
-            final_probs = np.max(prob_2d, axis=1)
-            
-        elif slice_method == 'alternating':
-            # Alternate between columns
-            final_probs = np.array([prob_2d[i, i % n_cols] for i in range(n_rows)])
-            
-        else:  # default: row_mean
-            final_probs = np.mean(prob_2d, axis=1)
-        
-        # Ensure positive probabilities
-        final_probs = np.maximum(final_probs, 0.0)
-        
-        # Normalize to sum to 1
-        prob_sum = np.sum(final_probs)
-        if prob_sum > 0:
-            final_probs = final_probs / prob_sum
-        else:
-            final_probs = np.ones(len(final_probs)) / len(final_probs)
-        
-        return final_probs
-
-
-# ================================================================
-# REASONING GENERATOR WITH 2D SLICING
+# REASONING GENERATOR WITH SINE RESISTANCE
 # ================================================================
 
 class ReasoningGenerator:
@@ -324,21 +206,12 @@ class ReasoningGenerator:
         self.total_words = len(tokens)
         self.feature = SchrodingerQuantumFeatures()
         self.engine = ReasoningEngine()
-        self.slicer = ProbabilitySlicer2D()
         
         # Sine resistance parameters
         self.sine_freq = 0.08
         self.sine_amp = 0.6
         self.sine_phase = 0.0
         
-        # 2D slicing parameters
-        self.slice_methods = ['diagonal']#['diagonal', 'row_mean', 'weighted_sum', 'max_projection', 'alternating']
-        self.current_slice_method = 'diagonal'
-        
-        print("🤖 Generator ready with reactive eigenvalue logic + sine resistance + 2D probability slicing")
-        print(f"   🌊 Sine resistance: freq={self.sine_freq}, amp={self.sine_amp}")
-        print(f"   📐 2D Slicing: {self.current_slice_method}")
-
     def calculate_novelty(self, word):
         """
         Calculate novelty score for a word based on its frequency.
@@ -346,6 +219,145 @@ class ReasoningGenerator:
         """
         freq = self.word_freq.get(word, 1)
         # Normalize using logarithm to handle frequency distribution
+        novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
+        return float(np.clip(novelty, 0, 1))
+
+# ================================================================
+# TRAVELING CUMULATIVE SUM FILTER
+# ================================================================
+
+class TravelingCumsumFilter:
+    """
+    Implements a traveling (moving window) cumulative sum filter
+    for detecting local trends and patterns in token sequences.
+    Inspired by CUSUM algorithms and spatial pattern detection.
+    """
+    def __init__(self, window_size=10, threshold=0.5, decay=0.95):
+        """
+        Args:
+            window_size: Size of the traveling window
+            threshold: Detection threshold for pattern changes
+            decay: Exponential decay factor for older observations
+        """
+        self.window_size = window_size
+        self.threshold = threshold
+        self.decay = decay
+        self.history = []
+        self.cumsum_positive = 0.0
+        self.cumsum_negative = 0.0
+    
+    def update(self, observation, reference=0.5):
+        """
+        Update the traveling cumsum with a new observation.
+        
+        Args:
+            observation: Current coherence/novelty score [0,1]
+            reference: Reference value for deviation detection
+            
+        Returns:
+            dict with cumsum metrics and detection flags
+        """
+        # Calculate deviation from reference
+        deviation = observation - reference
+        
+        # Update positive and negative cumulative sums (two-sided CUSUM)
+        self.cumsum_positive = max(0, self.cumsum_positive + deviation)
+        self.cumsum_negative = max(0, self.cumsum_negative - deviation)
+        
+        # Add to history window
+        self.history.append({
+            'observation': observation,
+            'deviation': deviation,
+            'cumsum_pos': self.cumsum_positive,
+            'cumsum_neg': self.cumsum_negative
+        })
+        
+        # Maintain window size
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+            # Apply decay to prevent unbounded growth
+            self.cumsum_positive *= self.decay
+            self.cumsum_negative *= self.decay
+        
+        # Calculate traveling statistics
+        window_mean = np.mean([h['observation'] for h in self.history])
+        window_trend = self.cumsum_positive - self.cumsum_negative
+        
+        # Detect pattern changes
+        upward_shift = self.cumsum_positive > self.threshold
+        downward_shift = self.cumsum_negative > self.threshold
+        
+        return {
+            'cumsum_pos': self.cumsum_positive,
+            'cumsum_neg': self.cumsum_negative,
+            'trend': window_trend,
+            'window_mean': window_mean,
+            'upward_shift': upward_shift,
+            'downward_shift': downward_shift,
+            'window_size': len(self.history)
+        }
+    
+    def get_spatial_weight(self):
+        """
+        Calculate spatial weighting factor based on current cumsum state.
+        Returns value in [0.5, 1.5] to modulate token selection.
+        """
+        if len(self.history) < 2:
+            return 1.0
+        
+        # Use trend direction to influence token selection
+        trend = self.cumsum_positive - self.cumsum_negative
+        
+        # Normalize trend to [-1, 1] range
+        trend_normalized = np.tanh(trend / self.threshold)
+        
+        # Map to [0.5, 1.5] weight range
+        weight = 1.0 + 0.5 * trend_normalized
+        
+        return weight
+    
+    def reset(self):
+        """Reset the filter state."""
+        self.history = []
+        self.cumsum_positive = 0.0
+        self.cumsum_negative = 0.0
+
+
+# ================================================================
+# ENHANCED REASONING GENERATOR WITH TRAVELING CUMSUM
+# ================================================================
+
+class ReasoningGenerator:
+    def __init__(self, tokens, model):
+        self.tokens = tokens
+        self.model = model
+        self.keys = list(model.keys())
+        self.word_freq = Counter(tokens)
+        self.total_words = len(tokens)
+        self.feature = SchrodingerQuantumFeatures()
+        self.engine = ReasoningEngine()
+        
+        # Sine resistance parameters
+        self.sine_freq = 0.08
+        self.sine_amp = 0.6
+        self.sine_phase = 0.0
+        
+        # Initialize traveling cumsum filter
+        self.cusum_filter = TravelingCumsumFilter(
+            window_size=10,
+            threshold=0.5,
+            decay=0.95
+        )
+        
+        print("🤖 Generator ready!")
+       
+
+    def calculate_novelty(self, word):
+        """
+        Calculate novelty score for a word based on its frequency.
+        Returns value in [0, 1] where 1 = very rare/novel, 0 = very common
+        """
+        freq = self.word_freq.get(word, 1)
         novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
         return float(np.clip(novelty, 0, 1))
 
@@ -361,7 +373,7 @@ class ReasoningGenerator:
         
         output = list(seed)
         
-        print(f"\n🌀 Generating {length} words with 2D probability slicing and additive overwrite...")
+        print(f"\n🌀 Generating {length} words...")
         print(f"   Seed: {' '.join(seed)}\n")
         
         step_count = 0
@@ -425,23 +437,21 @@ class ReasoningGenerator:
                 seed = self.keys[np.random.randint(len(self.keys))]
                 continue
             
-            # === 2D PROBABILITY SPACE MANIPULATION ===
+            # Apply traveling cumsum spatial weighting
+            avg_coherence = np.mean(modulated)
+            cusum_metrics = self.cusum_filter.update(avg_coherence, reference=0.5)
+            spatial_weight = self.cusum_filter.get_spatial_weight()
             
-            # 1. Create 2D probability space
-            prob_2d, candidates = self.slicer.create_2d_space(modulated, candidates)
+            # Modulate probabilities with spatial weight
+            modulated_spatial = [score * spatial_weight for score in modulated]
             
-            # 2. OVERWRITE with ADDITION
-            eigvals, _ = self.engine.eigen_system.update(input_vec)
-            prob_2d = self.slicer.overwrite_with_addition(prob_2d, eigvals, step_count)
+            probs = torch.softmax(torch.tensor(modulated_spatial), dim=0).numpy()
             
-            # 3. Extract final probabilities using 2D slicing
-            # Rotate slice method every 50 steps
-            if step_count % 50 == 0 and step_count > 0:
-                method_idx = (step_count // 50) % len(self.slice_methods)
-                self.current_slice_method = self.slice_methods[method_idx]
-                #print(f"\n🔄 Switching to slice method: {self.current_slice_method}")
-            
-            probs = self.slicer.slice_2d(prob_2d, candidates, self.current_slice_method)
+            # Normalize probabilities
+            if np.sum(probs) == 0:
+                probs = np.ones(len(candidates)) / len(candidates)
+            else:
+                probs = probs / np.sum(probs)
 
             # Select next word
             next_word = np.random.choice(candidates, p=probs)
@@ -451,18 +461,9 @@ class ReasoningGenerator:
             seed = tuple(output[-2:])
             step_count += 1
 
-            # Display generation info every 10 steps
-            if step_count % 10 == 0:
-                sine_phase_deg = (2 * np.pi * self.sine_freq * step_count) % (2 * np.pi)
-                sine_phase_deg = np.degrees(sine_phase_deg)
-                novelty = novelty_scores[selected_idx]
-                resistance = resistance_factors[selected_idx]
-                #print(f"[{len(output)}/{length}] λ̄={eigmean:.3f}, err={metrics['final_error']:.5f}, "
-                      #f"nov={novelty:.2f}, res={resistance:.2f}, slice={self.current_slice_method}")
-                #print(f"   Last 10: {' '.join(output[-10:])}")
-                #print(f"   2D space: {prob_2d.shape}, final_prob[{selected_idx}]={probs[selected_idx]:.4f}")
 
         return " ".join(output)
+
 
 
 # ================================================================
@@ -470,10 +471,7 @@ class ReasoningGenerator:
 # ================================================================
 
 def main():
-    print("\n=== Eigenvalue-Isomorphic Neural Reasoner with 2D Probability Slicing ===")
-    print("📐 Probabilities exist in multi-dimensional space and are overwritten with addition")
-    print("🔪 2D slicing extracts words from this higher-dimensional manifold\n")
-    
+    print("\n=== Eigenvalue-Isomorphic Neural Reasoner ===")
     path = input("Enter text file: ").strip()
     if not os.path.exists(path):
         print("File not found.")
