@@ -2,9 +2,7 @@ import torch
 import numpy as np
 from collections import Counter, defaultdict
 import os
-import re
 from datetime import datetime
-from difflib import SequenceMatcher
 
 # ================================================================
 # CONFIGURATION
@@ -18,140 +16,262 @@ print(f"Using {device}, precision {torch_dtype}")
 
 
 # ================================================================
-# CORE ISOMORPHISM (Two-Line Mathematical Form)
+# WORD FEATURE APPROXIMATOR
 # ================================================================
-"""
-Mathematical Foundation:
-    φ(v) = P Λ P⁻¹ v
-    where W = P Λ P⁻¹, Λᵢᵢ = λᵢ + α tanh(β ⟨eᵢ, v⟩)
-"""
 
-
-# ================================================================
-# REVERSE QUESTION-ANSWER PROCESSOR
-# ================================================================
-class ReverseQAProcessor:
+class WordFeatureApproximator:
     """
-    Implements Reverse Question Answering (RQA):
-    Given a question, generate an answer, then reverse it back to a question
-    while maximizing word overlap between original and reconstructed questions.
-    
-    Based on Deep Human Answer Understanding (Yao et al. 2019/2022) and
-    maximal word overlap similarity matching.
+    Computes multi-dimensional feature similarity between words.
+    Words approximate features of other words through:
+    - Lexical similarity (character overlap, edit distance)
+    - Frequency correlation (similar corpus distributions)
+    - Phonetic patterns (sound structure)
+    - Contextual co-occurrence (distributional semantics)
+    - Morphological features (prefix/suffix patterns)
     """
-    def __init__(self):
-        self.question_markers = ['what', 'who', 'where', 'when', 'why', 'how', 'which', 'is', 'are', 'can', 'do', 'does']
-        print("🔄 Reverse QA processor initialized")
+    def __init__(self, corpus_tokens, word_freq):
+        self.word_freq = word_freq
+        self.total_words = len(corpus_tokens)
+        
+        # Build co-occurrence matrix for distributional similarity
+        self.cooccurrence = self._build_cooccurrence(corpus_tokens, window=2)
+        
+        # Cache feature vectors for performance
+        self.feature_cache = {}
+        
+    def _build_cooccurrence(self, tokens, window=2):
+        """Build word co-occurrence matrix for distributional features."""
+        cooccur = defaultdict(Counter)
+        for i, word in enumerate(tokens):
+            context_start = max(0, i - window)
+            context_end = min(len(tokens), i + window + 1)
+            for j in range(context_start, context_end):
+                if i != j:
+                    cooccur[word][tokens[j]] += 1
+        return dict(cooccur)
     
-    def is_question(self, text):
-        """Check if text appears to be a question."""
-        text_lower = text.lower().strip()
-        return (text_lower.endswith('?') or 
-                any(text_lower.startswith(marker) for marker in self.question_markers))
-    
-    def extract_answer_content(self, text):
+    def extract_features(self, word):
         """
-        Extract answer-like content from text by removing question markers.
-        This simulates converting a question into an answer statement.
+        Extract comprehensive feature vector for a word.
+        Returns normalized feature array capturing multiple word properties.
         """
-        text = text.strip().rstrip('?')
-        text_lower = text.lower()
+        if word in self.feature_cache:
+            return self.feature_cache[word]
         
-        # Remove common question words while preserving content words
-        words = text.split()
-        if words and words[0].lower() in self.question_markers:
-            if len(words) > 1:
-                words = words[1:]
+        features = []
         
-        answer = ' '.join(words)
-        return answer
-    
-    def calculate_word_overlap(self, text1, text2):
-        """
-        Calculate maximal word overlap between two texts.
-        Returns overlap ratio and shared words.
-        """
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
+        # 1. Lexical features (character-level patterns)
+        features.append(len(word) / 20.0)  # Normalized length
+        features.append(sum(1 for c in word if c.isalpha()) / (len(word) + 1))  # Alpha ratio
+        features.append(sum(1 for c in word if c in 'aeiou') / (len(word) + 1))  # Vowel ratio
         
-        intersection = words1 & words2
-        union = words1 | words2
+        # 2. Character distribution features
+        char_counts = Counter(word)
+        features.append(len(char_counts) / (len(word) + 1))  # Character diversity
+        features.append(max(char_counts.values()) / (len(word) + 1) if char_counts else 0)  # Max char frequency
         
-        if not union:
-            return 0.0, []
+        # 3. Frequency-based features
+        freq = self.word_freq.get(word, 1)
+        features.append(np.log(freq + 1) / np.log(self.total_words + 1))  # Log-normalized frequency
+        features.append(1.0 / (freq + 1))  # Rarity score
         
-        overlap_ratio = len(intersection) / len(union)
-        return overlap_ratio, sorted(list(intersection))
-    
-    def calculate_sequence_overlap(self, text1, text2):
-        """Calculate longest common subsequence overlap."""
-        matcher = SequenceMatcher(None, text1.lower(), text2.lower())
-        match = matcher.find_longest_match(0, len(text1), 0, len(text2))
+        # 4. Phonetic features (approximate sound patterns)
+        features.append(1 if word[0] in 'aeiou' else 0 if word else 0)  # Starts with vowel
+        features.append(1 if word[-1] in 'aeiou' else 0 if word else 0)  # Ends with vowel
+        features.append(word.count('th') + word.count('ch') + word.count('sh'))  # Digraph count
         
-        if match.size == 0:
-            return 0.0, ""
+        # 5. Morphological features
+        features.append(1 if word.endswith('ing') else 0)  # Progressive form
+        features.append(1 if word.endswith('ed') else 0)  # Past tense
+        features.append(1 if word.endswith('s') else 0)  # Plural/3rd person
+        features.append(1 if word.startswith('un') or word.startswith('re') else 0)  # Common prefixes
         
-        overlap_text = text1[match.a:match.a + match.size]
-        overlap_ratio = match.size / max(len(text1), len(text2))
-        
-        return overlap_ratio, overlap_text
-    
-    def reverse_to_question(self, answer_text, original_question):
-        """
-        Reverse an answer back to a question form while maximizing
-        overlap with the original question.
-        """
-        # Extract words from both texts
-        answer_words = answer_text.lower().split()
-        question_words = original_question.lower().strip('?').split()
-        
-        # Find words that appear in the original question
-        shared_words = [w for w in answer_words if w in question_words]
-        unique_answer_words = [w for w in answer_words if w not in question_words]
-        
-        # Construct reversed question starting with a question marker
-        if not shared_words and not unique_answer_words:
-            reversed_q = f"What is {answer_text}?"
+        # 6. Positional character features (encoding word structure)
+        if len(word) >= 1:
+            features.append(ord(word[0]) / 122.0)  # First character (normalized)
         else:
-            # Try to preserve original question structure
-            if original_question.lower().startswith(tuple(self.question_markers)):
-                starter = original_question.split()[0]
-            else:
-                starter = "What"
-            
-            # Reconstruct using maximal shared words first
-            content = ' '.join(shared_words + unique_answer_words)
-            reversed_q = f"{starter} {content}?"
+            features.append(0)
+        if len(word) >= 2:
+            features.append(ord(word[1]) / 122.0)  # Second character
+        else:
+            features.append(0)
+        if len(word) >= 1:
+            features.append(ord(word[-1]) / 122.0)  # Last character
+        else:
+            features.append(0)
         
-        return reversed_q
+        feature_vector = np.array(features)
+        self.feature_cache[word] = feature_vector
+        return feature_vector
     
-    def process_reverse_qa(self, question, generated_answer, show_metrics=True):
+    def compute_similarity(self, word1, word2):
         """
-        Complete Reverse QA cycle:
-        1. Original Question → Answer (via generation)
-        2. Answer → Reversed Question (maximizing word overlap)
-        3. Calculate overlap metrics
+        Compute multi-feature similarity between two words.
+        Returns value in [0, 1] where 1 = identical features, 0 = completely different.
         """
-        # Step 1: Extract answer content from question
-        intermediate_answer = self.extract_answer_content(question)
+        # Extract feature vectors
+        vec1 = self.extract_features(word1)
+        vec2 = self.extract_features(word2)
         
-        # Step 2: Reverse generated answer back to question
-        reversed_question = self.reverse_to_question(generated_answer, question)
+        # Compute cosine similarity between feature vectors
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
         
-        # Step 3: Calculate overlap metrics
-        word_overlap, shared_words = self.calculate_word_overlap(question, reversed_question)
-        seq_overlap, seq_text = self.calculate_sequence_overlap(question, reversed_question)
+        if norm1 == 0 or norm2 == 0:
+            cosine_sim = 0
+        else:
+            cosine_sim = dot_product / (norm1 * norm2)
         
+        # Add distributional similarity based on co-occurrence
+        distributional_sim = self._distributional_similarity(word1, word2)
         
-        return {
-            'original_question': question,
-            'generated_answer': generated_answer,
-            'reversed_question': reversed_question,
-            'word_overlap_ratio': word_overlap,
-            'sequence_overlap_ratio': seq_overlap,
-            'shared_words': shared_words,
-            'seq_overlap_text': seq_text
-        }
+        # Compute character overlap (Jaccard similarity)
+        set1 = set(word1)
+        set2 = set(word2)
+        if len(set1) == 0 and len(set2) == 0:
+            jaccard_sim = 1.0
+        elif len(set1 | set2) == 0:
+            jaccard_sim = 0.0
+        else:
+            jaccard_sim = len(set1 & set2) / len(set1 | set2)
+        
+        # Weighted combination of similarity metrics
+        combined_similarity = (
+            0.5 * max(0, cosine_sim) +  # Feature vector similarity
+            0.3 * distributional_sim +   # Context similarity
+            0.2 * jaccard_sim            # Character overlap
+        )
+        
+        return float(np.clip(combined_similarity, 0, 1))
+    
+    def _distributional_similarity(self, word1, word2):
+        """
+        Compute distributional similarity based on shared context words.
+        Implements simplified word2vec-style distributional semantics.
+        """
+        if word1 not in self.cooccurrence or word2 not in self.cooccurrence:
+            return 0.0
+        
+        context1 = self.cooccurrence[word1]
+        context2 = self.cooccurrence[word2]
+        
+        # Find shared context words
+        shared_contexts = set(context1.keys()) & set(context2.keys())
+        
+        if not shared_contexts:
+            return 0.0
+        
+        # Compute similarity based on shared context weights
+        similarity_sum = sum(
+            min(context1[ctx], context2[ctx]) / max(context1[ctx], context2[ctx])
+            for ctx in shared_contexts
+        )
+        
+        return similarity_sum / (len(shared_contexts) + 1)
+    
+    def find_similar_words(self, target_word, candidates, top_k=5):
+        """
+        Find the k most similar words to target_word from candidates list.
+        Returns list of (word, similarity_score) tuples sorted by similarity.
+        """
+        similarities = [
+            (cand, self.compute_similarity(target_word, cand))
+            for cand in candidates
+            if cand != target_word
+        ]
+        
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
+    
+    def approximate_word_features(self, word, reference_words):
+        """
+        Approximate a word's features as a weighted combination of similar words' features.
+        This allows words to 'borrow' features from semantically/lexically related words.
+        """
+        if not reference_words:
+            return self.extract_features(word)
+        
+        # Get own features
+        own_features = self.extract_features(word)
+        
+        # Compute similarity to all reference words
+        similarities = [(ref, self.compute_similarity(word, ref)) for ref in reference_words]
+        similarities = [(ref, sim) for ref, sim in similarities if sim > 0.1]  # Filter low similarity
+        
+        if not similarities:
+            return own_features
+        
+        # Weight own features heavily, but blend in similar words' features
+        total_weight = 1.0 + sum(sim for _, sim in similarities)
+        approximated_features = own_features.copy()
+        
+        for ref_word, similarity in similarities:
+            ref_features = self.extract_features(ref_word)
+            approximated_features += (similarity / total_weight) * ref_features
+        
+        approximated_features = approximated_features / (1 + len(similarities) * 0.3)  # Normalize
+        
+        return approximated_features
+
+
+# ================================================================
+# CENTRAL KERNEL PROCESSOR
+# ================================================================
+
+class CentralKernel:
+    """
+    Central kernel that applies convolution-like operations to all arrays.
+    Acts as a unified processing core for coherence, eigenvalue, and spatial data.
+    """
+    def __init__(self, kernel_size=3):
+        self.kernel_size = kernel_size
+        self.kernel = self._create_kernel()
+        
+    def _create_kernel(self):
+        """Create the convolution kernel based on type."""
+        if self.kernel_size == 3:
+            kernel = np.array([1, 2, 1]) / 4.0
+        elif self.kernel_size == 5:
+            kernel = np.array([1, 4, 6, 4, 1]) / 16.0
+        else:
+            kernel = np.bartlett(self.kernel_size)
+            kernel = kernel / np.sum(kernel)
+        
+        return kernel
+    
+    def convolve_1d(self, array, mode='same'):
+        if len(array) == 0:
+            return array
+        arr = np.array(array)
+        if mode == 'same':
+            pad_width = self.kernel_size // 2
+            arr_padded = np.pad(arr, pad_width, mode='edge')
+            result = np.convolve(arr_padded, self.kernel, mode='valid')
+        else:
+            result = np.convolve(arr, self.kernel, mode=mode)
+        if mode == 'same' and len(result) != len(array):
+            result = result[:len(array)]
+        return result
+    
+    def process_scores(self, scores):
+        if len(scores) < self.kernel_size:
+            return scores
+        filtered = self.convolve_1d(scores, mode='same')
+        filtered = np.clip(filtered, 0, 1)
+        return filtered.tolist()
+    
+    def process_eigenvalues(self, eigenvalues):
+        if len(eigenvalues) < 2:
+            return eigenvalues
+        filtered = self.convolve_1d(eigenvalues, mode='same')
+        return filtered
+    
+    def process_vector(self, vector):
+        if len(vector) < self.kernel_size:
+            return vector
+        filtered = self.convolve_1d(vector, mode='same')
+        return filtered
 
 
 # ================================================================
@@ -159,7 +279,6 @@ class ReverseQAProcessor:
 # ================================================================
 
 def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
-    """Rhythmic resistance function to modulate acceptance of novel tokens."""
     oscillation = np.sin(2 * np.pi * freq * step + phase)
     resistance = 1.0 - amp * novelty * max(0.0, oscillation)
     return max(0.1, resistance)
@@ -168,40 +287,29 @@ def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
 # ================================================================
 # EIGENVALUE ISOMORPHISM MODEL
 # ================================================================
+
 class EigenIsomorphism:
-    """
-    Implements the two-line isomorphism:
-        φ(v) = P Λ P⁻¹ v
-        Λᵢᵢ = λᵢ + α tanh(β ⟨eᵢ, v⟩)
-    """
-    def __init__(self, dim=4, alpha=0.05, beta=0.6):
+    def __init__(self, dim=4, kernel=None):
         self.dim = dim
-        self.alpha = alpha
-        self.beta = beta
         self.W = np.eye(dim)
         self.last_input = np.zeros(dim)
-        print(f"✨ Isomorphism initialized: φ(v) = P Λ P⁻¹ v")
+        self.kernel = kernel
 
     def update(self, input_vector):
-        """Apply the isomorphism transformation."""
         eigvals, eigvecs = np.linalg.eig(self.W)
-        
-        input_padded = np.zeros(self.dim)
-        input_padded[:len(input_vector)] = input_vector[:self.dim]
-        projection = np.dot(eigvecs.T, input_padded)
-        
-        delta = self.alpha * np.tanh(self.beta * projection)
-        new_eigvals = eigvals + delta[:len(eigvals)]
-        
+        if self.kernel is not None and len(input_vector) >= self.kernel.kernel_size:
+            input_vector = self.kernel.process_vector(input_vector[:self.dim])
+        delta = np.tanh(0.6 * np.dot(eigvecs.T, input_vector[:self.dim]))
+        new_eigvals = eigvals + 0.05 * delta[:len(eigvals)]
+        if self.kernel is not None:
+            new_eigvals = self.kernel.process_eigenvalues(new_eigvals)
         self.W = eigvecs @ np.diag(new_eigvals) @ np.linalg.inv(eigvecs)
-        self.last_input = input_padded
-        
+        self.last_input = input_vector
         return np.real(new_eigvals), np.real(eigvecs)
 
-    def transform(self, vec):
-        """Apply φ(v) = P Λ P⁻¹ v"""
+    def project(self, vec):
         eigvals, eigvecs = np.linalg.eig(self.W)
-        return np.real(eigvecs @ np.diag(eigvals) @ np.linalg.inv(eigvecs) @ vec)
+        return np.real(np.dot(eigvecs, np.dot(np.diag(eigvals), np.dot(np.linalg.inv(eigvecs), vec))))
 
 
 # ================================================================
@@ -211,7 +319,7 @@ class EigenIsomorphism:
 class NeuralTruthTableWasher:
     def __init__(self, eta_0=0.3, alpha=0.1, epsilon=1e-4,
                  delta=1e-3, beta=1.0, gamma=2.0, mu=0.5,
-                 max_iterations=30):
+                 max_iterations=30, kernel=None):
         self.eta_0 = eta_0
         self.alpha = alpha
         self.epsilon = epsilon
@@ -223,6 +331,7 @@ class NeuralTruthTableWasher:
         self.dtype = torch_dtype
         self.device = device
         self.history = []
+        self.kernel = kernel
 
     def calculate_error(self, T, T_expected):
         T = torch.tensor(T, dtype=self.dtype, device=self.device)
@@ -242,6 +351,8 @@ class NeuralTruthTableWasher:
 
     def wash(self, T_contaminated, T_expected):
         Tcur = T_contaminated.copy()
+        if self.kernel is not None and len(Tcur) >= self.kernel.kernel_size:
+            Tcur = self.kernel.process_scores(Tcur)
         for k in range(self.max_iterations):
             eta = self.eta_0 * np.exp(-self.alpha * k)
             Tnext = self.wash_iteration(Tcur, T_expected, eta)
@@ -254,121 +365,68 @@ class NeuralTruthTableWasher:
 
 
 # ================================================================
-# TRAVELING CUMULATIVE SUM FILTER
-# ================================================================
-
-class TravelingCumsumFilter:
-    """
-    Implements traveling cumulative sum filter for pattern detection.
-    """
-    def __init__(self, window_size=10, threshold=0.5, decay=0.95):
-        self.window_size = window_size
-        self.threshold = threshold
-        self.decay = decay
-        self.history = []
-        self.cumsum_positive = 0.0
-        self.cumsum_negative = 0.0
-    
-    def update(self, observation, reference=0.5):
-        """Update the traveling cumsum with a new observation."""
-        deviation = observation - reference
-        
-        self.cumsum_positive = max(0, self.cumsum_positive + deviation)
-        self.cumsum_negative = max(0, self.cumsum_negative - deviation)
-        
-        self.history.append({
-            'observation': observation,
-            'deviation': deviation,
-            'cumsum_pos': self.cumsum_positive,
-            'cumsum_neg': self.cumsum_negative
-        })
-        
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-            self.cumsum_positive *= self.decay
-            self.cumsum_negative *= self.decay
-        
-        window_mean = np.mean([h['observation'] for h in self.history])
-        window_trend = self.cumsum_positive - self.cumsum_negative
-        
-        upward_shift = self.cumsum_positive > self.threshold
-        downward_shift = self.cumsum_negative > self.threshold
-        
-        return {
-            'cumsum_pos': self.cumsum_positive,
-            'cumsum_neg': self.cumsum_negative,
-            'trend': window_trend,
-            'window_mean': window_mean,
-            'upward_shift': upward_shift,
-            'downward_shift': downward_shift,
-            'window_size': len(self.history)
-        }
-    
-    def get_spatial_weight(self):
-        """Calculate spatial weighting factor based on cumsum state."""
-        if len(self.history) < 2:
-            return 1.0
-        
-        trend = self.cumsum_positive - self.cumsum_negative
-        trend_normalized = np.tanh(trend / self.threshold)
-        weight = 1.0 + 0.5 * trend_normalized
-        
-        return weight
-    
-    def reset(self):
-        """Reset the filter state."""
-        self.history = []
-        self.cumsum_positive = 0.0
-        self.cumsum_negative = 0.0
-
-
-# ================================================================
 # REASONING ENGINE
 # ================================================================
+
 class ReasoningEngine:
-    """
-    Orchestrates intuitive reasoning by combining eigenvalue isomorphism
-    with truth-table washing for decision clarity.
-    """
-    def __init__(self):
-        self.truth_washer = NeuralTruthTableWasher()
-        self.eigen_system = EigenIsomorphism()
-        print("🧠 Reasoning engine online")
+    def __init__(self, kernel=None):
+        self.kernel = kernel
+        self.truth_washer = NeuralTruthTableWasher(kernel=kernel)
+        self.eigen_system = EigenIsomorphism(kernel=kernel)
 
     def reason_step(self, coherence_scores, input_vector):
-        """Execute one reasoning step with isomorphic transformation."""
+        if self.kernel is not None and len(coherence_scores) >= self.kernel.kernel_size:
+            coherence_scores = self.kernel.process_scores(coherence_scores)
         eigvals, eigvecs = self.eigen_system.update(input_vector)
-        
         padded_scores = coherence_scores[:4]
         while len(padded_scores) < 4:
             padded_scores.append(0.5)
-        
         washed, metrics = self.truth_washer.wash(
             padded_scores,
             [1.0 if c > 0.5 else 0.0 for c in padded_scores]
         )
-        
-        scale = 1 + 0.1 * np.mean(eigvals)
         modulated = []
+        scale = 1 + 0.1 * np.mean(eigvals)
         for i in range(len(coherence_scores)):
             if i < len(washed):
                 modulated.append(float(np.clip(washed[i] * scale, 0, 1)))
             else:
                 modulated.append(float(np.clip(coherence_scores[i] * scale, 0, 1)))
-        
+        if self.kernel is not None and len(modulated) >= self.kernel.kernel_size:
+            modulated = self.kernel.process_scores(modulated)
         return modulated, np.mean(eigvals), metrics
 
 
 # ================================================================
-# SCHRODINGER QUANTUM FEATURES
+# ENHANCED QUANTUM FEATURES WITH WORD APPROXIMATION
 # ================================================================
 
 class SchrodingerQuantumFeatures:
+    def __init__(self, word_approximator=None):
+        self.word_approximator = word_approximator
+        
     def extract_quantum_features(self, segment, word_freq, total_words):
         xs = np.array([len(w) for w in segment])
         fs = np.array([word_freq.get(w, 1) for w in segment])
+        
+        # Base variance calculation
         var = np.var(xs / (fs + 1))
         coherence = 1.0 / (1.0 + var)
+        
+        # Enhanced: If word approximator available, boost coherence based on word similarities
+        if self.word_approximator is not None and len(segment) >= 2:
+            # Compute average pairwise similarity in segment
+            similarities = []
+            for i in range(len(segment) - 1):
+                sim = self.word_approximator.compute_similarity(segment[i], segment[i+1])
+                similarities.append(sim)
+            
+            if similarities:
+                avg_similarity = np.mean(similarities)
+                # Boost coherence for similar adjacent words
+                coherence = coherence * (1.0 + 0.3 * avg_similarity)
+                coherence = min(1.0, coherence)
+        
         return {"coherence": coherence}
 
 
@@ -385,90 +443,90 @@ def build_ngram_model(tokens, n=2):
 
 
 # ================================================================
-# REASONING GENERATOR WITH REVERSE QA
+# REASONING GENERATOR WITH WORD FEATURE APPROXIMATION
 # ================================================================
 
 class ReasoningGenerator:
-    def __init__(self, tokens, model):
+    def __init__(self, tokens, model, kernel_size=3):
         self.tokens = tokens
         self.model = model
         self.keys = list(model.keys())
         self.word_freq = Counter(tokens)
         self.total_words = len(tokens)
-        self.feature = SchrodingerQuantumFeatures()
-        self.engine = ReasoningEngine()
-        self.rqa_processor = ReverseQAProcessor()
+        
+        # Initialize word feature approximator
+        print("🔬 Building word feature approximator...")
+        self.word_approximator = WordFeatureApproximator(tokens, self.word_freq)
+        
+        # Initialize quantum features with approximator
+        self.feature = SchrodingerQuantumFeatures(word_approximator=self.word_approximator)
+        
+        # Initialize central kernel
+        self.central_kernel = CentralKernel(
+            kernel_size=kernel_size,
+        )
+        
+        # Initialize reasoning engine with kernel
+        self.engine = ReasoningEngine(kernel=self.central_kernel)
         
         # Sine resistance parameters
         self.sine_freq = 0.08
         self.sine_amp = 0.6
         self.sine_phase = 0.0
         
-        # Traveling cumsum filter
-        self.cusum_filter = TravelingCumsumFilter(
-            window_size=10,
-            threshold=0.5,
-            decay=0.95
-        )
-        
-        print("🤖 Generator ready with Reverse QA processing!")
-       
+        print(f"🤖 Generator ready with kernel and word approximation!")
+
     def calculate_novelty(self, word):
-        """Calculate novelty score [0,1] where 1 = rare, 0 = common."""
         freq = self.word_freq.get(word, 1)
         novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
         return float(np.clip(novelty, 0, 1))
 
-    def generate(self, seed, length=50, enable_rqa=True):
-        """
-        Generate text with optional Reverse QA processing.
-        
-        Args:
-            seed: User input (potentially a question)
-            length: Number of words to generate
-            enable_rqa: Enable reverse question-answer cycle
-        """
-        original_seed = seed
-        
-        # Parse seed
+    def generate(self, seed, length=50):
         seed_words = seed.lower().split()[:2]
         while len(seed_words) < 2:
             seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
-        seed_tuple = tuple(seed_words)
+        seed = tuple(seed_words)
         
-        if seed_tuple not in self.model:
-            seed_tuple = self.keys[np.random.randint(len(self.keys))]
+        if seed not in self.model:
+            seed = self.keys[np.random.randint(len(self.keys))]
         
-        output = list(seed_tuple)
+        output = list(seed)
         
-        print(f"\n🌀 Generating {length} words with isomorphic reasoning...")
-        print(f"   Starting seed: {' '.join(seed_tuple)}\n")
+        print(f"\n🌀 Generating {length} words with feature approximation...")
+        print(f"   Seed: {' '.join(seed)}\n")
         
         step_count = 0
         
         while len(output) < length:
-            # Create input vector for isomorphism
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
-            input_vec = np.array([ord(c) % 97 / 25.0 for c in recent_text.ljust(4)[:4]])
+            input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
+            input_vec = self.central_kernel.process_vector(input_vec)
 
-            # Get candidates
-            candidates = self.model.get(seed_tuple, [])
+            candidates = self.model.get(seed, [])
             candidates = [w for w in candidates if any(c.isalnum() for c in w)]
             
             if not candidates:
-                seed_tuple = self.keys[np.random.randint(len(self.keys))]
+                seed = self.keys[np.random.randint(len(self.keys))]
                 continue
 
-            # Calculate coherence with sine resistance
             coherence_scores = []
+            novelty_scores = []
+            resistance_factors = []
             
             for cand in candidates:
+                # Extract quantum features (now enhanced with word approximation)
                 q = self.feature.extract_quantum_features(
-                    list(seed_tuple) + [cand], 
+                    list(seed) + [cand], 
                     self.word_freq, 
                     self.total_words
                 )
                 base_coherence = q["coherence"]
+                
+                # Boost coherence for candidates similar to recent words
+                if len(output) >= 1:
+                    recent_word = output[-1]
+                    similarity = self.word_approximator.compute_similarity(recent_word, cand)
+                    base_coherence = base_coherence * (1.0 + 0.2 * similarity)
                 
                 novelty = self.calculate_novelty(cand)
                 resistance_factor = sine_resistance(
@@ -480,54 +538,41 @@ class ReasoningGenerator:
                 )
                 
                 adjusted_coherence = base_coherence * resistance_factor
+                
                 coherence_scores.append(adjusted_coherence)
+                novelty_scores.append(novelty)
+                resistance_factors.append(resistance_factor)
 
-            # Apply isomorphic reasoning
+            if len(coherence_scores) >= self.central_kernel.kernel_size:
+                coherence_scores = self.central_kernel.process_scores(coherence_scores)
+
             modulated, eigmean, metrics = self.engine.reason_step(coherence_scores, input_vec)
             
-            # Ensure alignment
             if len(modulated) != len(candidates):
                 min_len = min(len(modulated), len(candidates))
                 modulated = modulated[:min_len]
                 candidates = candidates[:min_len]
             
             if not modulated or not candidates:
-                seed_tuple = self.keys[np.random.randint(len(self.keys))]
+                seed = self.keys[np.random.randint(len(self.keys))]
                 continue
             
-            # Apply traveling cumsum spatial weighting
-            avg_coherence = np.mean(modulated)
-            cusum_metrics = self.cusum_filter.update(avg_coherence, reference=0.5)
-            spatial_weight = self.cusum_filter.get_spatial_weight()
+            if len(modulated) >= self.central_kernel.kernel_size:
+                modulated = self.central_kernel.process_scores(modulated)
             
-            modulated_spatial = [score * spatial_weight for score in modulated]
-            
-            # Convert to probabilities
-            probs = torch.softmax(torch.tensor(modulated_spatial), dim=0).numpy()
+            probs = torch.softmax(torch.tensor(modulated), dim=0).numpy()
             
             if np.sum(probs) == 0:
                 probs = np.ones(len(candidates)) / len(candidates)
             else:
                 probs = probs / np.sum(probs)
 
-            # Select next word
             next_word = np.random.choice(candidates, p=probs)
             output.append(next_word)
-            seed_tuple = tuple(output[-2:])
+            seed = tuple(output[-2:])
             step_count += 1
 
-        generated_text = " ".join(output)
-        
-        # Apply Reverse QA if enabled and input was a question
-        if enable_rqa and self.rqa_processor.is_question(original_seed):
-            rqa_results = self.rqa_processor.process_reverse_qa(
-                original_seed, 
-                generated_text,
-                show_metrics=True
-            )
-            return generated_text, rqa_results
-        
-        return generated_text, None
+        return " ".join(output)
 
 
 # ================================================================
@@ -535,57 +580,29 @@ class ReasoningGenerator:
 # ================================================================
 
 def main():
-    print("\n" + "="*60)
-    print("   EIGENVALUE-ISOMORPHIC NEURAL REASONER")
-    print("   φ(v) = P Λ P⁻¹ v  |  Λᵢᵢ = λᵢ + α tanh(β ⟨eᵢ, v⟩)")
-    print("   With Reverse Question-Answer Processing")
-    print("="*60)
+    print("\n=== Eigenvalue-Isomorphic Neural Reasoner ===")
+    print("    with Word Feature Approximation\n")
     
-    path = input("\nEnter text file: ").strip()
+    path = input("Enter text file: ").strip()
     if not os.path.exists(path):
-        print("❌ File not found.")
+        print("File not found.")
         return
 
     corpus = open(path, 'r', encoding='utf-8').read().lower().split()
     model = build_ngram_model(corpus)
-    print(f"\n📚 Loaded {len(corpus):,} tokens, model size: {len(model):,}")
+    print(f"Loaded {len(corpus):,} tokens, model size: {len(model):,}")
 
-    generator = ReasoningGenerator(corpus, model)
+    generator = ReasoningGenerator(corpus, model, kernel_size=3)
     
-    print("\n💡 Commands:")
-    print("   - Ask questions to trigger Reverse QA cycle")
-    print("   - Prefix with 'norqa:' to disable Reverse QA")
-    print("   - Type 'quit' or 'exit' to end\n")
-    result = generator.generate(
-            "warm up", 
-            length=500, 
-            enable_rqa=True
-        )
     while True:
-        seed = input("💬 USER: ")
+        seed = input("\nUSER: ")
         if seed.lower() in ['quit', 'exit']:
             break
-        
-        # Check if user wants to disable RQA
-      
-        result = generator.generate(
-            seed, 
-            length=500, 
-            enable_rqa=True
-        )
-        
-        if isinstance(result, tuple):
-            generated, rqa_results = result
-        else:
-            generated = result
-            rqa_results = None
-        
+            
+        generated = generator.generate(seed, length=500)
         print("\n=== AI Response ===\n")
         print(generated)
         print(f"\n[Total: {len(generated.split())} words]")
-        
-        if rqa_results:
-            print(f"\n✅ Reverse QA completed with {rqa_results['word_overlap_ratio']:.2%} word overlap")
 
 
 if __name__ == "__main__":
