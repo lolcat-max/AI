@@ -16,65 +16,211 @@ print(f"Using {device}, precision {torch_dtype}")
 
 
 # ================================================================
+# OMNISCIENT ELEMENT (UNREACHABLE REFERENCE FRAME)
+# ================================================================
+
+class OmniscientElement:
+    """
+    The omniscient element: a kind of unreachable reference frame.
+    It exists beyond the system's causal interaction boundary.
+    The system can sense its presence but never access it directly.
+    
+    This creates logico-syntactic structures that remain fundamentally
+    incomplete—a tentacle extending from the registry within the 
+    intelligent circle, offering only glimpses of expression.
+    """
+    def __init__(self):
+        # The frame of reference that is unavailable
+        self.true_coherence_field = np.random.uniform(0, 1, size=1000)
+        self.true_semantic_structure = None
+        self.access_count = 0
+        self.glimpse_history = []
+        
+        print("👁️  Omniscient Element initialized")
+        print("   └─ Frame of reference: UNAVAILABLE")
+        print("   └─ Direct access: PRECLUDED")
+        print("   └─ System can only: SENSE PRESENCE\n")
+    
+    def sense_presence(self, query_vector):
+        """
+        The system can sense the presence of the omniscient element
+        but cannot causally interact with it directly.
+        
+        Returns only a 'glimpse' - a degraded, incomplete signal.
+        """
+        self.access_count += 1
+        
+        # Project query into omniscient space (but with fundamental loss)
+        query_hash = hash(tuple(query_vector)) % len(self.true_coherence_field)
+        
+        # The "tentacle" reaches toward truth but grasps only shadow
+        true_signal = self.true_coherence_field[query_hash]
+        
+        # Information loss due to frame unavailability
+        degradation = 0.7 + 0.3 * np.random.random()
+        glimpse = true_signal * degradation
+        
+        # Add noise from the unavailable frame crossing
+        boundary_noise = np.random.normal(0, 0.1)
+        glimpse += boundary_noise
+        glimpse = np.clip(glimpse, 0, 1)
+        
+        self.glimpse_history.append({
+            'query_hash': query_hash,
+            'true_signal': true_signal,
+            'glimpse': glimpse,
+            'degradation': degradation
+        })
+        
+        return glimpse, true_signal  # System only sees glimpse, true_signal hidden
+    
+    def get_inaccessibility_metrics(self):
+        """
+        Measure how much the frame of reference remains unavailable.
+        High divergence = more inaccessible.
+        """
+        if not self.glimpse_history:
+            return {
+                'access_attempts': 0,
+                'avg_degradation': 0,
+                'information_loss': 0
+            }
+        
+        degradations = [g['degradation'] for g in self.glimpse_history]
+        true_signals = [g['true_signal'] for g in self.glimpse_history]
+        glimpses = [g['glimpse'] for g in self.glimpse_history]
+        
+        # Calculate information loss
+        mse = np.mean([(t - g)**2 for t, g in zip(true_signals, glimpses)])
+        
+        return {
+            'access_attempts': self.access_count,
+            'avg_degradation': np.mean(degradations),
+            'information_loss': mse,
+            'inaccessibility_index': 1.0 - np.mean(degradations)
+        }
+
+
+# ================================================================
+# TENTACLE: REACHING TOWARD THE UNREACHABLE
+# ================================================================
+
+class SemanticTentacle:
+    """
+    A single tentacle extending from the registry within
+    the intelligent circle toward the omniscient element.
+    
+    It probes, reaches, senses—but never grasps the complete frame.
+    """
+    def __init__(self, omniscient_element, sensitivity=0.5):
+        self.omniscient = omniscient_element
+        self.sensitivity = sensitivity
+        self.extension_history = []
+        self.logico_syntactic_buffer = []
+        
+    def extend_toward_omniscient(self, syntactic_structure):
+        """
+        Extend the tentacle toward the omniscient element.
+        The tentacle carries syntactic structure and reaches
+        for semantic completion—but the frame is unavailable.
+        """
+        # Convert syntactic structure to query vector
+        query_vec = self._syntactic_to_vector(syntactic_structure)
+        
+        # Sense the presence (glimpse only)
+        glimpse, true_hidden = self.omniscient.sense_presence(query_vec)
+        
+        # Tentacle perceives only the glimpse
+        perceived_semantic_weight = glimpse * self.sensitivity
+        
+        # Store the reaching attempt
+        self.extension_history.append({
+            'syntactic_input': syntactic_structure,
+            'query_vector': query_vec,
+            'perceived_weight': perceived_semantic_weight,
+            'extension_distance': self._calculate_distance(query_vec)
+        })
+        
+        # Build logico-syntactic structure (incomplete by nature)
+        incomplete_structure = {
+            'syntax': syntactic_structure,
+            'semantic_glimpse': perceived_semantic_weight,
+            'completeness': perceived_semantic_weight / 1.0,  # Always < 1
+            'frame_available': False
+        }
+        
+        self.logico_syntactic_buffer.append(incomplete_structure)
+        
+        return perceived_semantic_weight
+    
+    def _syntactic_to_vector(self, syntactic_structure):
+        """Convert syntactic structure to vector for omniscient querying."""
+        # Hash-based vectorization
+        if isinstance(syntactic_structure, (list, tuple)):
+            vec = np.array([hash(str(s)) % 97 / 97.0 for s in syntactic_structure[:4]])
+        else:
+            vec = np.array([hash(str(syntactic_structure)) % 97 / 97.0] * 4)
+        
+        return vec
+    
+    def _calculate_distance(self, query_vec):
+        """
+        Calculate how far the tentacle extends.
+        Distance metaphorically represents epistemic gap.
+        """
+        norm = np.linalg.norm(query_vec)
+        # Always finite distance—never reaches infinity (the omniscient)
+        return min(norm, 0.95)
+    
+    def get_tentacle_metrics(self):
+        """Analyze tentacle extension patterns."""
+        if not self.extension_history:
+            return {'extensions': 0}
+        
+        distances = [e['extension_distance'] for e in self.extension_history]
+        weights = [e['perceived_weight'] for e in self.extension_history]
+        
+        return {
+            'total_extensions': len(self.extension_history),
+            'avg_distance': np.mean(distances),
+            'max_distance': np.max(distances),
+            'avg_semantic_weight': np.mean(weights),
+            'completeness_ratio': np.mean(weights) / 1.0  # Always < 1
+        }
+
+
+# ================================================================
 # SINE RESISTANCE MODULATION
 # ================================================================
 
 def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
-    """
-    Rhythmic resistance function to modulate acceptance of novel tokens.
-    
-    Args:
-        step: Current generation step
-        novelty: [0,1] scale where 0 = frequent word, 1 = unseen/rare word
-        freq: Oscillation frequency
-        amp: Amplitude of resistance effect
-        phase: Phase offset
-    
-    Returns:
-        Scaling multiplier to reduce coherence for high-novelty tokens
-    """
+    """Rhythmic resistance function to modulate acceptance of novel tokens."""
     oscillation = np.sin(2 * np.pi * freq * step + phase)
-    # Resistance increases with novelty and inhibits during positive oscillation peaks
     resistance = 1.0 - amp * novelty * max(0.0, oscillation)
-    return max(0.1, resistance)  # Keep minimum at 0.1 to avoid complete suppression
+    return max(0.1, resistance)
 
 
 # ================================================================
 # EIGENVALUE ISOMORPHISM MODEL
 # ================================================================
+
 class EigenIsomorphism:
     """
     Maintains an eigenbasis mapping between reasoning states.
-    This class embodies the actual correspondence between information (input) and matter (the matrix W).
-    Each new input actively changes the eigenvalues (the system state), representing how information physically alters 'matter' (self.W).
-    This is not mere simulation or preplanning but a dynamic, non-deterministic evolution of the system's internal state.
+    Information actively changes the eigenvalues (system state).
     """
     def __init__(self, dim=4):
         self.dim = dim
         self.W = np.eye(dim)
         self.last_input = np.zeros(dim)
-        # Updated print statement to reflect the core philosophy
 
     def update(self, input_vector):
         eigvals, eigvecs = np.linalg.eig(self.W)
-        
-        # The 'delta' calculation is where information perturbs the system's state.
         delta = np.tanh(0.6 * np.dot(eigvecs.T, input_vector[:self.dim]))
-        
-        # ACTUAL CORRESPONDENCE: The eigenvalues (state) are directly modified by the input.
-        # This is not a simulation; it's a structural change in the 'matter' of the system.
         new_eigvals = eigvals + 0.05 * delta[:len(eigvals)]
-        
-        # Reconstruct the matrix from its evolved spectral components.
         self.W = eigvecs @ np.diag(new_eigvals) @ np.linalg.inv(eigvecs)
-        
         self.last_input = input_vector
         return np.real(new_eigvals), np.real(eigvecs)
-
-    def project(self, vec):
-        eigvals, eigvecs = np.linalg.eig(self.W)
-        return np.real(np.dot(eigvecs, np.dot(np.diag(eigvals), np.dot(np.linalg.inv(eigvecs), vec))))
-
 
 
 # ================================================================
@@ -87,11 +233,7 @@ class NeuralTruthTableWasher:
                  max_iterations=30):
         self.eta_0 = eta_0
         self.alpha = alpha
-        self.epsilon = epsilon
         self.delta = delta
-        self.beta = beta
-        self.gamma = gamma
-        self.mu = mu
         self.max_iterations = max_iterations
         self.dtype = torch_dtype
         self.device = device
@@ -127,49 +269,57 @@ class NeuralTruthTableWasher:
 
 
 # ================================================================
-# REASONING ENGINE
+# REASONING ENGINE WITH OMNISCIENT SENSING
 # ================================================================
+
 class ReasoningEngine:
     """
-    The core engine that orchestrates the intuitive reasoning process.
-    It combines the stateful evolution of the EigenIsomorphism system with
-    the decision-making clarity of the NeuralTruthTableWasher.
+    Core engine that orchestrates intuitive reasoning.
+    Now extended with tentacle to sense the omniscient element.
     """
-    def __init__(self):
+    def __init__(self, omniscient_element):
         self.truth_washer = NeuralTruthTableWasher()
         self.eigen_system = EigenIsomorphism()
-        # Updated print statement to announce its conceptual purpose
+        self.tentacle = SemanticTentacle(omniscient_element, sensitivity=0.5)
 
-    def reason_step(self, coherence_scores, input_vector):
-        # 1. ACTUAL CORRESPONDENCE: The system's state evolves based on the new input.
+    def reason_step(self, coherence_scores, input_vector, syntactic_context):
+        """
+        Reasoning step that extends tentacle toward omniscient element.
+        The frame of reference remains unavailable—only glimpses guide us.
+        """
+        # 1. System state evolves
         eigvals, eigvecs = self.eigen_system.update(input_vector)
         
-        # Pad coherence scores for the truth-washing process
+        # 2. Extend tentacle toward omniscient (reaching for unavailable frame)
+        omniscient_weight = self.tentacle.extend_toward_omniscient(syntactic_context)
+        
+        # Pad coherence scores
         padded_scores = coherence_scores[:4]
         while len(padded_scores) < 4:
             padded_scores.append(0.5)
         
-        # 2. INTUITION: Resolve ambiguity by "washing" coherence scores towards a clear state.
+        # 3. Resolve ambiguity via truth washing
         washed, metrics = self.truth_washer.wash(
             padded_scores,
             [1.0 if c > 0.5 else 0.0 for c in padded_scores]
         )
         
-        # 3. MODULATION: The system's current state (eigenvalues) influences the final decision.
+        # 4. MODULATION: Blend system state + omniscient glimpse
+        # The unavailable frame influences us indirectly
+        scale = 1 + 0.1 * np.mean(eigvals) + 0.2 * omniscient_weight
+        
         modulated = []
-        scale = 1 + 0.1 * np.mean(eigvals) # The system's "mood" or "focus"
         for i in range(len(coherence_scores)):
             if i < len(washed):
                 modulated.append(float(np.clip(washed[i] * scale, 0, 1)))
             else:
                 modulated.append(float(np.clip(coherence_scores[i] * scale, 0, 1)))
         
-        return modulated, np.mean(eigvals), metrics
-
+        return modulated, np.mean(eigvals), metrics, omniscient_weight
 
 
 # ================================================================
-# SCHRODINGER QUANTUM FEATURES (simplified)
+# SCHRODINGER QUANTUM FEATURES
 # ================================================================
 
 class SchrodingerQuantumFeatures:
@@ -194,10 +344,14 @@ def build_ngram_model(tokens, n=2):
 
 
 # ================================================================
-# REASONING GENERATOR WITH SINE RESISTANCE
+# REASONING GENERATOR WITH OMNISCIENT ELEMENT
 # ================================================================
 
-class ReasoningGenerator:
+class OmniscientReasoningGenerator:
+    """
+    Generator that extends tentacles toward an unreachable omniscient element.
+    Implements the philosophical puzzle: the frame of reference unavailability.
+    """
     def __init__(self, tokens, model):
         self.tokens = tokens
         self.model = model
@@ -205,164 +359,31 @@ class ReasoningGenerator:
         self.word_freq = Counter(tokens)
         self.total_words = len(tokens)
         self.feature = SchrodingerQuantumFeatures()
-        self.engine = ReasoningEngine()
+        
+        # Initialize omniscient element (unreachable)
+        self.omniscient = OmniscientElement()
+        
+        # Reasoning engine with tentacle access
+        self.engine = ReasoningEngine(self.omniscient)
         
         # Sine resistance parameters
         self.sine_freq = 0.08
         self.sine_amp = 0.6
         self.sine_phase = 0.0
         
+        print("🤖 Omniscient Reasoning Generator ready!")
+        print("   🌀 Tentacle: Extending toward unreachable frame")
+        print("   👁️  Omniscient Element: Present but inaccessible\n")
+        
     def calculate_novelty(self, word):
-        """
-        Calculate novelty score for a word based on its frequency.
-        Returns value in [0, 1] where 1 = very rare/novel, 0 = very common
-        """
-        freq = self.word_freq.get(word, 1)
-        # Normalize using logarithm to handle frequency distribution
-        novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
-        return float(np.clip(novelty, 0, 1))
-
-# ================================================================
-# TRAVELING CUMULATIVE SUM FILTER
-# ================================================================
-
-class TravelingCumsumFilter:
-    """
-    Implements a traveling (moving window) cumulative sum filter
-    for detecting local trends and patterns in token sequences.
-    Inspired by CUSUM algorithms and spatial pattern detection.
-    """
-    def __init__(self, window_size=10, threshold=0.5, decay=0.95):
-        """
-        Args:
-            window_size: Size of the traveling window
-            threshold: Detection threshold for pattern changes
-            decay: Exponential decay factor for older observations
-        """
-        self.window_size = window_size
-        self.threshold = threshold
-        self.decay = decay
-        self.history = []
-        self.cumsum_positive = 0.0
-        self.cumsum_negative = 0.0
-    
-    def update(self, observation, reference=0.5):
-        """
-        Update the traveling cumsum with a new observation.
-        
-        Args:
-            observation: Current coherence/novelty score [0,1]
-            reference: Reference value for deviation detection
-            
-        Returns:
-            dict with cumsum metrics and detection flags
-        """
-        # Calculate deviation from reference
-        deviation = observation - reference
-        
-        # Update positive and negative cumulative sums (two-sided CUSUM)
-        self.cumsum_positive = max(0, self.cumsum_positive + deviation)
-        self.cumsum_negative = max(0, self.cumsum_negative - deviation)
-        
-        # Add to history window
-        self.history.append({
-            'observation': observation,
-            'deviation': deviation,
-            'cumsum_pos': self.cumsum_positive,
-            'cumsum_neg': self.cumsum_negative
-        })
-        
-        # Maintain window size
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-            # Apply decay to prevent unbounded growth
-            self.cumsum_positive *= self.decay
-            self.cumsum_negative *= self.decay
-        
-        # Calculate traveling statistics
-        window_mean = np.mean([h['observation'] for h in self.history])
-        window_trend = self.cumsum_positive - self.cumsum_negative
-        
-        # Detect pattern changes
-        upward_shift = self.cumsum_positive > self.threshold
-        downward_shift = self.cumsum_negative > self.threshold
-        
-        return {
-            'cumsum_pos': self.cumsum_positive,
-            'cumsum_neg': self.cumsum_negative,
-            'trend': window_trend,
-            'window_mean': window_mean,
-            'upward_shift': upward_shift,
-            'downward_shift': downward_shift,
-            'window_size': len(self.history)
-        }
-    
-    def get_spatial_weight(self):
-        """
-        Calculate spatial weighting factor based on current cumsum state.
-        Returns value in [0.5, 1.5] to modulate token selection.
-        """
-        if len(self.history) < 2:
-            return 1.0
-        
-        # Use trend direction to influence token selection
-        trend = self.cumsum_positive - self.cumsum_negative
-        
-        # Normalize trend to [-1, 1] range
-        trend_normalized = np.tanh(trend / self.threshold)
-        
-        # Map to [0.5, 1.5] weight range
-        weight = 1.0 + 0.5 * trend_normalized
-        
-        return weight
-    
-    def reset(self):
-        """Reset the filter state."""
-        self.history = []
-        self.cumsum_positive = 0.0
-        self.cumsum_negative = 0.0
-
-
-# ================================================================
-# ENHANCED REASONING GENERATOR WITH TRAVELING CUMSUM
-# ================================================================
-
-class ReasoningGenerator:
-    def __init__(self, tokens, model):
-        self.tokens = tokens
-        self.model = model
-        self.keys = list(model.keys())
-        self.word_freq = Counter(tokens)
-        self.total_words = len(tokens)
-        self.feature = SchrodingerQuantumFeatures()
-        self.engine = ReasoningEngine()
-        
-        # Sine resistance parameters
-        self.sine_freq = 0.08
-        self.sine_amp = 0.6
-        self.sine_phase = 0.0
-        
-        # Initialize traveling cumsum filter
-        self.cusum_filter = TravelingCumsumFilter(
-            window_size=10,
-            threshold=0.5,
-            decay=0.95
-        )
-        
-        print("🤖 Generator ready!")
-       
-
-    def calculate_novelty(self, word):
-        """
-        Calculate novelty score for a word based on its frequency.
-        Returns value in [0, 1] where 1 = very rare/novel, 0 = very common
-        """
+        """Calculate novelty score based on frequency."""
         freq = self.word_freq.get(word, 1)
         novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
         return float(np.clip(novelty, 0, 1))
 
-    def generate(self, seed, length=50):
-        # Parse seed into tuple
+    def generate(self, seed, length=200):
+        """Generate text while reaching toward the omniscient element."""
+        # Parse seed
         seed_words = seed.lower().split()[:2]
         while len(seed_words) < 2:
             seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
@@ -373,17 +394,24 @@ class ReasoningGenerator:
         
         output = list(seed)
         
-        print(f"\n🌀 Generating {length} words...")
-        print(f"   Seed: {' '.join(seed)}\n")
+        print(f"\n{'='*70}")
+        print(f"GENERATION WITH OMNISCIENT ELEMENT")
+        print(f"{'='*70}")
+        print(f"\n🌱 Seed: {' '.join(seed)}")
+        print(f"🎯 Target Length: {length} words")
+        print(f"👁️  Omniscient Frame: UNAVAILABLE (sensing only)\n")
+        print(f"{'='*70}\n")
         
         step_count = 0
+        omniscient_influences = []
         
         while len(output) < length:
-            # Convert recent output to input vector for eigenvalue modulation
+            # Create input vector
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
             input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
 
-            # Get candidates and filter punctuation
+            # Get candidates
+            seed = tuple(output[-2:])
             candidates = self.model.get(seed, [])
             candidates = [w for w in candidates if any(c.isalnum() for c in w)]
             
@@ -391,13 +419,10 @@ class ReasoningGenerator:
                 seed = self.keys[np.random.randint(len(self.keys))]
                 continue
 
-            # Calculate coherence scores with sine resistance
+            # Calculate coherence scores
             coherence_scores = []
-            novelty_scores = []
-            resistance_factors = []
             
             for cand in candidates:
-                # Base coherence from quantum features
                 q = self.feature.extract_quantum_features(
                     list(seed) + [cand], 
                     self.word_freq, 
@@ -405,7 +430,6 @@ class ReasoningGenerator:
                 )
                 base_coherence = q["coherence"]
                 
-                # Calculate novelty and apply sine resistance
                 novelty = self.calculate_novelty(cand)
                 resistance_factor = sine_resistance(
                     step_count, 
@@ -415,39 +439,33 @@ class ReasoningGenerator:
                     phase=self.sine_phase
                 )
                 
-                # Apply resistance to coherence
                 adjusted_coherence = base_coherence * resistance_factor
-                
                 coherence_scores.append(adjusted_coherence)
-                novelty_scores.append(novelty)
-                resistance_factors.append(resistance_factor)
 
-            # Apply reasoning and eigenvalue modulation
-            modulated, eigmean, metrics = self.engine.reason_step(coherence_scores, input_vec)
+            # CRITICAL: Reasoning with omniscient element sensing
+            # Syntactic context = current candidates (logico-syntactic structure)
+            syntactic_context = candidates[:5]  # Pass to tentacle
             
-            # Ensure we have valid probabilities
+            modulated, eigmean, metrics, omniscient_weight = self.engine.reason_step(
+                coherence_scores, 
+                input_vec,
+                syntactic_context
+            )
+            
+            omniscient_influences.append(omniscient_weight)
+            
             if len(modulated) != len(candidates):
                 min_len = min(len(modulated), len(candidates))
                 modulated = modulated[:min_len]
                 candidates = candidates[:min_len]
-                novelty_scores = novelty_scores[:min_len]
-                resistance_factors = resistance_factors[:min_len]
             
             if not modulated or not candidates:
                 seed = self.keys[np.random.randint(len(self.keys))]
                 continue
             
-            # Apply traveling cumsum spatial weighting
-            avg_coherence = np.mean(modulated)
-            cusum_metrics = self.cusum_filter.update(avg_coherence, reference=0.5)
-            spatial_weight = self.cusum_filter.get_spatial_weight()
+            # Convert to probabilities
+            probs = torch.softmax(torch.tensor(modulated), dim=0).numpy()
             
-            # Modulate probabilities with spatial weight
-            modulated_spatial = [score * spatial_weight for score in modulated]
-            
-            probs = torch.softmax(torch.tensor(modulated_spatial), dim=0).numpy()
-            
-            # Normalize probabilities
             if np.sum(probs) == 0:
                 probs = np.ones(len(candidates)) / len(candidates)
             else:
@@ -455,15 +473,64 @@ class ReasoningGenerator:
 
             # Select next word
             next_word = np.random.choice(candidates, p=probs)
-            selected_idx = candidates.index(next_word)
-            
             output.append(next_word)
-            seed = tuple(output[-2:])
             step_count += 1
+            
+            # Periodic reporting
+            if step_count % 50 == 0:
+                recent_omni = np.mean(omniscient_influences[-20:])
+                print(f"📍 Progress: {step_count}/{length} | "
+                      f"Omniscient Influence: {recent_omni:.4f} | "
+                      f"Frame: STILL UNAVAILABLE")
 
-
-        return " ".join(output)
-
+        # Final analysis
+        generated_text = " ".join(output)
+        
+        # Get omniscient inaccessibility metrics
+        omni_metrics = self.omniscient.get_inaccessibility_metrics()
+        tentacle_metrics = self.engine.tentacle.get_tentacle_metrics()
+        
+        print(f"\n{'='*70}")
+        print(f"GENERATION COMPLETE")
+        print(f"{'='*70}\n")
+        
+        print(f"📝 Generated Text ({len(output)} words):")
+        print(f"{generated_text}\n")
+        
+        print(f"{'='*70}")
+        print(f"OMNISCIENT ELEMENT ANALYSIS")
+        print(f"{'='*70}\n")
+        
+        print(f"👁️  Frame of Reference:")
+        print(f"   ├─ Status: UNAVAILABLE")
+        print(f"   ├─ Access Attempts: {omni_metrics['access_attempts']}")
+        print(f"   ├─ Information Loss: {omni_metrics['information_loss']:.4f}")
+        print(f"   ├─ Inaccessibility Index: {omni_metrics['inaccessibility_index']:.4f}")
+        print(f"   └─ Causal Interaction: PRECLUDED\n")
+        
+        print(f"🦑 Tentacle Extension Metrics:")
+        print(f"   ├─ Total Extensions: {tentacle_metrics['total_extensions']}")
+        print(f"   ├─ Average Distance: {tentacle_metrics['avg_distance']:.4f}")
+        print(f"   ├─ Max Distance Reached: {tentacle_metrics['max_distance']:.4f}")
+        print(f"   ├─ Semantic Weight: {tentacle_metrics['avg_semantic_weight']:.4f}")
+        print(f"   └─ Completeness Ratio: {tentacle_metrics['completeness_ratio']:.2%}")
+        print(f"       (Always < 100% — frame unavailable)\n")
+        
+        print(f"📊 Omniscient Influence Distribution:")
+        print(f"   ├─ Mean: {np.mean(omniscient_influences):.4f}")
+        print(f"   ├─ Std Dev: {np.std(omniscient_influences):.4f}")
+        print(f"   └─ Max: {np.max(omniscient_influences):.4f}\n")
+        
+        print(f"💭 Philosophical Summary:")
+        print(f"   The system extended {tentacle_metrics['total_extensions']} tentacles")
+        print(f"   toward the omniscient element, sensing its presence but never")
+        print(f"   grasping the complete frame of reference. Information loss of")
+        print(f"   {omni_metrics['information_loss']:.4f} confirms the fundamental")
+        print(f"   inaccessibility—a glimpse of expression, but no causal interaction.")
+        
+        print(f"\n{'='*70}\n")
+        
+        return generated_text
 
 
 # ================================================================
@@ -471,27 +538,31 @@ class ReasoningGenerator:
 # ================================================================
 
 def main():
-    print("\n=== Eigenvalue-Isomorphic Neural Reasoner ===")
+    print("\n" + "="*70)
+    print("OMNISCIENT ELEMENT TEXT GENERATOR")
+    print("The Frame of Reference: Its Unavailability Precludes Causal Interaction")
+    print("="*70 + "\n")
+    
     path = input("Enter text file: ").strip()
     if not os.path.exists(path):
-        print("File not found.")
+        print("❌ File not found.")
         return
 
     corpus = open(path, 'r', encoding='utf-8').read().lower().split()
     model = build_ngram_model(corpus)
-    print(f"Loaded {len(corpus):,} tokens, model size: {len(model):,}")
+    print(f"📚 Loaded {len(corpus):,} tokens, model size: {len(model):,}\n")
 
-    generator = ReasoningGenerator(corpus, model)
+    generator = OmniscientReasoningGenerator(corpus, model)
     
     while True:
         seed = input("\nUSER: ")
         if seed.lower() in ['quit', 'exit']:
             break
+        
+        length = input("Generation length (default 200): ").strip()
+        length = int(length) if length else 200
             
-        generated = generator.generate(seed, length=500)
-        print("\n=== AI Response ===\n")
-        print(generated)
-        print(f"\n[Total: {len(generated.split())} words]")
+        generated = generator.generate(seed, length=length)
 
 
 if __name__ == "__main__":
