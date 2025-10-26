@@ -16,225 +16,13 @@ print(f"Using {device}, precision {torch_dtype}")
 
 
 # ================================================================
-# WORD FEATURE APPROXIMATOR
-# ================================================================
-
-class WordFeatureApproximator:
-    """
-    Computes multi-dimensional feature similarity between words.
-    Words approximate features of other words through:
-    - Lexical similarity (character overlap, edit distance)
-    - Frequency correlation (similar corpus distributions)
-    - Phonetic patterns (sound structure)
-    - Contextual co-occurrence (distributional semantics)
-    - Morphological features (prefix/suffix patterns)
-    """
-    def __init__(self, corpus_tokens, word_freq):
-        self.word_freq = word_freq
-        self.total_words = len(corpus_tokens)
-        
-        # Build co-occurrence matrix for distributional similarity
-        self.cooccurrence = self._build_cooccurrence(corpus_tokens, window=2)
-        
-        # Cache feature vectors for performance
-        self.feature_cache = {}
-        
-    def _build_cooccurrence(self, tokens, window=2):
-        """Build word co-occurrence matrix for distributional features."""
-        cooccur = defaultdict(Counter)
-        for i, word in enumerate(tokens):
-            context_start = max(0, i - window)
-            context_end = min(len(tokens), i + window + 1)
-            for j in range(context_start, context_end):
-                if i != j:
-                    cooccur[word][tokens[j]] += 1
-        return dict(cooccur)
-    
-    def extract_features(self, word):
-        """
-        Extract comprehensive feature vector for a word.
-        Returns normalized feature array capturing multiple word properties.
-        """
-        if word in self.feature_cache:
-            return self.feature_cache[word]
-        
-        features = []
-        
-        # 1. Lexical features (character-level patterns)
-        features.append(len(word) / 20.0)  # Normalized length
-        features.append(sum(1 for c in word if c.isalpha()) / (len(word) + 1))  # Alpha ratio
-        features.append(sum(1 for c in word if c in 'aeiou') / (len(word) + 1))  # Vowel ratio
-        
-        # 2. Character distribution features
-        char_counts = Counter(word)
-        features.append(len(char_counts) / (len(word) + 1))  # Character diversity
-        features.append(max(char_counts.values()) / (len(word) + 1) if char_counts else 0)  # Max char frequency
-        
-        # 3. Frequency-based features
-        freq = self.word_freq.get(word, 1)
-        features.append(np.log(freq + 1) / np.log(self.total_words + 1))  # Log-normalized frequency
-        features.append(1.0 / (freq + 1))  # Rarity score
-        
-        # 4. Phonetic features (approximate sound patterns)
-        features.append(1 if word[0] in 'aeiou' else 0 if word else 0)  # Starts with vowel
-        features.append(1 if word[-1] in 'aeiou' else 0 if word else 0)  # Ends with vowel
-        features.append(word.count('th') + word.count('ch') + word.count('sh'))  # Digraph count
-        
-        # 5. Morphological features
-        features.append(1 if word.endswith('ing') else 0)  # Progressive form
-        features.append(1 if word.endswith('ed') else 0)  # Past tense
-        features.append(1 if word.endswith('s') else 0)  # Plural/3rd person
-        features.append(1 if word.startswith('un') or word.startswith('re') else 0)  # Common prefixes
-        
-        # 6. Positional character features (encoding word structure)
-        if len(word) >= 1:
-            features.append(ord(word[0]) / 122.0)  # First character (normalized)
-        else:
-            features.append(0)
-        if len(word) >= 2:
-            features.append(ord(word[1]) / 122.0)  # Second character
-        else:
-            features.append(0)
-        if len(word) >= 1:
-            features.append(ord(word[-1]) / 122.0)  # Last character
-        else:
-            features.append(0)
-        
-        feature_vector = np.array(features)
-        self.feature_cache[word] = feature_vector
-        return feature_vector
-    
-    def compute_similarity(self, word1, word2):
-        """
-        Compute multi-feature similarity between two words.
-        Returns value in [0, 1] where 1 = identical features, 0 = completely different.
-        """
-        # Extract feature vectors
-        vec1 = self.extract_features(word1)
-        vec2 = self.extract_features(word2)
-        
-        # Compute cosine similarity between feature vectors
-        dot_product = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        
-        if norm1 == 0 or norm2 == 0:
-            cosine_sim = 0
-        else:
-            cosine_sim = dot_product / (norm1 * norm2)
-        
-        # Add distributional similarity based on co-occurrence
-        distributional_sim = self._distributional_similarity(word1, word2)
-        
-        # Compute character overlap (Jaccard similarity)
-        set1 = set(word1)
-        set2 = set(word2)
-        if len(set1) == 0 and len(set2) == 0:
-            jaccard_sim = 1.0
-        elif len(set1 | set2) == 0:
-            jaccard_sim = 0.0
-        else:
-            jaccard_sim = len(set1 & set2) / len(set1 | set2)
-        
-        # Weighted combination of similarity metrics
-        combined_similarity = (
-            0.5 * max(0, cosine_sim) +  # Feature vector similarity
-            0.3 * distributional_sim +   # Context similarity
-            0.2 * jaccard_sim            # Character overlap
-        )
-        
-        return float(np.clip(combined_similarity, 0, 1))
-    
-    def _distributional_similarity(self, word1, word2):
-        """
-        Compute distributional similarity based on shared context words.
-        Implements simplified word2vec-style distributional semantics.
-        """
-        if word1 not in self.cooccurrence or word2 not in self.cooccurrence:
-            return 0.0
-        
-        context1 = self.cooccurrence[word1]
-        context2 = self.cooccurrence[word2]
-        
-        # Find shared context words
-        shared_contexts = set(context1.keys()) & set(context2.keys())
-        
-        if not shared_contexts:
-            return 0.0
-        
-        # Compute similarity based on shared context weights
-        similarity_sum = sum(
-            min(context1[ctx], context2[ctx]) / max(context1[ctx], context2[ctx])
-            for ctx in shared_contexts
-        )
-        
-        return similarity_sum / (len(shared_contexts) + 1)
-
-
-# ================================================================
-# CENTRAL KERNEL PROCESSOR
-# ================================================================
-
-class CentralKernel:
-    """
-    Central kernel that applies convolution-like operations to all arrays.
-    Acts as a unified processing core for coherence, eigenvalue, and spatial data.
-    """
-    def __init__(self, kernel_size=3):
-        self.kernel_size = kernel_size
-        self.kernel = self._create_kernel()
-        
-    def _create_kernel(self):
-        """Create the convolution kernel based on type."""
-        if self.kernel_size == 3:
-            kernel = np.array([1, 2, 1]) / 4.0
-        elif self.kernel_size == 5:
-            kernel = np.array([1, 4, 6, 4, 1]) / 16.0
-        else:
-            kernel = np.bartlett(self.kernel_size)
-            kernel = kernel / np.sum(kernel)
-        
-        return kernel
-    
-    def convolve_1d(self, array, mode='same'):
-        if len(array) == 0:
-            return array
-        arr = np.array(array)
-        if mode == 'same':
-            pad_width = self.kernel_size // 2
-            arr_padded = np.pad(arr, pad_width, mode='edge')
-            result = np.convolve(arr_padded, self.kernel, mode='valid')
-        else:
-            result = np.convolve(arr, self.kernel, mode=mode)
-        if mode == 'same' and len(result) != len(array):
-            result = result[:len(array)]
-        return result
-    
-    def process_scores(self, scores):
-        if len(scores) < self.kernel_size:
-            return scores
-        filtered = self.convolve_1d(scores, mode='same')
-        filtered = np.clip(filtered, 0, 1)
-        return filtered.tolist()
-    
-    def process_eigenvalues(self, eigenvalues):
-        if len(eigenvalues) < 2:
-            return eigenvalues
-        filtered = self.convolve_1d(eigenvalues, mode='same')
-        return filtered
-    
-    def process_vector(self, vector):
-        if len(vector) < self.kernel_size:
-            return vector
-        filtered = self.convolve_1d(vector, mode='same')
-        return filtered
-
-
-# ================================================================
 # SINE RESISTANCE MODULATION
 # ================================================================
 
 def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
+    """
+    Rhythmic resistance function to modulate acceptance of novel tokens.
+    """
     oscillation = np.sin(2 * np.pi * freq * step + phase)
     resistance = 1.0 - amp * novelty * max(0.0, oscillation)
     return max(0.1, resistance)
@@ -245,20 +33,19 @@ def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
 # ================================================================
 
 class EigenIsomorphism:
-    def __init__(self, dim=4, kernel=None):
+    """
+    Maintains an eigenbasis mapping between reasoning states.
+    Information actively changes the eigenvalues (system state).
+    """
+    def __init__(self, dim=4):
         self.dim = dim
         self.W = np.eye(dim)
         self.last_input = np.zeros(dim)
-        self.kernel = kernel
 
     def update(self, input_vector):
         eigvals, eigvecs = np.linalg.eig(self.W)
-        if self.kernel is not None and len(input_vector) >= self.kernel.kernel_size:
-            input_vector = self.kernel.process_vector(input_vector[:self.dim])
         delta = np.tanh(0.6 * np.dot(eigvecs.T, input_vector[:self.dim]))
         new_eigvals = eigvals + 0.05 * delta[:len(eigvals)]
-        if self.kernel is not None:
-            new_eigvals = self.kernel.process_eigenvalues(new_eigvals)
         self.W = eigvecs @ np.diag(new_eigvals) @ np.linalg.inv(eigvecs)
         self.last_input = input_vector
         return np.real(new_eigvals), np.real(eigvecs)
@@ -275,7 +62,7 @@ class EigenIsomorphism:
 class NeuralTruthTableWasher:
     def __init__(self, eta_0=0.3, alpha=0.1, epsilon=1e-4,
                  delta=1e-3, beta=1.0, gamma=2.0, mu=0.5,
-                 max_iterations=30, kernel=None):
+                 max_iterations=30):
         self.eta_0 = eta_0
         self.alpha = alpha
         self.epsilon = epsilon
@@ -287,7 +74,6 @@ class NeuralTruthTableWasher:
         self.dtype = torch_dtype
         self.device = device
         self.history = []
-        self.kernel = kernel
 
     def calculate_error(self, T, T_expected):
         T = torch.tensor(T, dtype=self.dtype, device=self.device)
@@ -307,8 +93,6 @@ class NeuralTruthTableWasher:
 
     def wash(self, T_contaminated, T_expected):
         Tcur = T_contaminated.copy()
-        if self.kernel is not None and len(Tcur) >= self.kernel.kernel_size:
-            Tcur = self.kernel.process_scores(Tcur)
         for k in range(self.max_iterations):
             eta = self.eta_0 * np.exp(-self.alpha * k)
             Tnext = self.wash_iteration(Tcur, T_expected, eta)
@@ -325,22 +109,29 @@ class NeuralTruthTableWasher:
 # ================================================================
 
 class ReasoningEngine:
-    def __init__(self, kernel=None):
-        self.kernel = kernel
-        self.truth_washer = NeuralTruthTableWasher(kernel=kernel)
-        self.eigen_system = EigenIsomorphism(kernel=kernel)
+    """
+    Core engine that orchestrates intuitive reasoning process.
+    """
+    def __init__(self):
+        self.truth_washer = NeuralTruthTableWasher()
+        self.eigen_system = EigenIsomorphism()
 
     def reason_step(self, coherence_scores, input_vector):
-        if self.kernel is not None and len(coherence_scores) >= self.kernel.kernel_size:
-            coherence_scores = self.kernel.process_scores(coherence_scores)
+        # 1. System state evolves based on input
         eigvals, eigvecs = self.eigen_system.update(input_vector)
+        
+        # Pad coherence scores
         padded_scores = coherence_scores[:4]
         while len(padded_scores) < 4:
             padded_scores.append(0.5)
+        
+        # 2. Resolve ambiguity via truth washing
         washed, metrics = self.truth_washer.wash(
             padded_scores,
             [1.0 if c > 0.5 else 0.0 for c in padded_scores]
         )
+        
+        # 3. Modulation by system state
         modulated = []
         scale = 1 + 0.1 * np.mean(eigvals)
         for i in range(len(coherence_scores)):
@@ -348,180 +139,233 @@ class ReasoningEngine:
                 modulated.append(float(np.clip(washed[i] * scale, 0, 1)))
             else:
                 modulated.append(float(np.clip(coherence_scores[i] * scale, 0, 1)))
-        if self.kernel is not None and len(modulated) >= self.kernel.kernel_size:
-            modulated = self.kernel.process_scores(modulated)
+        
         return modulated, np.mean(eigvals), metrics
 
 
 # ================================================================
-# ENHANCED QUANTUM FEATURES WITH WORD APPROXIMATION
+# SCHRODINGER QUANTUM FEATURES
 # ================================================================
 
 class SchrodingerQuantumFeatures:
-    def __init__(self, word_approximator=None):
-        self.word_approximator = word_approximator
-        
     def extract_quantum_features(self, segment, word_freq, total_words):
         xs = np.array([len(w) for w in segment])
         fs = np.array([word_freq.get(w, 1) for w in segment])
-        
-        # Base variance calculation
         var = np.var(xs / (fs + 1))
         coherence = 1.0 / (1.0 + var)
-        
-        # Enhanced: If word approximator available, boost coherence based on word similarities
-        if self.word_approximator is not None and len(segment) >= 2:
-            # Compute average pairwise similarity in segment
-            similarities = []
-            for i in range(len(segment) - 1):
-                sim = self.word_approximator.compute_similarity(segment[i], segment[i+1])
-                similarities.append(sim)
-            
-            if similarities:
-                avg_similarity = np.mean(similarities)
-                # Boost coherence for similar adjacent words
-                coherence = coherence * (1.0 + 0.3 * avg_similarity)
-                coherence = min(1.0, coherence)
-        
         return {"coherence": coherence}
 
 
 # ================================================================
-# PROPERTY CONSTRUCTOR
+# TRAVELING CUMSUM FILTER
 # ================================================================
 
-class PropertyConstructor:
+class TravelingCumsumFilter:
     """
-    Constructs semantic properties and conceptual understanding from text.
-    Uses word feature approximation to build property networks.
+    Implements traveling cumulative sum filter for detecting
+    local trends and patterns in token sequences.
     """
-    def __init__(self, word_approximator):
-        self.word_approximator = word_approximator
-        self.property_graph = defaultdict(dict)
-        self.concept_embeddings = {}
+    def __init__(self, window_size=10, threshold=0.5, decay=0.95):
+        self.window_size = window_size
+        self.threshold = threshold
+        self.decay = decay
+        self.history = []
+        self.cumsum_positive = 0.0
+        self.cumsum_negative = 0.0
+    
+    def update(self, observation, reference=0.5):
+        """Update traveling cumsum with new observation."""
+        deviation = observation - reference
         
-    def extract_properties(self, text):
-        """Extract semantic properties from generated text."""
-        words = text.lower().split()
+        # Update cumulative sums
+        self.cumsum_positive = max(0, self.cumsum_positive + deviation)
+        self.cumsum_negative = max(0, self.cumsum_negative - deviation)
         
-        properties = {
-            'semantic_clusters': self._build_semantic_clusters(words),
-            'syntactic_patterns': self._extract_syntactic_patterns(words),
-            'thematic_coherence': self._measure_thematic_coherence(words),
-            'entity_relations': self._extract_entity_relations(words)
+        # Add to history
+        self.history.append({
+            'observation': observation,
+            'deviation': deviation,
+            'cumsum_pos': self.cumsum_positive,
+            'cumsum_neg': self.cumsum_negative
+        })
+        
+        # Maintain window
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+            self.cumsum_positive *= self.decay
+            self.cumsum_negative *= self.decay
+        
+        # Calculate statistics
+        window_mean = np.mean([h['observation'] for h in self.history])
+        window_trend = self.cumsum_positive - self.cumsum_negative
+        
+        # Detect shifts
+        upward_shift = self.cumsum_positive > self.threshold
+        downward_shift = self.cumsum_negative > self.threshold
+        
+        return {
+            'cumsum_pos': self.cumsum_positive,
+            'cumsum_neg': self.cumsum_negative,
+            'trend': window_trend,
+            'window_mean': window_mean,
+            'upward_shift': upward_shift,
+            'downward_shift': downward_shift,
+            'window_size': len(self.history)
         }
+    
+    def get_spatial_weight(self):
+        """Calculate spatial weighting factor."""
+        if len(self.history) < 2:
+            return 1.0
+        
+        trend = self.cumsum_positive - self.cumsum_negative
+        trend_normalized = np.tanh(trend / self.threshold)
+        weight = 1.0 + 0.5 * trend_normalized
+        
+        return weight
+    
+    def reset(self):
+        """Reset filter state."""
+        self.history = []
+        self.cumsum_positive = 0.0
+        self.cumsum_negative = 0.0
+
+
+# ================================================================
+# INCREMENTAL PROPERTY CONSTRUCTOR
+# ================================================================
+
+class IncrementalPropertyConstructor:
+    """
+    Incrementally constructs properties from newly generated text.
+    Analyzes each extension segment to extract semantic patterns.
+    """
+    def __init__(self):
+        self.property_history = []
+        self.semantic_patterns = defaultdict(int)
+        self.entity_graph = {'nodes': set(), 'edges': []}
+        self.thematic_evolution = []
+        
+    def analyze_extension(self, new_text_segment, word_freq):
+        """
+        Analyze newly generated text segment incrementally.
+        """
+        words = new_text_segment.lower().split()
+        
+        # Extract immediate properties
+        properties = {
+            'word_count': len(words),
+            'unique_words': len(set(words)),
+            'diversity': len(set(words)) / len(words) if words else 0,
+            'avg_word_length': np.mean([len(w) for w in words]) if words else 0,
+            'rare_words': sum(1 for w in words if word_freq.get(w, 0) < 10),
+            'patterns': self._extract_patterns(words),
+            'entities': self._extract_entities(words),
+            'coherence_vector': self._compute_coherence_vector(words)
+        }
+        
+        # Update cumulative understanding
+        self.property_history.append(properties)
+        self._update_semantic_patterns(properties['patterns'])
+        self._update_entity_graph(properties['entities'])
         
         return properties
     
-    def _build_semantic_clusters(self, words, threshold=0.4):
-        """Group words into semantic clusters based on feature similarity."""
-        clusters = []
-        visited = set()
+    def _extract_patterns(self, words):
+        """Extract n-gram patterns from segment."""
+        patterns = []
         
-        for i, word in enumerate(words):
-            if word in visited:
-                continue
-                
-            cluster = [word]
-            visited.add(word)
-            
-            # Find similar words within context window
-            context_window = words[max(0, i-10):min(len(words), i+10)]
-            
-            for other_word in context_window:
-                if other_word not in visited:
-                    similarity = self.word_approximator.compute_similarity(word, other_word)
-                    if similarity > threshold:
-                        cluster.append(other_word)
-                        visited.add(other_word)
-            
-            if len(cluster) > 1:
-                clusters.append(cluster)
-        
-        return clusters
-    
-    def _extract_syntactic_patterns(self, words):
-        """Identify recurring syntactic patterns via n-gram analysis."""
-        patterns = defaultdict(int)
-        
-        # Bigram patterns
+        # Bigrams
         for i in range(len(words) - 1):
             pattern = (words[i], words[i+1])
-            patterns[pattern] += 1
+            patterns.append(pattern)
         
-        # Trigram patterns
+        # Trigrams
         for i in range(len(words) - 2):
             pattern = (words[i], words[i+1], words[i+2])
-            patterns[pattern] += 1
+            patterns.append(pattern)
         
-        # Return top patterns
-        return sorted(patterns.items(), key=lambda x: x[1], reverse=True)[:20]
+        return patterns
     
-    def _measure_thematic_coherence(self, words):
-        """Measure how consistently themes are maintained across the text."""
-        if len(words) < 20:
-            return 0.5
+    def _extract_entities(self, words):
+        """Extract potential entities (simple heuristic)."""
+        entities = []
         
-        # Split into segments
-        segment_size = 10
-        segments = [words[i:i+segment_size] for i in range(0, len(words)-segment_size, segment_size)]
+        for i, word in enumerate(words):
+            # Heuristic: longer words or capitalized words
+            if len(word) > 5:
+                context = words[max(0, i-2):min(len(words), i+3)]
+                entities.append({
+                    'word': word,
+                    'position': i,
+                    'context': context
+                })
         
-        # Measure inter-segment similarity
-        coherence_scores = []
-        for i in range(len(segments) - 1):
-            seg1_words = set(segments[i])
-            seg2_words = set(segments[i+1])
+        return entities
+    
+    def _compute_coherence_vector(self, words):
+        """Compute multi-dimensional coherence vector."""
+        if len(words) < 3:
+            return [0.5, 0.5, 0.5]
+        
+        # Length variance
+        lengths = [len(w) for w in words]
+        length_coherence = 1.0 / (1.0 + np.var(lengths))
+        
+        # Positional consistency
+        first_chars = [w[0] if w else 'a' for w in words]
+        char_diversity = len(set(first_chars)) / len(words)
+        positional_coherence = 1.0 - char_diversity
+        
+        # Semantic density (approximation via word length distribution)
+        semantic_coherence = np.mean(lengths) / 10.0
+        semantic_coherence = min(1.0, semantic_coherence)
+        
+        return [length_coherence, positional_coherence, semantic_coherence]
+    
+    def _update_semantic_patterns(self, patterns):
+        """Update cumulative semantic pattern counts."""
+        for pattern in patterns:
+            self.semantic_patterns[pattern] += 1
+    
+    def _update_entity_graph(self, entities):
+        """Update entity relationship graph."""
+        for entity in entities:
+            self.entity_graph['nodes'].add(entity['word'])
             
-            # Calculate average similarity between segments
-            similarities = []
-            for w1 in list(seg1_words)[:5]:  # Sample to avoid O(n²)
-                for w2 in list(seg2_words)[:5]:
-                    similarities.append(self.word_approximator.compute_similarity(w1, w2))
-            
-            if similarities:
-                coherence_scores.append(np.mean(similarities))
-        
-        return np.mean(coherence_scores) if coherence_scores else 0.5
+            # Create edges between entities in same context
+            for context_word in entity['context']:
+                if context_word != entity['word'] and len(context_word) > 5:
+                    edge = (entity['word'], context_word)
+                    self.entity_graph['edges'].append(edge)
     
-    def _extract_entity_relations(self, words):
-        """Extract entity relationships via co-occurrence patterns."""
-        relations = []
+    def get_understanding_summary(self):
+        """Generate summary of accumulated understanding."""
+        if not self.property_history:
+            return "No text analyzed yet."
         
-        # Simple pattern: [entity1] [relation_verb] [entity2]
-        for i in range(len(words) - 2):
-            # Heuristic: longer words are entities
-            if len(words[i]) > 3 and len(words[i+2]) > 3:
-                relation = (words[i], words[i+1], words[i+2])
-                relations.append(relation)
+        total_words = sum(p['word_count'] for p in self.property_history)
+        total_unique = sum(p['unique_words'] for p in self.property_history)
+        avg_diversity = np.mean([p['diversity'] for p in self.property_history])
         
-        return relations[:10]  # Return top relations
-    
-    def build_knowledge_graph(self, properties):
-        """Construct a knowledge graph from extracted properties."""
-        graph = {
-            'nodes': [],
-            'edges': []
+        # Top patterns
+        top_patterns = sorted(
+            self.semantic_patterns.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )[:5]
+        
+        summary = {
+            'total_words_analyzed': total_words,
+            'total_unique_words': total_unique,
+            'average_diversity': avg_diversity,
+            'top_patterns': top_patterns,
+            'entity_count': len(self.entity_graph['nodes']),
+            'relationship_count': len(self.entity_graph['edges']),
+            'analysis_segments': len(self.property_history)
         }
         
-        # Add semantic clusters as nodes
-        for cluster in properties['semantic_clusters']:
-            node = {
-                'id': f"cluster_{len(graph['nodes'])}",
-                'words': cluster,
-                'type': 'semantic_cluster'
-            }
-            graph['nodes'].append(node)
-        
-        # Add entity relations as edges
-        for entity1, relation, entity2 in properties['entity_relations']:
-            edge = {
-                'source': entity1,
-                'target': entity2,
-                'relation': relation
-            }
-            graph['edges'].append(edge)
-        
-        return graph
+        return summary
 
 
 # ================================================================
@@ -530,267 +374,97 @@ class PropertyConstructor:
 
 class EnvironmentCorrelator:
     """
-    Correlates environmental conditions with generation quality.
-    Adapts generation parameters based on environmental feedback.
+    Correlates environmental conditions with generation quality
+    in real-time during seed extension.
     """
-    def __init__(self, reasoning_generator):
-        self.generator = reasoning_generator
+    def __init__(self):
         self.environment_state = {
-            'coherence_history': [],
-            'novelty_history': [],
-            'diversity_history': [],
-            'quality_trend': 0.0
+            'coherence_trajectory': [],
+            'novelty_trajectory': [],
+            'diversity_trajectory': [],
+            'quality_velocity': 0.0,
+            'trend_direction': 'neutral'
         }
-        self.adaptation_threshold = 0.3
+        self.alert_threshold = 0.3
         
-    def monitor_environment(self, generated_text):
-        """Monitor environmental conditions during generation."""
-        words = generated_text.split()
+    def correlate_segment(self, properties, step):
+        """
+        Correlate environment with newly generated segment.
+        """
+        # Extract metrics
+        coherence = np.mean(properties['coherence_vector'])
+        diversity = properties['diversity']
         
-        # Measure current state
-        coherence = self._measure_coherence(words)
-        novelty = self._measure_novelty(words)
-        diversity = len(set(words)) / len(words) if words else 0
+        # Update trajectories
+        self.environment_state['coherence_trajectory'].append(coherence)
+        self.environment_state['diversity_trajectory'].append(diversity)
         
-        # Update history
-        self.environment_state['coherence_history'].append(coherence)
-        self.environment_state['novelty_history'].append(novelty)
-        self.environment_state['diversity_history'].append(diversity)
+        # Calculate velocity (rate of change)
+        if len(self.environment_state['coherence_trajectory']) >= 3:
+            recent = self.environment_state['coherence_trajectory'][-3:]
+            velocity = (recent[-1] - recent[0]) / 3
+            self.environment_state['quality_velocity'] = velocity
+            
+            # Determine trend
+            if velocity > 0.1:
+                self.environment_state['trend_direction'] = 'improving'
+            elif velocity < -0.1:
+                self.environment_state['trend_direction'] = 'declining'
+            else:
+                self.environment_state['trend_direction'] = 'stable'
         
-        # Compute quality trend
-        if len(self.environment_state['coherence_history']) >= 5:
-            recent_quality = np.mean(self.environment_state['coherence_history'][-5:])
-            previous_quality = np.mean(self.environment_state['coherence_history'][-10:-5]) if len(self.environment_state['coherence_history']) >= 10 else recent_quality
-            self.environment_state['quality_trend'] = recent_quality - previous_quality
+        # Generate correlation report
+        correlation = {
+            'step': step,
+            'coherence': coherence,
+            'diversity': diversity,
+            'velocity': self.environment_state['quality_velocity'],
+            'trend': self.environment_state['trend_direction'],
+            'alert': self._check_alerts()
+        }
         
-        return self.environment_state
+        return correlation
     
-    def _measure_coherence(self, words):
-        """Measure coherence of generated text."""
-        if len(words) < 5:
-            return 0.5
+    def _check_alerts(self):
+        """Check for environmental alerts."""
+        alerts = []
         
-        segments = [words[i:i+5] for i in range(0, min(len(words)-4, 20))]
-        coherences = [
-            self.generator.feature.extract_quantum_features(seg, self.generator.word_freq, self.generator.total_words)['coherence']
-            for seg in segments
-        ]
-        return np.mean(coherences)
-    
-    def _measure_novelty(self, words):
-        """Measure novelty of generated words."""
-        if not words:
-            return 0.5
+        # Check for declining quality
+        if self.environment_state['quality_velocity'] < -self.alert_threshold:
+            alerts.append('⚠️ Quality declining rapidly')
         
-        novelties = [self.generator.calculate_novelty(w) for w in words[:20]]
-        return np.mean(novelties)
-    
-    def adapt_parameters(self):
-        """Adapt generation parameters based on environment state."""
-        adaptations = {}
+        # Check for low coherence
+        if len(self.environment_state['coherence_trajectory']) > 0:
+            recent_coherence = np.mean(self.environment_state['coherence_trajectory'][-3:])
+            if recent_coherence < 0.3:
+                alerts.append('⚠️ Low coherence detected')
         
-        # If quality is declining, increase novelty exploration
-        if self.environment_state['quality_trend'] < -self.adaptation_threshold:
-            adaptations['sine_amp'] = min(0.8, self.generator.sine_amp + 0.1)
-            adaptations['sine_freq'] = min(0.12, self.generator.sine_freq + 0.02)
-            print("🔧 Environment declining - increasing exploration")
+        # Check for low diversity
+        if len(self.environment_state['diversity_trajectory']) > 0:
+            recent_diversity = np.mean(self.environment_state['diversity_trajectory'][-3:])
+            if recent_diversity < 0.3:
+                alerts.append('⚠️ Low diversity detected')
         
-        # If quality is improving, exploit current strategy
-        elif self.environment_state['quality_trend'] > self.adaptation_threshold:
-            adaptations['sine_amp'] = max(0.4, self.generator.sine_amp - 0.05)
-            adaptations['sine_freq'] = max(0.05, self.generator.sine_freq - 0.01)
-            print("🎯 Environment improving - exploiting current strategy")
-        
-        # Apply adaptations
-        for param, value in adaptations.items():
-            setattr(self.generator, param, value)
-        
-        return adaptations
+        return alerts if alerts else ['✓ Environment stable']
     
     def get_environment_summary(self):
-        """Generate summary of environmental conditions."""
-        if not self.environment_state['coherence_history']:
+        """Get current environment state summary."""
+        if not self.environment_state['coherence_trajectory']:
             return {
+                'status': 'initializing',
                 'avg_coherence': 0.5,
-                'avg_novelty': 0.5,
                 'avg_diversity': 0.5,
-                'quality_trend': 0.0,
-                'status': 'initializing'
+                'trend': 'neutral'
             }
         
-        summary = {
-            'avg_coherence': np.mean(self.environment_state['coherence_history']),
-            'avg_novelty': np.mean(self.environment_state['novelty_history']),
-            'avg_diversity': np.mean(self.environment_state['diversity_history']),
-            'quality_trend': self.environment_state['quality_trend'],
-            'status': 'improving' if self.environment_state['quality_trend'] > 0 else 'declining'
+        return {
+            'status': 'active',
+            'avg_coherence': np.mean(self.environment_state['coherence_trajectory']),
+            'avg_diversity': np.mean(self.environment_state['diversity_trajectory']),
+            'velocity': self.environment_state['quality_velocity'],
+            'trend': self.environment_state['trend_direction'],
+            'trajectory_length': len(self.environment_state['coherence_trajectory'])
         }
-        
-        return summary
-
-
-# ================================================================
-# ENVIRONMENT CONTEXT INJECTOR
-# ================================================================
-
-class EnvironmentContextInjector:
-    """
-    Injects environmental context directly into user input.
-    Fuses environment state with seed to create conditioned input.
-    """
-    def __init__(self, environment_correlator):
-        self.environment_correlator = environment_correlator
-        self.injection_strength = 0.5  # How much environment influences input
-        
-    def create_environment_tokens(self, env_state):
-        """Convert environment state into token-like representations."""
-        env_tokens = []
-        
-        # Coherence tokens
-        coherence = env_state.get('avg_coherence', 0.5)
-        if coherence > 0.7:
-            env_tokens.append('__HIGH_COHERENCE__')
-        elif coherence < 0.3:
-            env_tokens.append('__LOW_COHERENCE__')
-        else:
-            env_tokens.append('__MID_COHERENCE__')
-        
-        # Novelty tokens
-        novelty = env_state.get('avg_novelty', 0.5)
-        if novelty > 0.6:
-            env_tokens.append('__NOVEL__')
-        elif novelty < 0.4:
-            env_tokens.append('__FAMILIAR__')
-        
-        # Diversity tokens
-        diversity = env_state.get('avg_diversity', 0.5)
-        if diversity > 0.6:
-            env_tokens.append('__DIVERSE__')
-        elif diversity < 0.4:
-            env_tokens.append('__REPETITIVE__')
-        
-        # Trend tokens
-        trend = env_state.get('quality_trend', 0.0)
-        if trend > 0.1:
-            env_tokens.append('__IMPROVING__')
-        elif trend < -0.1:
-            env_tokens.append('__DECLINING__')
-        
-        return env_tokens
-    
-    def inject_environment_into_seed(self, seed, env_state):
-        """Inject environment context directly into seed input."""
-        # Get environment tokens
-        env_tokens = self.create_environment_tokens(env_state)
-        
-        # Create conditioned seed: [ENV_CONTEXT] + [USER_SEED]
-        env_prefix = ' '.join(env_tokens)
-        conditioned_seed = f"{env_prefix} {seed}"
-        
-        print(f"\n🔬 Environment Injection:")
-        print(f"   Original Seed: {seed}")
-        print(f"   Environment Context: {env_prefix}")
-        print(f"   Conditioned Input: {conditioned_seed}")
-        
-        return conditioned_seed
-    
-    def create_environment_vector(self, env_state):
-        """Create dense vector representation of environment state."""
-        vec = np.array([
-            env_state.get('avg_coherence', 0.5),
-            env_state.get('avg_novelty', 0.5),
-            env_state.get('avg_diversity', 0.5),
-            env_state.get('quality_trend', 0.0) + 0.5,  # Normalize to [0, 1]
-        ])
-        
-        return vec
-    
-    def modulate_input_vector(self, input_vector, env_state):
-        """Modulate the input vector with environment state."""
-        env_vec = self.create_environment_vector(env_state)
-        
-        # Ensure same dimensionality
-        if len(input_vector) != len(env_vec):
-            # Pad or truncate
-            min_len = min(len(input_vector), len(env_vec))
-            env_vec = env_vec[:min_len]
-            input_vector = input_vector[:min_len]
-        
-        # Context-gating: weighted fusion
-        modulated = (1 - self.injection_strength) * input_vector + self.injection_strength * env_vec
-        
-        return modulated
-
-
-# ================================================================
-# PERFECTION DETECTOR
-# ================================================================
-
-class PerfectionDetector:
-    """
-    Detects states of 'perfection' in generation output and triggers
-    self-modification of system properties.
-    """
-    def __init__(self, threshold_percentile=95):
-        self.threshold_percentile = threshold_percentile
-        self.quality_history = []
-        self.perfection_events = []
-        self.baseline_metrics = None
-        
-    def detect_perfection(self, output_metrics):
-        """Detect if current output represents 'perfection'."""
-        # Composite quality score
-        quality_score = (
-            0.4 * output_metrics.get('avg_coherence', 0) +
-            0.3 * output_metrics.get('thematic_coherence', 0) +
-            0.2 * output_metrics.get('avg_diversity', 0) +
-            0.1 * (1.0 - abs(output_metrics.get('avg_novelty', 0.5) - 0.5) * 2)
-        )
-        
-        self.quality_history.append(quality_score)
-        
-        # Need sufficient history to establish baseline
-        if len(self.quality_history) < 20:
-            return False, quality_score
-        
-        # Calculate dynamic threshold
-        threshold = np.percentile(self.quality_history, self.threshold_percentile)
-        
-        # Perfection: current quality exceeds 95th percentile
-        is_perfect = quality_score > threshold
-        
-        if is_perfect:
-            perfection_event = {
-                'timestamp': datetime.now(),
-                'quality_score': quality_score,
-                'threshold': threshold,
-                'metrics': output_metrics.copy()
-            }
-            self.perfection_events.append(perfection_event)
-            print(f"\n✨ PERFECTION DETECTED! Score: {quality_score:.4f} (threshold: {threshold:.4f})")
-        
-        return is_perfect, quality_score
-    
-    def get_perfection_patterns(self):
-        """Analyze perfection events to extract common patterns."""
-        if len(self.perfection_events) < 3:
-            return None
-        
-        # Extract metrics from perfection events
-        perfect_coherences = [e['metrics'].get('avg_coherence', 0) for e in self.perfection_events]
-        perfect_novelties = [e['metrics'].get('avg_novelty', 0) for e in self.perfection_events]
-        perfect_diversities = [e['metrics'].get('avg_diversity', 0) for e in self.perfection_events]
-        
-        patterns = {
-            'optimal_coherence': np.mean(perfect_coherences),
-            'optimal_novelty': np.mean(perfect_novelties),
-            'optimal_diversity': np.mean(perfect_diversities),
-            'coherence_std': np.std(perfect_coherences),
-            'novelty_std': np.std(perfect_novelties),
-            'diversity_std': np.std(perfect_diversities)
-        }
-        
-        return patterns
 
 
 # ================================================================
@@ -806,131 +480,106 @@ def build_ngram_model(tokens, n=2):
 
 
 # ================================================================
-# ENVIRONMENT-AWARE GENERATOR
+# SEED EXTENSION GENERATOR
 # ================================================================
 
-class EnvironmentAwareGenerator:
+class SeedExtensionGenerator:
     """
-    Enhanced generator with environment injection at every step.
-    No switches - both environment and seed always active.
+    Generates text by extending a seed, with real-time property construction
+    and environment correlation. The output IS the extension process itself.
     """
-    def __init__(self, tokens, model, kernel_size=3):
+    def __init__(self, tokens, model):
         self.tokens = tokens
         self.model = model
         self.keys = list(model.keys())
         self.word_freq = Counter(tokens)
         self.total_words = len(tokens)
-        
-        # Initialize word feature approximator
-        print("🔬 Building word feature approximator...")
-        self.word_approximator = WordFeatureApproximator(tokens, self.word_freq)
-        
-        # Initialize quantum features with approximator
-        self.feature = SchrodingerQuantumFeatures(word_approximator=self.word_approximator)
-        
-        # Initialize central kernel
-        self.central_kernel = CentralKernel(kernel_size=kernel_size)
-        
-        # Initialize reasoning engine with kernel
-        self.engine = ReasoningEngine(kernel=self.central_kernel)
+        self.feature = SchrodingerQuantumFeatures()
+        self.engine = ReasoningEngine()
         
         # Sine resistance parameters
         self.sine_freq = 0.08
         self.sine_amp = 0.6
         self.sine_phase = 0.0
         
-        # Environment injector (set externally)
-        self.env_injector = None
+        # Traveling cumsum filter
+        self.cusum_filter = TravelingCumsumFilter(
+            window_size=10,
+            threshold=0.5,
+            decay=0.95
+        )
         
-        print(f"🤖 Generator ready with kernel and word approximation!")
-
+        # Property constructor and environment correlator
+        self.property_constructor = IncrementalPropertyConstructor()
+        self.environment_correlator = EnvironmentCorrelator()
+        
+        print("🤖 Seed Extension Generator ready!")
+        print("   📊 Incremental property construction: Enabled")
+        print("   🌍 Environment correlation: Active")
+        
     def calculate_novelty(self, word):
+        """Calculate novelty score based on frequency."""
         freq = self.word_freq.get(word, 1)
         novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
         return float(np.clip(novelty, 0, 1))
 
-    def generate_with_environment_injection(self, seed, env_state, length=200):
-        """Generate with continuous environment injection."""
-        # Inject environment into seed
-        if self.env_injector and env_state:
-            conditioned_seed = self.env_injector.inject_environment_into_seed(seed, env_state)
-        else:
-            conditioned_seed = seed
+    def extend_seed(self, seed, extension_length=200, report_interval=20):
+        """
+        Extend the seed incrementally with real-time analysis.
+        The output IS the extension itself with understanding built progressively.
+        """
+        # Parse seed
+        seed_words = seed.lower().split()[:2]
+        while len(seed_words) < 2:
+            seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
+        seed_tuple = tuple(seed_words)
         
-        seed_words = conditioned_seed.lower().split()
+        if seed_tuple not in self.model:
+            seed_tuple = self.keys[np.random.randint(len(self.keys))]
         
-        # Find valid seed from conditioned input
-        valid_seed = None
-        for i in range(len(seed_words) - 1):
-            potential_seed = tuple(seed_words[i:i+2])
-            if potential_seed in self.model:
-                valid_seed = potential_seed
-                break
+        # Initialize output with seed
+        output = list(seed_tuple)
+        extension_start_index = len(output)
         
-        if not valid_seed:
-            # Fallback to original seed words (skip env tokens)
-            original_words = seed.lower().split()[:2]
-            while len(original_words) < 2:
-                original_words.append(self.tokens[len(original_words) % len(self.tokens)])
-            valid_seed = tuple(original_words)
-            
-            if valid_seed not in self.model:
-                valid_seed = self.keys[np.random.randint(len(self.keys))]
-        
-        output = list(valid_seed)
-        
-        print(f"\n🌀 Generating {length} words with environment injection...")
-        print(f"   Effective Seed: {' '.join(valid_seed)}\n")
+        print(f"\n{'='*70}")
+        print(f"SEED EXTENSION GENERATION")
+        print(f"{'='*70}")
+        print(f"\n🌱 Seed: {' '.join(seed_tuple)}")
+        print(f"🎯 Extension Target: {extension_length} words")
+        print(f"📊 Analysis Interval: Every {report_interval} words\n")
+        print(f"{'='*70}\n")
         
         step_count = 0
+        last_report = 0
         
-        while len(output) < length:
-            # Create base input vector
+        while len(output) - extension_start_index < extension_length:
+            # Create input vector
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
             input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
-            
-            # INJECT ENVIRONMENT: Modulate input vector with environment state
-            if self.env_injector and env_state:
-                input_vec = self.env_injector.modulate_input_vector(input_vec, env_state)
-            
-            # Process through kernel
-            input_vec = self.central_kernel.process_vector(input_vec)
 
-            seed = tuple(output[-2:])
-            candidates = self.model.get(seed, [])
+            # Get candidates
+            seed_tuple = tuple(output[-2:])
+            candidates = self.model.get(seed_tuple, [])
             candidates = [w for w in candidates if any(c.isalnum() for c in w)]
             
             if not candidates:
-                seed = self.keys[np.random.randint(len(self.keys))]
+                seed_tuple = self.keys[np.random.randint(len(self.keys))]
                 continue
 
+            # Calculate coherence scores with sine resistance
             coherence_scores = []
             
             for cand in candidates:
+                # Base coherence
                 q = self.feature.extract_quantum_features(
-                    list(seed) + [cand], 
+                    list(seed_tuple) + [cand], 
                     self.word_freq, 
                     self.total_words
                 )
                 base_coherence = q["coherence"]
                 
-                # Boost coherence for candidates similar to recent words
-                if len(output) >= 1:
-                    recent_word = output[-1]
-                    similarity = self.word_approximator.compute_similarity(recent_word, cand)
-                    base_coherence = base_coherence * (1.0 + 0.2 * similarity)
-                
+                # Apply sine resistance
                 novelty = self.calculate_novelty(cand)
-                
-                # ENVIRONMENT MODULATION: Adjust scores based on environment
-                if self.env_injector and env_state:
-                    # If environment is declining, boost novelty
-                    if env_state.get('quality_trend', 0) < -0.1:
-                        novelty = novelty * 1.3
-                    # If environment is improving, boost coherence
-                    elif env_state.get('quality_trend', 0) > 0.1:
-                        base_coherence = base_coherence * 1.2
-                
                 resistance_factor = sine_resistance(
                     step_count, 
                     novelty, 
@@ -942,263 +591,116 @@ class EnvironmentAwareGenerator:
                 adjusted_coherence = base_coherence * resistance_factor
                 coherence_scores.append(adjusted_coherence)
 
-            if len(coherence_scores) >= self.central_kernel.kernel_size:
-                coherence_scores = self.central_kernel.process_scores(coherence_scores)
-
-            # ENVIRONMENT INJECTION: Pass environment-modulated input to reasoning
+            # Apply reasoning
             modulated, eigmean, metrics = self.engine.reason_step(coherence_scores, input_vec)
             
+            # Ensure validity
             if len(modulated) != len(candidates):
                 min_len = min(len(modulated), len(candidates))
                 modulated = modulated[:min_len]
                 candidates = candidates[:min_len]
             
             if not modulated or not candidates:
-                seed = self.keys[np.random.randint(len(self.keys))]
+                seed_tuple = self.keys[np.random.randint(len(self.keys))]
                 continue
             
-            if len(modulated) >= self.central_kernel.kernel_size:
-                modulated = self.central_kernel.process_scores(modulated)
+            # Apply traveling cumsum spatial weighting
+            avg_coherence = np.mean(modulated)
+            cusum_metrics = self.cusum_filter.update(avg_coherence, reference=0.5)
+            spatial_weight = self.cusum_filter.get_spatial_weight()
             
-            probs = torch.softmax(torch.tensor(modulated), dim=0).numpy()
+            # Modulate with spatial weight
+            modulated_spatial = [score * spatial_weight for score in modulated]
+            
+            probs = torch.softmax(torch.tensor(modulated_spatial), dim=0).numpy()
             
             if np.sum(probs) == 0:
                 probs = np.ones(len(candidates)) / len(candidates)
             else:
                 probs = probs / np.sum(probs)
 
+            # Select next word
             next_word = np.random.choice(candidates, p=probs)
             output.append(next_word)
             step_count += 1
-
-        return " ".join(output)
-
-
-# ================================================================
-# SIMULTANEOUS ENVIRONMENT SYSTEM
-# ================================================================
-
-class SimultaneousEnvironmentSystem:
-    """
-    System where environment correlation and generation happen simultaneously.
-    No switches - both always active together. Self-modifies when perfection detected.
-    """
-    def __init__(self, generator, property_constructor, environment_correlator):
-        self.generator = generator
-        self.property_constructor = property_constructor
-        self.environment_correlator = environment_correlator
-        self.perfection_detector = PerfectionDetector()
+            
+            # INCREMENTAL ANALYSIS: Analyze every report_interval words
+            words_generated = len(output) - extension_start_index
+            if words_generated - last_report >= report_interval:
+                # Get segment for analysis
+                segment_start = extension_start_index + last_report
+                segment_text = ' '.join(output[segment_start:])
+                
+                # Property construction
+                properties = self.property_constructor.analyze_extension(
+                    segment_text, 
+                    self.word_freq
+                )
+                
+                # Environment correlation
+                correlation = self.environment_correlator.correlate_segment(
+                    properties, 
+                    step_count
+                )
+                
+                # Display real-time analysis
+                print(f"📍 Extension Progress: {words_generated}/{extension_length} words")
+                print(f"   └─ Segment: {segment_text[:60]}...")
+                print(f"\n📊 Property Analysis:")
+                print(f"   ├─ Diversity: {properties['diversity']:.3f}")
+                print(f"   ├─ Avg Word Length: {properties['avg_word_length']:.2f}")
+                print(f"   ├─ Rare Words: {properties['rare_words']}")
+                print(f"   └─ Coherence Vector: [{', '.join(f'{c:.3f}' for c in properties['coherence_vector'])}]")
+                print(f"\n🌍 Environment Correlation:")
+                print(f"   ├─ Trend: {correlation['trend']}")
+                print(f"   ├─ Velocity: {correlation['velocity']:+.4f}")
+                print(f"   └─ Status: {', '.join(correlation['alert'])}")
+                print(f"\n{'-'*70}\n")
+                
+                last_report = words_generated
         
-        # Create environment injector
-        self.env_injector = EnvironmentContextInjector(environment_correlator)
-        
-        # Link injector to generator
-        self.generator.env_injector = self.env_injector
-        
-        # Baseline parameters for self-modification
-        self.baseline_params = {
-            'sine_amp': generator.sine_amp,
-            'sine_freq': generator.sine_freq,
-            'sine_phase': generator.sine_phase,
-        }
-        
-        self.meta_learning_rate = 0.1
-        self.modification_history = []
-        
-    def generate_with_simultaneous_correlation(self, seed, length=200):
-        """Generate text with environment correlation happening simultaneously."""
-        print(f"\n{'='*70}")
-        print(f"SIMULTANEOUS ENVIRONMENT CORRELATION SYSTEM")
-        print(f"Environment + Seed Injection Active Throughout Generation")
-        print(f"{'='*70}\n")
-        
-        # Get current environment state
+        # Final summary
+        extension_text = ' '.join(output[extension_start_index:])
+        understanding_summary = self.property_constructor.get_understanding_summary()
         env_summary = self.environment_correlator.get_environment_summary()
         
-        # Phase 1: Simultaneous Generation with Environment Injection
-        print("🔄 Phase 1: Simultaneous Generation + Environment Correlation")
-        print("   ├─ User Seed: Active ✓")
-        print("   ├─ Environment Context: Active ✓")
-        print("   └─ Continuous Fusion: Enabled ✓\n")
-        
-        generated_text = self.generator.generate_with_environment_injection(
-            seed, 
-            env_summary, 
-            length=length
-        )
-        
-        # Phase 2: Update Environment State
-        print("\n🌍 Phase 2: Environment State Update")
-        env_state = self.environment_correlator.monitor_environment(generated_text)
-        updated_summary = self.environment_correlator.get_environment_summary()
-        
-        print(f"   Coherence: {updated_summary['avg_coherence']:.3f}")
-        print(f"   Novelty: {updated_summary['avg_novelty']:.3f}")
-        print(f"   Diversity: {updated_summary['avg_diversity']:.3f}")
-        print(f"   Trend: {updated_summary['status']}")
-        
-        # Phase 3: Extract Properties
-        print("\n🔍 Phase 3: Property Construction")
-        properties = self.property_constructor.extract_properties(generated_text)
-        
-        print(f"   Semantic Clusters: {len(properties['semantic_clusters'])}")
-        print(f"   Thematic Coherence: {properties['thematic_coherence']:.3f}")
-        
-        # Phase 4: Knowledge Graph
-        print("\n🕸️  Phase 4: Knowledge Graph Construction")
-        knowledge_graph = self.property_constructor.build_knowledge_graph(properties)
-        print(f"   Nodes: {len(knowledge_graph['nodes'])}")
-        print(f"   Edges: {len(knowledge_graph['edges'])}")
-        
-        # Phase 5: Perfection Detection + Self-Modification
-        print("\n✨ Phase 5: Perfection Detection")
-        
-        output_metrics = {
-            'avg_coherence': updated_summary['avg_coherence'],
-            'avg_novelty': updated_summary['avg_novelty'],
-            'avg_diversity': updated_summary['avg_diversity'],
-            'thematic_coherence': properties['thematic_coherence']
-        }
-        
-        is_perfect, quality_score = self.perfection_detector.detect_perfection(output_metrics)
-        
-        modified = False
-        if is_perfect:
-            patterns = self.perfection_detector.get_perfection_patterns()
-            if patterns:
-                print("\n🧬 Phase 6: Self-Modification Triggered")
-                modifications = self._compute_modifications(patterns)
-                self._apply_modifications(modifications)
-                
-                # Optimize kernel if perfection detected
-                self._optimize_kernel_properties(patterns)
-                modified = True
-        
-        if not modified:
-            # Adaptive parameter tuning
-            print("\n⚙️  Phase 6: Adaptive Parameter Tuning")
-            adaptations = self.environment_correlator.adapt_parameters()
-        else:
-            adaptations = {}
-        
-        # Compile output
-        output = {
-            'generated_text': generated_text,
-            'environment_state': updated_summary,
-            'properties': properties,
-            'knowledge_graph': knowledge_graph,
-            'adaptations': adaptations,
-            'self_modifications': modified,
-            'quality_score': quality_score,
-            'perfection_detected': is_perfect
-        }
-        
-        return output
-    
-    def _compute_modifications(self, patterns):
-        """Compute parameter modifications from perfection patterns."""
-        modifications = {}
-        current_params = {
-            'sine_amp': self.generator.sine_amp,
-            'sine_freq': self.generator.sine_freq,
-            'sine_phase': self.generator.sine_phase,
-        }
-        
-        # Adjust based on patterns
-        if patterns['optimal_coherence'] > 0.7:
-            new_amp = current_params['sine_amp'] * (1 - self.meta_learning_rate * 0.3)
-            modifications['sine_amp'] = np.clip(new_amp, 0.3, 0.9)
-        elif patterns['optimal_coherence'] < 0.5:
-            new_amp = current_params['sine_amp'] * (1 + self.meta_learning_rate * 0.5)
-            modifications['sine_amp'] = np.clip(new_amp, 0.3, 0.9)
-        
-        if patterns['optimal_diversity'] > 0.6:
-            new_freq = current_params['sine_freq'] * (1 + self.meta_learning_rate * 0.4)
-            modifications['sine_freq'] = np.clip(new_freq, 0.04, 0.15)
-        
-        optimal_novelty = patterns['optimal_novelty']
-        if abs(optimal_novelty - 0.5) < 0.1:
-            phase_shift = 0.1 * np.sin(optimal_novelty * np.pi)
-            new_phase = (current_params['sine_phase'] + phase_shift) % (2 * np.pi)
-            modifications['sine_phase'] = new_phase
-        
-        return modifications
-    
-    def _apply_modifications(self, modifications):
-        """Apply self-modifications."""
-        for param, value in modifications.items():
-            old_value = getattr(self.generator, param)
-            setattr(self.generator, param, value)
-            print(f"   ✅ {param}: {old_value:.4f} → {value:.4f}")
-            
-            self.modification_history.append({
-                'timestamp': datetime.now(),
-                'parameter': param,
-                'old_value': old_value,
-                'new_value': value
-            })
-    
-    def _optimize_kernel_properties(self, patterns):
-        """Optimize central kernel properties based on perfection patterns."""
-        print("\n🔧 Optimizing Kernel Properties...")
-        
-        coherence_std = patterns.get('coherence_std', 0)
-        
-        if coherence_std < 0.05:
-            # Low variance - tighter kernel works
-            new_kernel_size = max(3, self.generator.central_kernel.kernel_size - 2)
-            print(f"   🎯 Tightening kernel: {self.generator.central_kernel.kernel_size} → {new_kernel_size}")
-        elif coherence_std > 0.15:
-            # High variance - broader smoothing needed
-            new_kernel_size = min(7, self.generator.central_kernel.kernel_size + 2)
-            print(f"   📊 Broadening kernel: {self.generator.central_kernel.kernel_size} → {new_kernel_size}")
-        else:
-            return
-        
-        # Recreate kernel with new size
-        self.generator.central_kernel = CentralKernel(kernel_size=new_kernel_size)
-        self.generator.engine.kernel = self.generator.central_kernel
-        self.generator.engine.truth_washer.kernel = self.generator.central_kernel
-        self.generator.engine.eigen_system.kernel = self.generator.central_kernel
-        
-        print("   ✅ Kernel properties updated")
-    
-    def display_output(self, output):
-        """Display comprehensive output."""
         print(f"\n{'='*70}")
-        print("GENERATED TEXT")
-        print(f"{'='*70}\n")
-        print(output['generated_text'])
-        
-        print(f"\n{'='*70}")
-        print("ENVIRONMENT-CONDITIONED ANALYSIS")
+        print(f"EXTENSION COMPLETE")
         print(f"{'='*70}\n")
         
-        # Quality metrics
-        print("📊 Quality Metrics:")
-        print(f"   Overall Score: {output['quality_score']:.4f}")
-        if output['perfection_detected']:
-            print(f"   Status: ✨ PERFECTION DETECTED ✨")
-        else:
-            print(f"   Status: Standard generation")
+        print(f"📝 Final Extension ({len(output) - extension_start_index} words):")
+        print(f"{extension_text}\n")
         
-        # Semantic clusters
-        print("\n🔹 Semantic Clusters:")
-        for i, cluster in enumerate(output['properties']['semantic_clusters'][:3]):
-            print(f"   Cluster {i+1}: {', '.join(cluster[:5])}")
+        print(f"{'='*70}")
+        print(f"ACCUMULATED UNDERSTANDING")
+        print(f"{'='*70}\n")
         
-        # Entity relations
-        print("\n🔹 Entity Relations:")
-        for e1, rel, e2 in output['properties']['entity_relations'][:5]:
-            print(f"   {e1} --[{rel}]--> {e2}")
+        print(f"📊 Property Summary:")
+        print(f"   ├─ Total Words Analyzed: {understanding_summary['total_words_analyzed']}")
+        print(f"   ├─ Unique Words: {understanding_summary['total_unique_words']}")
+        print(f"   ├─ Average Diversity: {understanding_summary['average_diversity']:.3f}")
+        print(f"   ├─ Entities Discovered: {understanding_summary['entity_count']}")
+        print(f"   └─ Relationships Found: {understanding_summary['relationship_count']}")
         
-        # Self-modification summary
-        if output['self_modifications']:
-            print(f"\n🧬 Self-Modifications:")
-            print(f"   Total Perfection Events: {len(self.perfection_detector.perfection_events)}")
-            print(f"   Total Modifications: {len(self.modification_history)}")
+        print(f"\n🔍 Top Semantic Patterns:")
+        for pattern, count in understanding_summary['top_patterns']:
+            print(f"   └─ {' → '.join(pattern)}: {count} occurrences")
+        
+        print(f"\n🌍 Environment Final State:")
+        print(f"   ├─ Average Coherence: {env_summary['avg_coherence']:.3f}")
+        print(f"   ├─ Average Diversity: {env_summary['avg_diversity']:.3f}")
+        print(f"   ├─ Quality Velocity: {env_summary['velocity']:+.4f}")
+        print(f"   └─ Final Trend: {env_summary['trend']}")
         
         print(f"\n{'='*70}\n")
+        
+        return {
+            'seed': seed,
+            'extension': extension_text,
+            'full_output': ' '.join(output),
+            'understanding': understanding_summary,
+            'environment': env_summary
+        }
 
 
 # ================================================================
@@ -1207,72 +709,38 @@ class SimultaneousEnvironmentSystem:
 
 def main():
     print("\n" + "="*70)
-    print("SIMULTANEOUS ENVIRONMENT CORRELATION SYSTEM")
-    print("Environment + Seed Always Active Together")
-    print("Self-Modifying When Perfection Detected")
+    print("SEED EXTENSION GENERATOR")
+    print("Real-Time Property Construction + Environment Correlation")
     print("="*70 + "\n")
     
-    # Load corpus
     path = input("Enter text file: ").strip()
     if not os.path.exists(path):
         print("❌ File not found.")
         return
 
     corpus = open(path, 'r', encoding='utf-8').read().lower().split()
-    model = build_ngram_model(corpus, n=2)
-    print(f"📚 Loaded {len(corpus):,} tokens, model size: {len(model):,}")
+    model = build_ngram_model(corpus)
+    print(f"📚 Loaded {len(corpus):,} tokens, model size: {len(model):,}\n")
 
-    # Initialize components
-    print("\n🔧 Initializing simultaneous correlation system...")
+    generator = SeedExtensionGenerator(corpus, model)
     
-    # Use environment-aware generator
-    generator = EnvironmentAwareGenerator(corpus, model, kernel_size=3)
-    property_constructor = PropertyConstructor(generator.word_approximator)
-    environment_correlator = EnvironmentCorrelator(generator)
-    
-    # Create simultaneous system
-    system = SimultaneousEnvironmentSystem(
-        generator, 
-        property_constructor, 
-        environment_correlator
-    )
-    
-    print("✅ Simultaneous correlation system ready!")
-    print("💡 Environment context injected into every generation step")
-    print("🧬 Self-modification enabled for perfection events\n")
-    
-    # Interactive loop
-    generation_count = 0
     while True:
-        seed = input("\nUSER SEED: ")
+        seed = input("\nSEED TO EXTEND: ")
         if seed.lower() in ['quit', 'exit']:
             break
         
-        generation_count += 1
-        print(f"\n[Generation #{generation_count}]")
+        extension_length = input("Extension length (default 200): ").strip()
+        extension_length = int(extension_length) if extension_length else 200
         
-        # Generate with simultaneous environment correlation
-        output = system.generate_with_simultaneous_correlation(seed, length=200)
+        report_interval = input("Report interval (default 20): ").strip()
+        report_interval = int(report_interval) if report_interval else 20
         
-        # Display results
-        system.display_output(output)
-        
-        # Show environment injection details
-        print("\n🔬 Environment Injection Details:")
-        env_state = output['environment_state']
-        env_vec = system.env_injector.create_environment_vector(env_state)
-        print(f"   Environment Vector: {env_vec}")
-        print(f"   Injection Strength: {system.env_injector.injection_strength:.2f}")
-        print(f"   Context Tokens: {system.env_injector.create_environment_tokens(env_state)}")
-        
-        # Modification history every 5 generations
-        if generation_count % 5 == 0 and system.modification_history:
-            view = input("\nView modification history? (y/n): ").strip().lower()
-            if view == 'y':
-                print("\n📊 MODIFICATION HISTORY:")
-                for i, mod in enumerate(system.modification_history[-10:]):
-                    print(f"   {i+1}. {mod['timestamp'].strftime('%H:%M:%S')} - "
-                          f"{mod['parameter']}: {mod['old_value']:.4f} → {mod['new_value']:.4f}")
+        # Generate extension with real-time analysis
+        result = generator.extend_seed(
+            seed, 
+            extension_length=extension_length,
+            report_interval=report_interval
+        )
 
 
 if __name__ == "__main__":
