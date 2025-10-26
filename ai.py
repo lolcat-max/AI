@@ -16,65 +16,300 @@ print(f"Using {device}, precision {torch_dtype}")
 
 
 # ================================================================
+# WORD FEATURE APPROXIMATOR
+# ================================================================
+
+class WordFeatureApproximator:
+    """
+    Computes multi-dimensional feature similarity between words.
+    Words approximate features of other words through:
+    - Lexical similarity (character overlap, edit distance)
+    - Frequency correlation (similar corpus distributions)
+    - Phonetic patterns (sound structure)
+    - Contextual co-occurrence (distributional semantics)
+    - Morphological features (prefix/suffix patterns)
+    """
+    def __init__(self, corpus_tokens, word_freq):
+        self.word_freq = word_freq
+        self.total_words = len(corpus_tokens)
+        
+        # Build co-occurrence matrix for distributional similarity
+        self.cooccurrence = self._build_cooccurrence(corpus_tokens, window=2)
+        
+        # Cache feature vectors for performance
+        self.feature_cache = {}
+        
+    def _build_cooccurrence(self, tokens, window=2):
+        """Build word co-occurrence matrix for distributional features."""
+        cooccur = defaultdict(Counter)
+        for i, word in enumerate(tokens):
+            context_start = max(0, i - window)
+            context_end = min(len(tokens), i + window + 1)
+            for j in range(context_start, context_end):
+                if i != j:
+                    cooccur[word][tokens[j]] += 1
+        return dict(cooccur)
+    
+    def extract_features(self, word):
+        """
+        Extract comprehensive feature vector for a word.
+        Returns normalized feature array capturing multiple word properties.
+        """
+        if word in self.feature_cache:
+            return self.feature_cache[word]
+        
+        features = []
+        
+        # 1. Lexical features (character-level patterns)
+        features.append(len(word) / 20.0)  # Normalized length
+        features.append(sum(1 for c in word if c.isalpha()) / (len(word) + 1))  # Alpha ratio
+        features.append(sum(1 for c in word if c in 'aeiou') / (len(word) + 1))  # Vowel ratio
+        
+        # 2. Character distribution features
+        char_counts = Counter(word)
+        features.append(len(char_counts) / (len(word) + 1))  # Character diversity
+        features.append(max(char_counts.values()) / (len(word) + 1) if char_counts else 0)  # Max char frequency
+        
+        # 3. Frequency-based features
+        freq = self.word_freq.get(word, 1)
+        features.append(np.log(freq + 1) / np.log(self.total_words + 1))  # Log-normalized frequency
+        features.append(1.0 / (freq + 1))  # Rarity score
+        
+        # 4. Phonetic features (approximate sound patterns)
+        features.append(1 if word[0] in 'aeiou' else 0 if word else 0)  # Starts with vowel
+        features.append(1 if word[-1] in 'aeiou' else 0 if word else 0)  # Ends with vowel
+        features.append(word.count('th') + word.count('ch') + word.count('sh'))  # Digraph count
+        
+        # 5. Morphological features
+        features.append(1 if word.endswith('ing') else 0)  # Progressive form
+        features.append(1 if word.endswith('ed') else 0)  # Past tense
+        features.append(1 if word.endswith('s') else 0)  # Plural/3rd person
+        features.append(1 if word.startswith('un') or word.startswith('re') else 0)  # Common prefixes
+        
+        # 6. Positional character features (encoding word structure)
+        if len(word) >= 1:
+            features.append(ord(word[0]) / 122.0)  # First character (normalized)
+        else:
+            features.append(0)
+        if len(word) >= 2:
+            features.append(ord(word[1]) / 122.0)  # Second character
+        else:
+            features.append(0)
+        if len(word) >= 1:
+            features.append(ord(word[-1]) / 122.0)  # Last character
+        else:
+            features.append(0)
+        
+        feature_vector = np.array(features)
+        self.feature_cache[word] = feature_vector
+        return feature_vector
+    
+    def compute_similarity(self, word1, word2):
+        """
+        Compute multi-feature similarity between two words.
+        Returns value in [0, 1] where 1 = identical features, 0 = completely different.
+        """
+        # Extract feature vectors
+        vec1 = self.extract_features(word1)
+        vec2 = self.extract_features(word2)
+        
+        # Compute cosine similarity between feature vectors
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            cosine_sim = 0
+        else:
+            cosine_sim = dot_product / (norm1 * norm2)
+        
+        # Add distributional similarity based on co-occurrence
+        distributional_sim = self._distributional_similarity(word1, word2)
+        
+        # Compute character overlap (Jaccard similarity)
+        set1 = set(word1)
+        set2 = set(word2)
+        if len(set1) == 0 and len(set2) == 0:
+            jaccard_sim = 1.0
+        elif len(set1 | set2) == 0:
+            jaccard_sim = 0.0
+        else:
+            jaccard_sim = len(set1 & set2) / len(set1 | set2)
+        
+        # Weighted combination of similarity metrics
+        combined_similarity = (
+            0.5 * max(0, cosine_sim) +  # Feature vector similarity
+            0.3 * distributional_sim +   # Context similarity
+            0.2 * jaccard_sim            # Character overlap
+        )
+        
+        return float(np.clip(combined_similarity, 0, 1))
+    
+    def _distributional_similarity(self, word1, word2):
+        """
+        Compute distributional similarity based on shared context words.
+        Implements simplified word2vec-style distributional semantics.
+        """
+        if word1 not in self.cooccurrence or word2 not in self.cooccurrence:
+            return 0.0
+        
+        context1 = self.cooccurrence[word1]
+        context2 = self.cooccurrence[word2]
+        
+        # Find shared context words
+        shared_contexts = set(context1.keys()) & set(context2.keys())
+        
+        if not shared_contexts:
+            return 0.0
+        
+        # Compute similarity based on shared context weights
+        similarity_sum = sum(
+            min(context1[ctx], context2[ctx]) / max(context1[ctx], context2[ctx])
+            for ctx in shared_contexts
+        )
+        
+        return similarity_sum / (len(shared_contexts) + 1)
+    
+    def find_similar_words(self, target_word, candidates, top_k=5):
+        """
+        Find the k most similar words to target_word from candidates list.
+        Returns list of (word, similarity_score) tuples sorted by similarity.
+        """
+        similarities = [
+            (cand, self.compute_similarity(target_word, cand))
+            for cand in candidates
+            if cand != target_word
+        ]
+        
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        return similarities[:top_k]
+    
+    def approximate_word_features(self, word, reference_words):
+        """
+        Approximate a word's features as a weighted combination of similar words' features.
+        This allows words to 'borrow' features from semantically/lexically related words.
+        """
+        if not reference_words:
+            return self.extract_features(word)
+        
+        # Get own features
+        own_features = self.extract_features(word)
+        
+        # Compute similarity to all reference words
+        similarities = [(ref, self.compute_similarity(word, ref)) for ref in reference_words]
+        similarities = [(ref, sim) for ref, sim in similarities if sim > 0.1]  # Filter low similarity
+        
+        if not similarities:
+            return own_features
+        
+        # Weight own features heavily, but blend in similar words' features
+        total_weight = 1.0 + sum(sim for _, sim in similarities)
+        approximated_features = own_features.copy()
+        
+        for ref_word, similarity in similarities:
+            ref_features = self.extract_features(ref_word)
+            approximated_features += (similarity / total_weight) * ref_features
+        
+        approximated_features = approximated_features / (1 + len(similarities) * 0.3)  # Normalize
+        
+        return approximated_features
+
+
+# ================================================================
+# CENTRAL KERNEL PROCESSOR
+# ================================================================
+
+class CentralKernel:
+    """
+    Central kernel that applies convolution-like operations to all arrays.
+    Acts as a unified processing core for coherence, eigenvalue, and spatial data.
+    """
+    def __init__(self, kernel_size=3):
+        self.kernel_size = kernel_size
+        self.kernel = self._create_kernel()
+        
+    def _create_kernel(self):
+        """Create the convolution kernel based on type."""
+        if self.kernel_size == 3:
+            kernel = np.array([1, 2, 1]) / 4.0
+        elif self.kernel_size == 5:
+            kernel = np.array([1, 4, 6, 4, 1]) / 16.0
+        else:
+            kernel = np.bartlett(self.kernel_size)
+            kernel = kernel / np.sum(kernel)
+        
+        return kernel
+    
+    def convolve_1d(self, array, mode='same'):
+        if len(array) == 0:
+            return array
+        arr = np.array(array)
+        if mode == 'same':
+            pad_width = self.kernel_size // 2
+            arr_padded = np.pad(arr, pad_width, mode='edge')
+            result = np.convolve(arr_padded, self.kernel, mode='valid')
+        else:
+            result = np.convolve(arr, self.kernel, mode=mode)
+        if mode == 'same' and len(result) != len(array):
+            result = result[:len(array)]
+        return result
+    
+    def process_scores(self, scores):
+        if len(scores) < self.kernel_size:
+            return scores
+        filtered = self.convolve_1d(scores, mode='same')
+        filtered = np.clip(filtered, 0, 1)
+        return filtered.tolist()
+    
+    def process_eigenvalues(self, eigenvalues):
+        if len(eigenvalues) < 2:
+            return eigenvalues
+        filtered = self.convolve_1d(eigenvalues, mode='same')
+        return filtered
+    
+    def process_vector(self, vector):
+        if len(vector) < self.kernel_size:
+            return vector
+        filtered = self.convolve_1d(vector, mode='same')
+        return filtered
+
+
+# ================================================================
 # SINE RESISTANCE MODULATION
 # ================================================================
 
 def sine_resistance(step, novelty, freq=0.08, amp=0.6, phase=0.0):
-    """
-    Rhythmic resistance function to modulate acceptance of novel tokens.
-    
-    Args:
-        step: Current generation step
-        novelty: [0,1] scale where 0 = frequent word, 1 = unseen/rare word
-        freq: Oscillation frequency
-        amp: Amplitude of resistance effect
-        phase: Phase offset
-    
-    Returns:
-        Scaling multiplier to reduce coherence for high-novelty tokens
-    """
     oscillation = np.sin(2 * np.pi * freq * step + phase)
-    # Resistance increases with novelty and inhibits during positive oscillation peaks
     resistance = 1.0 - amp * novelty * max(0.0, oscillation)
-    return max(0.1, resistance)  # Keep minimum at 0.1 to avoid complete suppression
+    return max(0.1, resistance)
 
 
 # ================================================================
 # EIGENVALUE ISOMORPHISM MODEL
 # ================================================================
+
 class EigenIsomorphism:
-    """
-    Maintains an eigenbasis mapping between reasoning states.
-    This class embodies the actual correspondence between information (input) and matter (the matrix W).
-    Each new input actively changes the eigenvalues (the system state), representing how information physically alters 'matter' (self.W).
-    This is not mere simulation or preplanning but a dynamic, non-deterministic evolution of the system's internal state.
-    """
-    def __init__(self, dim=4):
+    def __init__(self, dim=4, kernel=None):
         self.dim = dim
         self.W = np.eye(dim)
         self.last_input = np.zeros(dim)
-        # Updated print statement to reflect the core philosophy
+        self.kernel = kernel
 
     def update(self, input_vector):
         eigvals, eigvecs = np.linalg.eig(self.W)
-        
-        # The 'delta' calculation is where information perturbs the system's state.
+        if self.kernel is not None and len(input_vector) >= self.kernel.kernel_size:
+            input_vector = self.kernel.process_vector(input_vector[:self.dim])
         delta = np.tanh(0.6 * np.dot(eigvecs.T, input_vector[:self.dim]))
-        
-        # ACTUAL CORRESPONDENCE: The eigenvalues (state) are directly modified by the input.
-        # This is not a simulation; it's a structural change in the 'matter' of the system.
         new_eigvals = eigvals + 0.05 * delta[:len(eigvals)]
-        
-        # Reconstruct the matrix from its evolved spectral components.
+        if self.kernel is not None:
+            new_eigvals = self.kernel.process_eigenvalues(new_eigvals)
         self.W = eigvecs @ np.diag(new_eigvals) @ np.linalg.inv(eigvecs)
-        
         self.last_input = input_vector
         return np.real(new_eigvals), np.real(eigvecs)
 
     def project(self, vec):
         eigvals, eigvecs = np.linalg.eig(self.W)
         return np.real(np.dot(eigvecs, np.dot(np.diag(eigvals), np.dot(np.linalg.inv(eigvecs), vec))))
-
 
 
 # ================================================================
@@ -84,7 +319,7 @@ class EigenIsomorphism:
 class NeuralTruthTableWasher:
     def __init__(self, eta_0=0.3, alpha=0.1, epsilon=1e-4,
                  delta=1e-3, beta=1.0, gamma=2.0, mu=0.5,
-                 max_iterations=30):
+                 max_iterations=30, kernel=None):
         self.eta_0 = eta_0
         self.alpha = alpha
         self.epsilon = epsilon
@@ -96,6 +331,7 @@ class NeuralTruthTableWasher:
         self.dtype = torch_dtype
         self.device = device
         self.history = []
+        self.kernel = kernel
 
     def calculate_error(self, T, T_expected):
         T = torch.tensor(T, dtype=self.dtype, device=self.device)
@@ -115,6 +351,8 @@ class NeuralTruthTableWasher:
 
     def wash(self, T_contaminated, T_expected):
         Tcur = T_contaminated.copy()
+        if self.kernel is not None and len(Tcur) >= self.kernel.kernel_size:
+            Tcur = self.kernel.process_scores(Tcur)
         for k in range(self.max_iterations):
             eta = self.eta_0 * np.exp(-self.alpha * k)
             Tnext = self.wash_iteration(Tcur, T_expected, eta)
@@ -129,55 +367,66 @@ class NeuralTruthTableWasher:
 # ================================================================
 # REASONING ENGINE
 # ================================================================
+
 class ReasoningEngine:
-    """
-    The core engine that orchestrates the intuitive reasoning process.
-    It combines the stateful evolution of the EigenIsomorphism system with
-    the decision-making clarity of the NeuralTruthTableWasher.
-    """
-    def __init__(self):
-        self.truth_washer = NeuralTruthTableWasher()
-        self.eigen_system = EigenIsomorphism()
-        # Updated print statement to announce its conceptual purpose
+    def __init__(self, kernel=None):
+        self.kernel = kernel
+        self.truth_washer = NeuralTruthTableWasher(kernel=kernel)
+        self.eigen_system = EigenIsomorphism(kernel=kernel)
 
     def reason_step(self, coherence_scores, input_vector):
-        # 1. ACTUAL CORRESPONDENCE: The system's state evolves based on the new input.
+        if self.kernel is not None and len(coherence_scores) >= self.kernel.kernel_size:
+            coherence_scores = self.kernel.process_scores(coherence_scores)
         eigvals, eigvecs = self.eigen_system.update(input_vector)
-        
-        # Pad coherence scores for the truth-washing process
         padded_scores = coherence_scores[:4]
         while len(padded_scores) < 4:
             padded_scores.append(0.5)
-        
-        # 2. INTUITION: Resolve ambiguity by "washing" coherence scores towards a clear state.
         washed, metrics = self.truth_washer.wash(
             padded_scores,
             [1.0 if c > 0.5 else 0.0 for c in padded_scores]
         )
-        
-        # 3. MODULATION: The system's current state (eigenvalues) influences the final decision.
         modulated = []
-        scale = 1 + 0.1 * np.mean(eigvals) # The system's "mood" or "focus"
+        scale = 1 + 0.1 * np.mean(eigvals)
         for i in range(len(coherence_scores)):
             if i < len(washed):
                 modulated.append(float(np.clip(washed[i] * scale, 0, 1)))
             else:
                 modulated.append(float(np.clip(coherence_scores[i] * scale, 0, 1)))
-        
+        if self.kernel is not None and len(modulated) >= self.kernel.kernel_size:
+            modulated = self.kernel.process_scores(modulated)
         return modulated, np.mean(eigvals), metrics
 
 
-
 # ================================================================
-# SCHRODINGER QUANTUM FEATURES (simplified)
+# ENHANCED QUANTUM FEATURES WITH WORD APPROXIMATION
 # ================================================================
 
 class SchrodingerQuantumFeatures:
+    def __init__(self, word_approximator=None):
+        self.word_approximator = word_approximator
+        
     def extract_quantum_features(self, segment, word_freq, total_words):
         xs = np.array([len(w) for w in segment])
         fs = np.array([word_freq.get(w, 1) for w in segment])
+        
+        # Base variance calculation
         var = np.var(xs / (fs + 1))
         coherence = 1.0 / (1.0 + var)
+        
+        # Enhanced: If word approximator available, boost coherence based on word similarities
+        if self.word_approximator is not None and len(segment) >= 2:
+            # Compute average pairwise similarity in segment
+            similarities = []
+            for i in range(len(segment) - 1):
+                sim = self.word_approximator.compute_similarity(segment[i], segment[i+1])
+                similarities.append(sim)
+            
+            if similarities:
+                avg_similarity = np.mean(similarities)
+                # Boost coherence for similar adjacent words
+                coherence = coherence * (1.0 + 0.3 * avg_similarity)
+                coherence = min(1.0, coherence)
+        
         return {"coherence": coherence}
 
 
@@ -194,175 +443,45 @@ def build_ngram_model(tokens, n=2):
 
 
 # ================================================================
-# REASONING GENERATOR WITH SINE RESISTANCE
+# REASONING GENERATOR WITH WORD FEATURE APPROXIMATION
 # ================================================================
 
 class ReasoningGenerator:
-    def __init__(self, tokens, model):
+    def __init__(self, tokens, model, kernel_size=3):
         self.tokens = tokens
         self.model = model
         self.keys = list(model.keys())
         self.word_freq = Counter(tokens)
         self.total_words = len(tokens)
-        self.feature = SchrodingerQuantumFeatures()
-        self.engine = ReasoningEngine()
         
-        # Sine resistance parameters
-        self.sine_freq = 0.08
-        self.sine_amp = 0.6
-        self.sine_phase = 0.0
+        # Initialize word feature approximator
+        print("🔬 Building word feature approximator...")
+        self.word_approximator = WordFeatureApproximator(tokens, self.word_freq)
         
-    def calculate_novelty(self, word):
-        """
-        Calculate novelty score for a word based on its frequency.
-        Returns value in [0, 1] where 1 = very rare/novel, 0 = very common
-        """
-        freq = self.word_freq.get(word, 1)
-        # Normalize using logarithm to handle frequency distribution
-        novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
-        return float(np.clip(novelty, 0, 1))
-
-# ================================================================
-# TRAVELING CUMULATIVE SUM FILTER
-# ================================================================
-
-class TravelingCumsumFilter:
-    """
-    Implements a traveling (moving window) cumulative sum filter
-    for detecting local trends and patterns in token sequences.
-    Inspired by CUSUM algorithms and spatial pattern detection.
-    """
-    def __init__(self, window_size=10, threshold=0.5, decay=0.95):
-        """
-        Args:
-            window_size: Size of the traveling window
-            threshold: Detection threshold for pattern changes
-            decay: Exponential decay factor for older observations
-        """
-        self.window_size = window_size
-        self.threshold = threshold
-        self.decay = decay
-        self.history = []
-        self.cumsum_positive = 0.0
-        self.cumsum_negative = 0.0
-    
-    def update(self, observation, reference=0.5):
-        """
-        Update the traveling cumsum with a new observation.
+        # Initialize quantum features with approximator
+        self.feature = SchrodingerQuantumFeatures(word_approximator=self.word_approximator)
         
-        Args:
-            observation: Current coherence/novelty score [0,1]
-            reference: Reference value for deviation detection
-            
-        Returns:
-            dict with cumsum metrics and detection flags
-        """
-        # Calculate deviation from reference
-        deviation = observation - reference
-        
-        # Update positive and negative cumulative sums (two-sided CUSUM)
-        self.cumsum_positive = max(0, self.cumsum_positive + deviation)
-        self.cumsum_negative = max(0, self.cumsum_negative - deviation)
-        
-        # Add to history window
-        self.history.append({
-            'observation': observation,
-            'deviation': deviation,
-            'cumsum_pos': self.cumsum_positive,
-            'cumsum_neg': self.cumsum_negative
-        })
-        
-        # Maintain window size
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-            # Apply decay to prevent unbounded growth
-            self.cumsum_positive *= self.decay
-            self.cumsum_negative *= self.decay
-        
-        # Calculate traveling statistics
-        window_mean = np.mean([h['observation'] for h in self.history])
-        window_trend = self.cumsum_positive - self.cumsum_negative
-        
-        # Detect pattern changes
-        upward_shift = self.cumsum_positive > self.threshold
-        downward_shift = self.cumsum_negative > self.threshold
-        
-        return {
-            'cumsum_pos': self.cumsum_positive,
-            'cumsum_neg': self.cumsum_negative,
-            'trend': window_trend,
-            'window_mean': window_mean,
-            'upward_shift': upward_shift,
-            'downward_shift': downward_shift,
-            'window_size': len(self.history)
-        }
-    
-    def get_spatial_weight(self):
-        """
-        Calculate spatial weighting factor based on current cumsum state.
-        Returns value in [0.5, 1.5] to modulate token selection.
-        """
-        if len(self.history) < 2:
-            return 1.0
-        
-        # Use trend direction to influence token selection
-        trend = self.cumsum_positive - self.cumsum_negative
-        
-        # Normalize trend to [-1, 1] range
-        trend_normalized = np.tanh(trend / self.threshold)
-        
-        # Map to [0.5, 1.5] weight range
-        weight = 1.0 + 0.5 * trend_normalized
-        
-        return weight
-    
-    def reset(self):
-        """Reset the filter state."""
-        self.history = []
-        self.cumsum_positive = 0.0
-        self.cumsum_negative = 0.0
-
-
-# ================================================================
-# ENHANCED REASONING GENERATOR WITH TRAVELING CUMSUM
-# ================================================================
-
-class ReasoningGenerator:
-    def __init__(self, tokens, model):
-        self.tokens = tokens
-        self.model = model
-        self.keys = list(model.keys())
-        self.word_freq = Counter(tokens)
-        self.total_words = len(tokens)
-        self.feature = SchrodingerQuantumFeatures()
-        self.engine = ReasoningEngine()
-        
-        # Sine resistance parameters
-        self.sine_freq = 0.08
-        self.sine_amp = 0.6
-        self.sine_phase = 0.0
-        
-        # Initialize traveling cumsum filter
-        self.cusum_filter = TravelingCumsumFilter(
-            window_size=10,
-            threshold=0.5,
-            decay=0.95
+        # Initialize central kernel
+        self.central_kernel = CentralKernel(
+            kernel_size=kernel_size,
         )
         
-        print("🤖 Generator ready!")
-       
+        # Initialize reasoning engine with kernel
+        self.engine = ReasoningEngine(kernel=self.central_kernel)
+        
+        # Sine resistance parameters
+        self.sine_freq = 0.08
+        self.sine_amp = 0.6
+        self.sine_phase = 0.0
+        
+        print(f"🤖 Generator ready with kernel and word approximation!")
 
     def calculate_novelty(self, word):
-        """
-        Calculate novelty score for a word based on its frequency.
-        Returns value in [0, 1] where 1 = very rare/novel, 0 = very common
-        """
         freq = self.word_freq.get(word, 1)
         novelty = 1.0 - np.log(freq + 1) / np.log(self.total_words + 1)
         return float(np.clip(novelty, 0, 1))
 
     def generate(self, seed, length=50):
-        # Parse seed into tuple
         seed_words = seed.lower().split()[:2]
         while len(seed_words) < 2:
             seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
@@ -373,17 +492,16 @@ class ReasoningGenerator:
         
         output = list(seed)
         
-        print(f"\n🌀 Generating {length} words...")
+        print(f"\n🌀 Generating {length} words with feature approximation...")
         print(f"   Seed: {' '.join(seed)}\n")
         
         step_count = 0
         
         while len(output) < length:
-            # Convert recent output to input vector for eigenvalue modulation
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
             input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
+            input_vec = self.central_kernel.process_vector(input_vec)
 
-            # Get candidates and filter punctuation
             candidates = self.model.get(seed, [])
             candidates = [w for w in candidates if any(c.isalnum() for c in w)]
             
@@ -391,13 +509,12 @@ class ReasoningGenerator:
                 seed = self.keys[np.random.randint(len(self.keys))]
                 continue
 
-            # Calculate coherence scores with sine resistance
             coherence_scores = []
             novelty_scores = []
             resistance_factors = []
             
             for cand in candidates:
-                # Base coherence from quantum features
+                # Extract quantum features (now enhanced with word approximation)
                 q = self.feature.extract_quantum_features(
                     list(seed) + [cand], 
                     self.word_freq, 
@@ -405,7 +522,12 @@ class ReasoningGenerator:
                 )
                 base_coherence = q["coherence"]
                 
-                # Calculate novelty and apply sine resistance
+                # Boost coherence for candidates similar to recent words
+                if len(output) >= 1:
+                    recent_word = output[-1]
+                    similarity = self.word_approximator.compute_similarity(recent_word, cand)
+                    base_coherence = base_coherence * (1.0 + 0.2 * similarity)
+                
                 novelty = self.calculate_novelty(cand)
                 resistance_factor = sine_resistance(
                     step_count, 
@@ -415,55 +537,42 @@ class ReasoningGenerator:
                     phase=self.sine_phase
                 )
                 
-                # Apply resistance to coherence
                 adjusted_coherence = base_coherence * resistance_factor
                 
                 coherence_scores.append(adjusted_coherence)
                 novelty_scores.append(novelty)
                 resistance_factors.append(resistance_factor)
 
-            # Apply reasoning and eigenvalue modulation
+            if len(coherence_scores) >= self.central_kernel.kernel_size:
+                coherence_scores = self.central_kernel.process_scores(coherence_scores)
+
             modulated, eigmean, metrics = self.engine.reason_step(coherence_scores, input_vec)
             
-            # Ensure we have valid probabilities
             if len(modulated) != len(candidates):
                 min_len = min(len(modulated), len(candidates))
                 modulated = modulated[:min_len]
                 candidates = candidates[:min_len]
-                novelty_scores = novelty_scores[:min_len]
-                resistance_factors = resistance_factors[:min_len]
             
             if not modulated or not candidates:
                 seed = self.keys[np.random.randint(len(self.keys))]
                 continue
             
-            # Apply traveling cumsum spatial weighting
-            avg_coherence = np.mean(modulated)
-            cusum_metrics = self.cusum_filter.update(avg_coherence, reference=0.5)
-            spatial_weight = self.cusum_filter.get_spatial_weight()
+            if len(modulated) >= self.central_kernel.kernel_size:
+                modulated = self.central_kernel.process_scores(modulated)
             
-            # Modulate probabilities with spatial weight
-            modulated_spatial = [score * spatial_weight for score in modulated]
+            probs = torch.softmax(torch.tensor(modulated), dim=0).numpy()
             
-            probs = torch.softmax(torch.tensor(modulated_spatial), dim=0).numpy()
-            
-            # Normalize probabilities
             if np.sum(probs) == 0:
                 probs = np.ones(len(candidates)) / len(candidates)
             else:
                 probs = probs / np.sum(probs)
 
-            # Select next word
             next_word = np.random.choice(candidates, p=probs)
-            selected_idx = candidates.index(next_word)
-            
             output.append(next_word)
             seed = tuple(output[-2:])
             step_count += 1
 
-
         return " ".join(output)
-
 
 
 # ================================================================
@@ -472,6 +581,8 @@ class ReasoningGenerator:
 
 def main():
     print("\n=== Eigenvalue-Isomorphic Neural Reasoner ===")
+    print("    with Word Feature Approximation\n")
+    
     path = input("Enter text file: ").strip()
     if not os.path.exists(path):
         print("File not found.")
@@ -481,7 +592,7 @@ def main():
     model = build_ngram_model(corpus)
     print(f"Loaded {len(corpus):,} tokens, model size: {len(model):,}")
 
-    generator = ReasoningGenerator(corpus, model)
+    generator = ReasoningGenerator(corpus, model, kernel_size=3)
     
     while True:
         seed = input("\nUSER: ")
