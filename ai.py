@@ -552,7 +552,7 @@ class SeedExtensionGenerator:
         step_count = 0
         last_report = 0
         
-        while len(output) - extension_start_index -1 < extension_length:
+        for i in range(extension_length):
             # Create input vector
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
             input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
@@ -644,63 +644,13 @@ class SeedExtensionGenerator:
                 )
                 
                 # Display real-time analysis
-                print(f"📍 Extension Progress: {words_generated}/{extension_length} words")
-                print(f"   └─ Segment: {segment_text[:60]}...")
-                print(f"\n📊 Property Analysis:")
-                print(f"   ├─ Diversity: {properties['diversity']:.3f}")
-                print(f"   ├─ Avg Word Length: {properties['avg_word_length']:.2f}")
-                print(f"   ├─ Rare Words: {properties['rare_words']}")
-                print(f"   └─ Coherence Vector: [{', '.join(f'{c:.3f}' for c in properties['coherence_vector'])}]")
-                print(f"\n🌍 Environment Correlation:")
-                print(f"   ├─ Trend: {correlation['trend']}")
-                print(f"   ├─ Velocity: {correlation['velocity']:+.4f}")
-                print(f"   └─ Status: {', '.join(correlation['alert'])}")
+                print(f"📍 Progress: {words_generated}/{extension_length} words")
+                print(f"   └─ Segment: {segment_text}...")
                 print(f"\n{'-'*70}\n")
                 
                 last_report = words_generated
         
-        # Final summary
-        extension_text = ' '.join(output[extension_start_index:])
-        understanding_summary = self.property_constructor.get_understanding_summary()
-        env_summary = self.environment_correlator.get_environment_summary()
-        
-        print(f"\n{'='*70}")
-        print(f"EXTENSION COMPLETE")
-        print(f"{'='*70}\n")
-        
-        print(f"📝 Final Extension ({len(output) - extension_start_index} words):")
-        print(f"{extension_text}\n")
-        
-        print(f"{'='*70}")
-        print(f"ACCUMULATED UNDERSTANDING")
-        print(f"{'='*70}\n")
-        
-        print(f"📊 Property Summary:")
-        print(f"   ├─ Total Words Analyzed: {understanding_summary['total_words_analyzed']}")
-        print(f"   ├─ Unique Words: {understanding_summary['total_unique_words']}")
-        print(f"   ├─ Average Diversity: {understanding_summary['average_diversity']:.3f}")
-        print(f"   ├─ Entities Discovered: {understanding_summary['entity_count']}")
-        print(f"   └─ Relationships Found: {understanding_summary['relationship_count']}")
-        
-        print(f"\n🔍 Top Semantic Patterns:")
-        for pattern, count in understanding_summary['top_patterns']:
-            print(f"   └─ {' → '.join(pattern)}: {count} occurrences")
-        
-        print(f"\n🌍 Environment Final State:")
-        print(f"   ├─ Average Coherence: {env_summary['avg_coherence']:.3f}")
-        print(f"   ├─ Average Diversity: {env_summary['avg_diversity']:.3f}")
-        print(f"   ├─ Quality Velocity: {env_summary['velocity']:+.4f}")
-        print(f"   └─ Final Trend: {env_summary['trend']}")
-        
-        print(f"\n{'='*70}\n")
-        
-        return {
-            'seed': seed,
-            'extension': extension_text,
-            'full_output': ' '.join(output),
-            'understanding': understanding_summary,
-            'environment': env_summary
-        }
+        return
 
 
 # ================================================================
