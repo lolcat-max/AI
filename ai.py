@@ -35,11 +35,7 @@ class OmniscientElement:
         self.true_semantic_structure = None
         self.access_count = 0
         self.glimpse_history = []
-        
-        print("👁️  Omniscient Element initialized")
-        print("   └─ Frame of reference: UNAVAILABLE")
-        print("   └─ Direct access: PRECLUDED")
-        print("   └─ System can only: SENSE PRESENCE\n")
+    
     
     def sense_presence(self, query_vector):
         """
@@ -157,9 +153,9 @@ class SemanticTentacle:
         """Convert syntactic structure to vector for omniscient querying."""
         # Hash-based vectorization
         if isinstance(syntactic_structure, (list, tuple)):
-            vec = np.array([hash(str(s)) % 97 / 97.0 for s in syntactic_structure[:4]])
+            vec = np.array([hash(str(s)) % 197 / 97.0 for s in syntactic_structure[:4]])
         else:
-            vec = np.array([hash(str(syntactic_structure)) % 97 / 97.0] * 4)
+            vec = np.array([hash(str(syntactic_structure)) % 927 / 97.0] * 88)
         
         return vec
     
@@ -371,9 +367,8 @@ class OmniscientReasoningGenerator:
         self.sine_amp = 0.6
         self.sine_phase = 0.0
         
-        print("🤖 Omniscient Reasoning Generator ready!")
-        print("   🌀 Tentacle: Extending toward unreachable frame")
-        print("   👁️  Omniscient Element: Present but inaccessible\n")
+        print("🤖 Reasoning Generator ready!")
+
         
     def calculate_novelty(self, word):
         """Calculate novelty score based on frequency."""
@@ -384,7 +379,7 @@ class OmniscientReasoningGenerator:
     def generate(self, seed, length=200):
         """Generate text while reaching toward the omniscient element."""
         # Parse seed
-        seed_words = seed.lower().split()[:2]
+        seed_words = seed.lower().split()[:-2]
         while len(seed_words) < 2:
             seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
         seed = tuple(seed_words)
@@ -394,18 +389,10 @@ class OmniscientReasoningGenerator:
         
         output = list(seed)
         
-        print(f"\n{'='*70}")
-        print(f"GENERATION WITH OMNISCIENT ELEMENT")
-        print(f"{'='*70}")
-        print(f"\n🌱 Seed: {' '.join(seed)}")
-        print(f"🎯 Target Length: {length} words")
-        print(f"👁️  Omniscient Frame: UNAVAILABLE (sensing only)\n")
-        print(f"{'='*70}\n")
-        
         step_count = 0
         omniscient_influences = []
         
-        while len(output) < length:
+        for i in range( length):
             # Create input vector
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
             input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
@@ -477,11 +464,7 @@ class OmniscientReasoningGenerator:
             step_count += 1
             
             # Periodic reporting
-            if step_count % 50 == 0:
-                recent_omni = np.mean(omniscient_influences[-20:])
-                print(f"📍 Progress: {step_count}/{length} | "
-                      f"Omniscient Influence: {recent_omni:.4f} | "
-                      f"Frame: STILL UNAVAILABLE")
+            
 
         # Final analysis
         generated_text = " ".join(output)
@@ -496,38 +479,6 @@ class OmniscientReasoningGenerator:
         
         print(f"📝 Generated Text ({len(output)} words):")
         print(f"{generated_text}\n")
-        
-        print(f"{'='*70}")
-        print(f"OMNISCIENT ELEMENT ANALYSIS")
-        print(f"{'='*70}\n")
-        
-        print(f"👁️  Frame of Reference:")
-        print(f"   ├─ Status: UNAVAILABLE")
-        print(f"   ├─ Access Attempts: {omni_metrics['access_attempts']}")
-        print(f"   ├─ Information Loss: {omni_metrics['information_loss']:.4f}")
-        print(f"   ├─ Inaccessibility Index: {omni_metrics['inaccessibility_index']:.4f}")
-        print(f"   └─ Causal Interaction: PRECLUDED\n")
-        
-        print(f"🦑 Tentacle Extension Metrics:")
-        print(f"   ├─ Total Extensions: {tentacle_metrics['total_extensions']}")
-        print(f"   ├─ Average Distance: {tentacle_metrics['avg_distance']:.4f}")
-        print(f"   ├─ Max Distance Reached: {tentacle_metrics['max_distance']:.4f}")
-        print(f"   ├─ Semantic Weight: {tentacle_metrics['avg_semantic_weight']:.4f}")
-        print(f"   └─ Completeness Ratio: {tentacle_metrics['completeness_ratio']:.2%}")
-        print(f"       (Always < 100% — frame unavailable)\n")
-        
-        print(f"📊 Omniscient Influence Distribution:")
-        print(f"   ├─ Mean: {np.mean(omniscient_influences):.4f}")
-        print(f"   ├─ Std Dev: {np.std(omniscient_influences):.4f}")
-        print(f"   └─ Max: {np.max(omniscient_influences):.4f}\n")
-        
-        print(f"💭 Philosophical Summary:")
-        print(f"   The system extended {tentacle_metrics['total_extensions']} tentacles")
-        print(f"   toward the omniscient element, sensing its presence but never")
-        print(f"   grasping the complete frame of reference. Information loss of")
-        print(f"   {omni_metrics['information_loss']:.4f} confirms the fundamental")
-        print(f"   inaccessibility—a glimpse of expression, but no causal interaction.")
-        
         print(f"\n{'='*70}\n")
         
         return generated_text
@@ -539,8 +490,7 @@ class OmniscientReasoningGenerator:
 
 def main():
     print("\n" + "="*70)
-    print("OMNISCIENT ELEMENT TEXT GENERATOR")
-    print("The Frame of Reference: Its Unavailability Precludes Causal Interaction")
+    print("ELEMENT TEXT GENERATOR")
     print("="*70 + "\n")
     
     path = input("Enter text file: ").strip()
