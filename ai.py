@@ -552,7 +552,7 @@ class SeedExtensionGenerator:
         step_count = 0
         last_report = 0
         
-        while len(output) - extension_start_index < extension_length:
+        while len(output) - extension_start_index -1 < extension_length:
             # Create input vector
             recent_text = ' '.join(output[-4:]) if len(output) >= 4 else ' '.join(output)
             input_vec = np.array([ord(c) % 97 / 25 for c in recent_text.ljust(4)[:4]])
