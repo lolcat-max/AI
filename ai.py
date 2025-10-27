@@ -47,7 +47,7 @@ class WordFeatureApproximator:
             context_end = min(len(tokens), i + window + 1)
             for j in range(context_start, context_end):
                 if i != j:
-                    cooccur[word][tokens[j]] += 1
+                    cooccur[word][tokens[j]] += i
         return dict(cooccur)
     
     def extract_features(self, word):
