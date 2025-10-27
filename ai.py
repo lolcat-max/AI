@@ -1,3 +1,4 @@
+
 import torch
 import numpy as np
 from collections import Counter, defaultdict
@@ -14,7 +15,7 @@ torch_dtype = torch.float64 if USE_FLOAT64 else torch.float32
 
 print(f"Using {device}, precision {torch_dtype}")
 
-
+context_window = 20
 # ================================================================
 # WORD FEATURE APPROXIMATOR
 # ================================================================
@@ -483,7 +484,7 @@ class ReasoningGenerator:
 
     def generate(self, seed, length=50):
         seed_words = seed.lower().split()[:2]
-        while len(seed_words) < 2:
+        while len(seed_words) < context_window:
             seed_words.append(self.tokens[len(seed_words) % len(self.tokens)])
         seed = tuple(seed_words)
         
