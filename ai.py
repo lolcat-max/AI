@@ -35,7 +35,7 @@ class WordFeatureApproximator:
         self.total_words = len(corpus_tokens)
         
         # Build co-occurrence matrix for distributional similarity
-        self.cooccurrence = self._build_cooccurrence(corpus_tokens, window=2)
+        self.cooccurrence = self._build_cooccurrence(corpus_tokens, window=20)
         
         # Cache feature vectors for performance
         self.feature_cache = {}
