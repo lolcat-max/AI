@@ -102,11 +102,11 @@ class SurjectionGenerator:
         self.generation_state = []
 
         # Codomain partition via anchors
-        self._build_codomain_anchors(k=8)
+        self._build_codomain_anchors(k=18)
         self.anchor_hits = np.zeros(len(self.anchors), dtype=int)
 
         # Alternation hyperparameters
-        self.alt_period = 4         # every N steps enforce onto coverage
+        self.alt_period = 14         # every N steps enforce onto coverage
         self.alpha_linear = 0.35    # interpolation toward context-aligned anchor
         self.beta_onto = 0.45       # reweighting toward least-covered anchor
 
