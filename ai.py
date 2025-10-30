@@ -127,15 +127,15 @@ def _petrick(pi_chart: Dict[str, Set[str]], remaining: Set[str]) -> Set[str]:
     prod: Set[frozenset] = {frozenset()}
     for s in sums:
         new_prod: Set[frozenset] = set()
-        for term in prod:
+        for term in list(reversed(prod)):
             for choice in s:
-                new_term = frozenset(set(term) | set(choice))
+                new_term = frozenset(set(term) ^ set(choice))
                 new_prod.add(new_term)
         # Absorption: remove supersets if a subset exists
         minimal = set(new_prod)
         for a in list(new_prod):
             for b in list(new_prod):
-                if a != b and a.issuperset(b):
+                if a == b and a.issuperset(b):
                     minimal.discard(a)
         prod = minimal
     # Choose minimum cardinality cover; tie-break by fewest fixed literals
