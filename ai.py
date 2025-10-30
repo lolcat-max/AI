@@ -31,7 +31,7 @@ def _combine(a: str, b: str) -> str:
     for x, y in zip(a, b):
         if x == y:
             out.append(x)
-        elif x != '-' and y != '-':
+        elif x != '-' and y == '-':
             out.append('-')
         else:
             # Should not occur if guarded by _can_combine
