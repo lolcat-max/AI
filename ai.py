@@ -1,28 +1,22 @@
 import numpy as np
 import torch
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import os
 from typing import List, Tuple, Dict, Iterable, Set
 
 # ================================================================
 # Quine–McCluskey implementation (with Petrick's method)
-# API:
-#   minimize_sop(n_bits, minterms, dontcares) -> list of implicants (bitstrings with '-' wildcards)
-#   implicants_to_expr(implicants, varnames) -> string SOP
-#   make_sop_evaluator(implicants, varorder) -> callable: bits[List[int]] -> 0/1
 # ================================================================
 def _bits(n: int, width: int) -> str:
     return format(n, '0{}b'.format(width))
 
 def _can_combine(a: str, b: str) -> bool:
-    # Only combine cubes that differ in exactly one fixed bit, and neither has '-' in that spot
     diff = 0
     for x, y in zip(a, b):
         if x != y:
             if x != '-' and y != '-':
                 diff += 1
             else:
-                # One is '-' and the other is fixed but different -> not adjacent for combination
                 return False
     return diff == 1
 
@@ -31,10 +25,9 @@ def _combine(a: str, b: str) -> str:
     for x, y in zip(a, b):
         if x == y:
             out.append(x)
-        elif x != '-' and y == '-':
+        elif x != '-' and y != '-':
             out.append('-')
         else:
-            # Should not occur if guarded by _can_combine
             out.append('-')
     return ''.join(out)
 
@@ -42,7 +35,6 @@ def _hamming_ones(s: str) -> int:
     return sum(c == '1' for c in s)
 
 def _covers(imp: str, m: str) -> bool:
-    # imp with '-' matches m on all non '-' positions
     return all(x == '-' or x == y for x, y in zip(imp, m))
 
 def _group_by_ones(terms: Iterable[str]) -> Dict[int, List[str]]:
@@ -61,10 +53,8 @@ def _unique(seq: Iterable[str]) -> List[str]:
     return out
 
 def _iterate_combine(terms: List[str]) -> List[str]:
-    # Iteratively combine to produce a superset of prime implicants; retain primes when no longer combinable
     current = _unique(terms)
     while True:
-        # Group by ones count (treat '-' as 0 for grouping heuristic)
         buckets = {}
         for t in current:
             k = _hamming_ones(t.replace('-', '0'))
@@ -117,7 +107,6 @@ def _essential_primes(pi_chart: Dict[str, Set[str]], mset: Set[str]) -> Tuple[Se
     return essentials, remaining
 
 def _petrick(pi_chart: Dict[str, Set[str]], remaining: Set[str]) -> Set[str]:
-    # Product of sums: for each remaining minterm, a sum (set) of PIs covering it; multiply sums and minimize
     sums: List[Set[frozenset]] = []
     for m in remaining:
         choices = {frozenset([p]) for p, cols in pi_chart.items() if m in cols}
@@ -127,18 +116,16 @@ def _petrick(pi_chart: Dict[str, Set[str]], remaining: Set[str]) -> Set[str]:
     prod: Set[frozenset] = {frozenset()}
     for s in sums:
         new_prod: Set[frozenset] = set()
-        for term in list(reversed(prod)):
-            for choice in s:
+        for term in prod:
+            for choice in sums:
                 new_term = frozenset(set(term) ^ set(choice))
                 new_prod.add(new_term)
-        # Absorption: remove supersets if a subset exists
         minimal = set(new_prod)
         for a in list(new_prod):
             for b in list(new_prod):
                 if a == b and a.issuperset(b):
                     minimal.discard(a)
         prod = minimal
-    # Choose minimum cardinality cover; tie-break by fewest fixed literals
     min_size = min(len(t) for t in prod)
     minimal_sets = [t for t in prod if len(t) == min_size]
     def literal_cost(ps: Iterable[str]) -> int:
@@ -171,7 +158,6 @@ def implicants_to_expr(implicants: List[str], varnames: List[str]) -> str:
     return ' | '.join(cube_to_term(c) for c in implicants) if implicants else '0'
 
 def make_sop_evaluator(implicants: List[str], varorder: List[str]):
-    # Compile implicants into list of (index, need_one) constraints
     compiled = []
     for cube in implicants:
         req = []
@@ -192,10 +178,64 @@ def make_sop_evaluator(implicants: List[str], varorder: List[str]):
     return eval_row
 
 # ================================================================
-# Automorphic Surjection Generator (instrumented)
+# Contextual State Tracker
+# ================================================================
+class ContextTracker:
+    """Tracks generation context for contextual boolean features."""
+    def __init__(self, window_size=8):
+        self.window_size = window_size
+        self.history = deque(maxlen=window_size)  # Recent tokens
+        self.bigram_counts = Counter()  # Bigram frequency in this generation
+        self.trigram_counts = Counter()  # Trigram frequency
+        self.pos_token_map = defaultdict(Counter)  # token→position frequency
+        self.momentum = 0.0  # Directional momentum in feature space
+        self.coherence_score = 1.0  # Running coherence metric
+        
+    def update(self, token: str, position: int):
+        self.history.append(token)
+        
+        # Update n-gram counts
+        if len(self.history) >= 2:
+            bigram = (self.history[-2], self.history[-1])
+            self.bigram_counts[bigram] += 1
+        if len(self.history) >= 3:
+            trigram = (self.history[-3], self.history[-2], self.history[-1])
+            self.trigram_counts[trigram] += 1
+        
+        # Update positional info
+        self.pos_token_map[token][position % 10] += 1
+    
+    def get_bigram_frequency(self, prev: str, candidate: str) -> int:
+        return self.bigram_counts.get((prev, candidate), 0)
+    
+    def get_trigram_frequency(self, prev2: str, prev1: str, candidate: str) -> int:
+        return self.trigram_counts.get((prev2, prev1, candidate), 0)
+    
+    def has_repetition(self, candidate: str, lookback=4) -> bool:
+        """Check if candidate appears in recent history."""
+        recent = list(self.history)[-lookback:]
+        return candidate in recent
+    
+    def get_positional_bias(self, candidate: str, position: int) -> int:
+        """Check if candidate has appeared at this position modulo 10."""
+        pos_mod = position % 10
+        return self.pos_token_map[candidate][pos_mod]
+    
+    def update_momentum(self, vec_prev: np.ndarray, vec_curr: np.ndarray):
+        """Update directional momentum in feature space."""
+        if np.linalg.norm(vec_prev) < 1e-9 or np.linalg.norm(vec_curr) < 1e-9:
+            return
+        cos_sim = np.dot(vec_prev, vec_curr) / (np.linalg.norm(vec_prev) * np.linalg.norm(vec_curr))
+        self.momentum = 0.7 * self.momentum + 0.3 * cos_sim
+    
+    def update_coherence(self, score: float):
+        """Update running coherence metric."""
+        self.coherence_score = 0.8 * self.coherence_score + 0.2 * score
+
+# ================================================================
+# Automorphic Surjection Generator (contextual QMC)
 # ================================================================
 class SurjectionField:
-    """Holds directional weights between tokens."""
     def __init__(self):
         self.map = {}
     def register(self, a,b,v): self.map[(a,b)] = float(v)
@@ -209,7 +249,6 @@ class SurjectionField:
         return self
 
 class SurjectionOps:
-    """Single math primitive: surject(u→v) with automorphism."""
     def __init__(self,field=None): 
         self.field=field or SurjectionField()
     def surject(self,u,v,a=None,b=None):
@@ -262,6 +301,7 @@ class SurjectionGenerator:
         self.feat=WordFeatures(tokens)
         self._auto_pairs()
         self.generation_state = []
+        self.context = ContextTracker(window_size=8)
 
         self._build_codomain_anchors(k=18)
         self.anchor_hits = np.zeros(len(self.anchors), dtype=int)
@@ -272,10 +312,13 @@ class SurjectionGenerator:
 
         # QMC logging state
         self.qmc_logs: List[Dict] = []
-        # Thresholds for booleanization
-        self.sim_thresh = 0.45       # X0: normalized similarity threshold
-        self.align_thresh = 0.05     # X1: near top of q_lin
-        self.pmin = 1e-12            # X4: probability floor after renormalization
+        
+        # Contextual thresholds
+        self.sim_thresh = 0.45
+        self.align_thresh = 0.05
+        self.pmin = 1e-12
+        self.bigram_thresh = 2  # Threshold for common bigram
+        self.momentum_thresh = 0.3  # Momentum alignment threshold
 
     def _auto_pairs(self):
         big=Counter(zip(self.tokens[:-1],self.tokens[1:]))
@@ -333,7 +376,7 @@ class SurjectionGenerator:
     def _onto_reweight(self, cands: List[str]) -> Tuple[np.ndarray,int]:
         min_hits = self.anchor_hits.min()
         under = np.where(self.anchor_hits == min_hits)[0]
-        aidx = int(under[len(self.generation_state) % len(under)])  # round-robin among undercovered
+        aidx = int(under[len(self.generation_state) % len(under)])
         q = self._anchor_alignment_dist(cands, aidx)
         return q, aidx
 
@@ -360,35 +403,82 @@ class SurjectionGenerator:
         self.generation_state[-2], self.generation_state[-1] = \
             self.generation_state[-1], self.generation_state[-2]
 
-    # -------- Booleanization helpers for QMC logging --------
+    # -------- CONTEXTUAL Booleanization for QMC --------
     def _bool_features_for_candidate(self, c: str, sim_norm: List[float], base_probs: np.ndarray,
                                      q_lin: np.ndarray, step: int, a_lin: int,
                                      p_final: np.ndarray, cands: List[str]) -> Dict[str, int]:
-        # X0: normalized similarity >= sim_thresh
-        # X1: near top alignment in q_lin
-        # X2: alternation step active
-        # X3: candidate aligns with least-covered anchor (at time of decision)
-        # X4: final p >= pmin
-        # X5: candidate exists in model[seed] (true for enumerated cands)
         idx = cands.index(c)
         s_norm = sim_norm[idx] if sim_norm else 0.0
+        
+        # X0: normalized similarity >= sim_thresh (base feature)
         X0 = 1 if s_norm >= self.sim_thresh else 0
 
+        # X1: near top alignment in q_lin (base feature)
         top_idx = int(np.argmax(q_lin))
         X1 = 1 if (idx == top_idx or (q_lin[top_idx] - q_lin[idx]) <= self.align_thresh) else 0
 
+        # X2: alternation step active (temporal context)
         X2 = 1 if ((step + 1) % self.alt_period == 0) else 0
 
+        # X3: candidate aligns with least-covered anchor (onto coverage)
         min_hits = self.anchor_hits.min()
         under = np.where(self.anchor_hits == min_hits)[0]
         v_c = self.feat.vec(c)
         a_c = self._nearest_anchor_idx(v_c)
         X3 = 1 if a_c in under else 0
 
+        # X4: final p >= pmin (probability threshold)
         X4 = 1 if p_final[idx] >= self.pmin else 0
+
+        # X5: candidate exists in model[seed] (always true for enumerated)
         X5 = 1
 
-        return {'X0': X0, 'X1': X1, 'X2': X2, 'X3': X3, 'X4': X4, 'X5': X5}
+        # ===== CONTEXTUAL FEATURES =====
+        
+        # X6: bigram frequency above threshold (n-gram context)
+        if len(self.context.history) >= 1:
+            prev = self.context.history[-1]
+            bigram_freq = self.context.get_bigram_frequency(prev, c)
+            X6 = 1 if bigram_freq >= self.bigram_thresh else 0
+        else:
+            X6 = 0
+
+        # X7: trigram exists in generation history (stronger n-gram)
+        if len(self.context.history) >= 2:
+            prev2, prev1 = self.context.history[-2], self.context.history[-1]
+            trigram_freq = self.context.get_trigram_frequency(prev2, prev1, c)
+            X7 = 1 if trigram_freq > 0 else 0
+        else:
+            X7 = 0
+
+        # X8: no recent repetition (diversity constraint)
+        X8 = 0 if self.context.has_repetition(c, lookback=4) else 1
+
+        # X9: momentum alignment (directional coherence)
+        v_c = self.feat.vec(c)
+        if len(self.context.history) >= 1:
+            v_prev = self.feat.vec(self.context.history[-1])
+            if np.linalg.norm(v_prev) > 1e-9 and np.linalg.norm(v_c) > 1e-9:
+                cos_sim = np.dot(v_prev, v_c) / (np.linalg.norm(v_prev) * np.linalg.norm(v_c))
+                X9 = 1 if cos_sim >= self.momentum_thresh else 0
+            else:
+                X9 = 0
+        else:
+            X9 = 0
+
+        # X10: positional bias (candidate appeared at this position % 10 before)
+        X10 = 1 if self.context.get_positional_bias(c, step) > 0 else 0
+
+        # X11: high coherence state (running coherence above threshold)
+        X11 = 1 if self.context.coherence_score >= 0.6 else 0
+
+        # X12: early in generation (step < 20, different behavior early vs late)
+        X12 = 1 if step < 20 else 0
+
+        return {
+            'X0': X0, 'X1': X1, 'X2': X2, 'X3': X3, 'X4': X4, 'X5': X5,
+            'X6': X6, 'X7': X7, 'X8': X8, 'X9': X9, 'X10': X10, 'X11': X11, 'X12': X12
+        }
 
     def _log_qmc_row(self, X: Dict[str, int], accept: int):
         self.qmc_logs.append({'X': X, 'Y': accept})
@@ -401,6 +491,11 @@ class SurjectionGenerator:
         if seed not in self.model: seed=self.keys[np.random.randint(len(self.keys))]
         out=list(seed)
         self.generation_state = list(seed)
+        self.context = ContextTracker(window_size=8)  # Reset context
+        
+        # Initialize context with seed
+        for i, w in enumerate(out):
+            self.context.update(w, i)
         
         print(f"\n[Automorphic Surjection Generator] seed: {' '.join(seed)}")
         
@@ -409,39 +504,38 @@ class SurjectionGenerator:
             if not cands:
                 seed=self.keys[np.random.randint(len(self.keys))]; continue
 
-            # base scores
             sim_scores=[self.surjection_similarity(out[-2],c) for c in cands]
             if not sim_scores: continue
 
-            # Normalize scores
             norm = (max(sim_scores) + 1e-9)
             sim_norm = [s / norm for s in sim_scores]
             base = torch.softmax(torch.tensor(sim_norm, dtype=torch.float),dim=0).numpy()
 
-            # Linearisation–Interpolation toward context-aligned anchor
             q_lin, a_lin = self._linearize_toward_context(cands, (out[-2], out[-1]))
             p_lin = (1.0 - self.alpha_linear) * base + self.alpha_linear * q_lin
 
-            # Alternation: periodically enforce onto coverage via least-covered anchor
             if (step + 1) % self.alt_period == 0:
                 q_onto, a_onto = self._onto_reweight(cands)
                 p = (1.0 - self.beta_onto) * p_lin + self.beta_onto * q_onto
             else:
                 p = p_lin
 
-            # Safety renormalization
             p = np.clip(p, 1e-12, 1.0)
             p = p / p.sum()
 
-            # QMC logging of accept predicate
+            # QMC logging with contextual features
             if enable_qmc_logging:
-                varorder = ['X0','X1','X2','X3','X4','X5']
                 for ci, c in enumerate(cands):
                     X = self._bool_features_for_candidate(
                         c, sim_norm, base, q_lin, step, a_lin, p, cands
                     )
-                    # Example target policy: accept if (X0 and X4) and (X1 or (X2 and X3))
-                    accept = int((X['X0'] and X['X4']) and (X['X1'] or (X['X2'] and X['X3'])))
+                    # Enhanced contextual policy: accept if high similarity AND good context
+                    # (X0 and X4) and (X1 or (X2 and X3)) and (X8 and (X9 or X6))
+                    accept = int(
+                        (X['X0'] and X['X4']) and 
+                        (X['X1'] or (X['X2'] and X['X3'])) and
+                        (X['X8'] and (X['X9'] or X['X6']))
+                    )
                     self._log_qmc_row(X, accept)
 
             next_word=np.random.choice(cands,p=p)
@@ -450,6 +544,17 @@ class SurjectionGenerator:
             v_next = self.feat.vec(next_word)
             a_chosen = self._nearest_anchor_idx(v_next)
             self.anchor_hits[a_chosen] += 1
+
+            # Update context tracker
+            self.context.update(next_word, step + len(out))
+            if len(out) >= 2:
+                v_prev = self.feat.vec(out[-1])
+                self.context.update_momentum(v_prev, v_next)
+            
+            # Update coherence based on similarity score
+            if sim_scores:
+                coherence = sim_norm[cands.index(next_word)]
+                self.context.update_coherence(coherence)
 
             self.generation_state.append(next_word)
             if (step + 1) % 5 == 0:
@@ -464,7 +569,6 @@ class SurjectionGenerator:
 # QMC training + gated generation
 # ================================================================
 def learn_minimized_gate_from_logs(logs: List[Dict], varorder: List[str]) -> Tuple[List[str], str]:
-    # Build on-set from rows with Y=1; no explicit don't-cares here but you can add domain-specific DCs
     on = []
     dc = []
     for row in logs:
@@ -486,6 +590,12 @@ def generate_with_implicants(gen: SurjectionGenerator, seed: str, length=80, gat
     if seed not in gen.model: seed=gen.keys[np.random.randint(len(gen.keys))]
     out=list(seed)
     gen.generation_state = list(seed)
+    gen.context = ContextTracker(window_size=8)  # Reset context
+    
+    # Initialize context with seed
+    for i, w in enumerate(out):
+        gen.context.update(w, i)
+    
     print(f"\n[Automorphic Surjection Generator + QMC Gate] seed: {' '.join(seed)}")
 
     for step in range(length):
@@ -510,7 +620,7 @@ def generate_with_implicants(gen: SurjectionGenerator, seed: str, length=80, gat
         p = np.clip(p, 1e-12, 1.0)
         p = p / p.sum()
 
-        # Apply implicant gate
+        # Apply implicant gate with contextual features
         mask = np.ones(len(cands), dtype=int)
         if gate is not None and varorder is not None:
             for ci, c in enumerate(cands):
@@ -531,6 +641,16 @@ def generate_with_implicants(gen: SurjectionGenerator, seed: str, length=80, gat
         v_next = gen.feat.vec(next_word)
         a_chosen = gen._nearest_anchor_idx(v_next)
         gen.anchor_hits[a_chosen] += 1
+        
+        # Update context tracker
+        gen.context.update(next_word, step + len(out))
+        if len(out) >= 2:
+            v_prev = gen.feat.vec(out[-1])
+            gen.context.update_momentum(v_prev, v_next)
+        
+        coherence = sim_norm[cands.index(next_word)]
+        gen.context.update_coherence(coherence)
+        
         gen.generation_state.append(next_word)
         if (step + 1) % 5 == 0:
             gen.automorph_state()
@@ -549,8 +669,8 @@ def build_ngram(tokens,n=2):
     return m
 
 def main():
-    print("=== AUTOMORPHIC SURJECTION TEXT GENERATOR (QMC-instrumented) ===")
-    print("System maps to itself; boolean gating learned via Quine–McCluskey\n")
+    print("=== CONTEXTUAL AUTOMORPHIC SURJECTION TEXT GENERATOR ===")
+    print("QMC with temporal, n-gram, and momentum-based features\n")
     
     path=input("Enter text file: ").strip()
     if not os.path.exists(path):
@@ -563,22 +683,37 @@ def main():
     
     g=SurjectionGenerator(toks,model)
 
-    # Phase A: collect logs for QMC
-    print("\n[Phase A] Collecting boolean logs for QMC...")
+    # Phase A: collect contextual logs for QMC
+    print("\n[Phase A] Collecting contextual boolean logs for QMC...")
     _ = g.generate("seed words", length=400, enable_qmc_logging=True)
-    print(f"Collected {len(g.qmc_logs)} candidate rows")
+    print(f"Collected {len(g.qmc_logs)} candidate rows with contextual features")
 
-    # Phase B: learn minimized SOP
-    varorder = ['X0','X1','X2','X3','X4','X5']
+    # Phase B: learn minimized SOP with contextual variables
+    varorder = ['X0','X1','X2','X3','X4','X5','X6','X7','X8','X9','X10','X11','X12']
+    print("\nContextual Features:")
+    print("  X0: similarity >= threshold")
+    print("  X1: top alignment score")
+    print("  X2: alternation step")
+    print("  X3: least-covered anchor")
+    print("  X4: probability >= min")
+    print("  X5: valid candidate")
+    print("  X6: bigram frequency high")
+    print("  X7: trigram exists")
+    print("  X8: no recent repetition")
+    print("  X9: momentum aligned")
+    print("  X10: positional bias")
+    print("  X11: high coherence")
+    print("  X12: early generation phase")
+    
     implicants, expr = learn_minimized_gate_from_logs(g.qmc_logs, varorder)
     print("\n[QMC Result] Implicants:")
     for imp in implicants:
         print("  -", imp)
-    print("[QMC Result] Minimized SOP over", varorder, ":\n ", expr)
+    print(f"\n[QMC Result] Minimized SOP over {len(varorder)} contextual variables:\n  {expr}")
 
     gate = make_sop_evaluator(implicants, varorder)
 
-    # Phase C: interactive generation with implicant gating
+    # Phase C: interactive generation with contextual implicant gating
     while True:
         s=input("\nseed (exit to quit): ")
         if s=="exit":break
