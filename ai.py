@@ -683,40 +683,27 @@ def main():
     
     g=SurjectionGenerator(toks,model)
 
-    # Phase A: collect contextual logs for QMC
-    print("\n[Phase A] Collecting contextual boolean logs for QMC...")
-    _ = g.generate("seed words", length=400, enable_qmc_logging=True)
-    print(f"Collected {len(g.qmc_logs)} candidate rows with contextual features")
-
-    # Phase B: learn minimized SOP with contextual variables
-    varorder = ['X0','X1','X2','X3','X4','X5','X6','X7','X8','X9','X10','X11','X12']
-    print("\nContextual Features:")
-    print("  X0: similarity >= threshold")
-    print("  X1: top alignment score")
-    print("  X2: alternation step")
-    print("  X3: least-covered anchor")
-    print("  X4: probability >= min")
-    print("  X5: valid candidate")
-    print("  X6: bigram frequency high")
-    print("  X7: trigram exists")
-    print("  X8: no recent repetition")
-    print("  X9: momentum aligned")
-    print("  X10: positional bias")
-    print("  X11: high coherence")
-    print("  X12: early generation phase")
     
-    implicants, expr = learn_minimized_gate_from_logs(g.qmc_logs, varorder)
-    print("\n[QMC Result] Implicants:")
-    for imp in implicants:
-        print("  -", imp)
-    print(f"\n[QMC Result] Minimized SOP over {len(varorder)} contextual variables:\n  {expr}")
-
-    gate = make_sop_evaluator(implicants, varorder)
-
     # Phase C: interactive generation with contextual implicant gating
     while True:
         s=input("\nseed (exit to quit): ")
         if s=="exit":break
+        # Phase A: collect contextual logs for QMC
+        print("\n[Phase A] Collecting contextual boolean logs for QMC...")
+        _ = g.generate(s, length=400, enable_qmc_logging=True)
+        print(f"Collected {len(g.qmc_logs)} candidate rows with contextual features")
+
+        # Phase B: learn minimized SOP with contextual variables
+        varorder = ['X0','X1','X2','X3','X4','X5','X6','X7','X8','X9','X10','X11','X12']
+        
+        implicants, expr = learn_minimized_gate_from_logs(g.qmc_logs, varorder)
+        print("\n[QMC Result] Implicants:")
+        for imp in implicants:
+            print("  -", imp)
+        print(f"\n[QMC Result] Minimized SOP over {len(varorder)} contextual variables:\n  {expr}")
+
+        gate = make_sop_evaluator(implicants, varorder)
+
         print("\n"+generate_with_implicants(g, s, length=620, gate=gate, varorder=varorder))
 
 if __name__=="__main__":
