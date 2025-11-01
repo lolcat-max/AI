@@ -117,13 +117,13 @@ def _petrick(pi_chart: Dict[str, Set[str]], remaining: Set[str]) -> Set[str]:
     for s in sums:
         new_prod: Set[frozenset] = set()
         for term in prod:
-            for choice in sums:
-                new_term = frozenset(set(term) ^ set(choice))
+            for choice in s:
+                new_term = frozenset(set(term) | set(choice))
                 new_prod.add(new_term)
         minimal = set(new_prod)
         for a in list(new_prod):
             for b in list(new_prod):
-                if a == b and a.issuperset(b):
+                if a != b and a.issuperset(b):
                     minimal.discard(a)
         prod = minimal
     min_size = min(len(t) for t in prod)
@@ -181,55 +181,46 @@ def make_sop_evaluator(implicants: List[str], varorder: List[str]):
 # Contextual State Tracker
 # ================================================================
 class ContextTracker:
-    """Tracks generation context for contextual boolean features."""
     def __init__(self, window_size=8):
         self.window_size = window_size
-        self.history = deque(maxlen=window_size)  # Recent tokens
-        self.bigram_counts = Counter()  # Bigram frequency in this generation
-        self.trigram_counts = Counter()  # Trigram frequency
-        self.pos_token_map = defaultdict(Counter)  # token→position frequency
-        self.momentum = 0.0  # Directional momentum in feature space
-        self.coherence_score = 1.0  # Running coherence metric
-        
+        self.history = deque(maxlen=window_size)  
+        self.bigram_counts = Counter()  
+        self.trigram_counts = Counter()  
+        self.pos_token_map = defaultdict(Counter) 
+        self.momentum = 0.0  
+        self.coherence_score = 1.0  
+
     def update(self, token: str, position: int):
         self.history.append(token)
-        
-        # Update n-gram counts
         if len(self.history) >= 2:
             bigram = (self.history[-2], self.history[-1])
             self.bigram_counts[bigram] += 1
         if len(self.history) >= 3:
             trigram = (self.history[-3], self.history[-2], self.history[-1])
             self.trigram_counts[trigram] += 1
-        
-        # Update positional info
         self.pos_token_map[token][position % 10] += 1
-    
+
     def get_bigram_frequency(self, prev: str, candidate: str) -> int:
         return self.bigram_counts.get((prev, candidate), 0)
-    
+
     def get_trigram_frequency(self, prev2: str, prev1: str, candidate: str) -> int:
         return self.trigram_counts.get((prev2, prev1, candidate), 0)
-    
+
     def has_repetition(self, candidate: str, lookback=4) -> bool:
-        """Check if candidate appears in recent history."""
         recent = list(self.history)[-lookback:]
         return candidate in recent
-    
+
     def get_positional_bias(self, candidate: str, position: int) -> int:
-        """Check if candidate has appeared at this position modulo 10."""
         pos_mod = position % 10
         return self.pos_token_map[candidate][pos_mod]
-    
+
     def update_momentum(self, vec_prev: np.ndarray, vec_curr: np.ndarray):
-        """Update directional momentum in feature space."""
         if np.linalg.norm(vec_prev) < 1e-9 or np.linalg.norm(vec_curr) < 1e-9:
             return
         cos_sim = np.dot(vec_prev, vec_curr) / (np.linalg.norm(vec_prev) * np.linalg.norm(vec_curr))
         self.momentum = 0.7 * self.momentum + 0.3 * cos_sim
-    
+
     def update_coherence(self, score: float):
-        """Update running coherence metric."""
         self.coherence_score = 0.8 * self.coherence_score + 0.2 * score
 
 # ================================================================
@@ -317,8 +308,8 @@ class SurjectionGenerator:
         self.sim_thresh = 0.45
         self.align_thresh = 0.05
         self.pmin = 1e-12
-        self.bigram_thresh = 2  # Threshold for common bigram
-        self.momentum_thresh = 0.3  # Momentum alignment threshold
+        self.bigram_thresh = 2
+        self.momentum_thresh = 0.3
 
     def _auto_pairs(self):
         big=Counter(zip(self.tokens[:-1],self.tokens[1:]))
@@ -409,70 +400,59 @@ class SurjectionGenerator:
                                      p_final: np.ndarray, cands: List[str]) -> Dict[str, int]:
         idx = cands.index(c)
         s_norm = sim_norm[idx] if sim_norm else 0.0
-        
-        # X0: normalized similarity >= sim_thresh (base feature)
-        X0 = 1 if s_norm >= self.sim_thresh else 0
 
-        # X1: near top alignment in q_lin (base feature)
-        top_idx = int(np.argmax(q_lin))
-        X1 = 1 if (idx == top_idx or (q_lin[top_idx] - q_lin[idx]) <= self.align_thresh) else 0
+        # ---- THOUGHT SIGNATURES ----
+        # X0: "Conceptual resonance" of candidate with current context (semantic coherence)
+        v_c = self.feat.vec(c)
+        if len(self.context.history) >= 2:
+            v_ctx1 = self.feat.vec(self.context.history[-1])
+            v_ctx2 = self.feat.vec(self.context.history[-2])
+            v_mean = (v_ctx1 + v_ctx2) / 2.0
+            cos_res = np.dot(v_mean, v_c) / (np.linalg.norm(v_mean)*np.linalg.norm(v_c) + 1e-9)
+        else:
+            cos_res = s_norm
+        coherence_factor = self.context.coherence_score
+        momentum_factor = abs(self.context.momentum)
+        thought_signature = 0.4 * cos_res + 0.3 * coherence_factor + 0.3 * momentum_factor
+        X0 = 1 if thought_signature >= 0.55 else 0  # conceptual resonance threshold
 
-        # X2: alternation step active (temporal context)
+        # X1: "Intent alignment" — candidate matches structural flow and anchor theme distribution
+        aidx_ctx = self._nearest_anchor_idx(self.feat.vec(self.context.history[-1])) if len(self.context.history)>=1 else 0
+        aidx_cand = self._nearest_anchor_idx(v_c)
+        semantic_anchor_align = 1.0 - abs(aidx_cand - aidx_ctx) / max(1, len(self.anchors))
+        temporal_factor = np.sin((step % self.alt_period) / self.alt_period * np.pi)
+        alignment_signature = 0.6 * semantic_anchor_align + 0.4 * temporal_factor
+        X1 = 1 if alignment_signature >= 0.5 else 0
+
+        # ---- BASE CONTEXTUALS (unchanged) ----
         X2 = 1 if ((step + 1) % self.alt_period == 0) else 0
-
-        # X3: candidate aligns with least-covered anchor (onto coverage)
         min_hits = self.anchor_hits.min()
         under = np.where(self.anchor_hits == min_hits)[0]
-        v_c = self.feat.vec(c)
         a_c = self._nearest_anchor_idx(v_c)
         X3 = 1 if a_c in under else 0
-
-        # X4: final p >= pmin (probability threshold)
         X4 = 1 if p_final[idx] >= self.pmin else 0
-
-        # X5: candidate exists in model[seed] (always true for enumerated)
         X5 = 1
-
-        # ===== CONTEXTUAL FEATURES =====
-        
-        # X6: bigram frequency above threshold (n-gram context)
         if len(self.context.history) >= 1:
             prev = self.context.history[-1]
             bigram_freq = self.context.get_bigram_frequency(prev, c)
             X6 = 1 if bigram_freq >= self.bigram_thresh else 0
         else:
             X6 = 0
-
-        # X7: trigram exists in generation history (stronger n-gram)
         if len(self.context.history) >= 2:
             prev2, prev1 = self.context.history[-2], self.context.history[-1]
             trigram_freq = self.context.get_trigram_frequency(prev2, prev1, c)
             X7 = 1 if trigram_freq > 0 else 0
         else:
             X7 = 0
-
-        # X8: no recent repetition (diversity constraint)
         X8 = 0 if self.context.has_repetition(c, lookback=4) else 1
-
-        # X9: momentum alignment (directional coherence)
-        v_c = self.feat.vec(c)
         if len(self.context.history) >= 1:
             v_prev = self.feat.vec(self.context.history[-1])
-            if np.linalg.norm(v_prev) > 1e-9 and np.linalg.norm(v_c) > 1e-9:
-                cos_sim = np.dot(v_prev, v_c) / (np.linalg.norm(v_prev) * np.linalg.norm(v_c))
-                X9 = 1 if cos_sim >= self.momentum_thresh else 0
-            else:
-                X9 = 0
+            cos_sim = np.dot(v_prev, v_c) / (np.linalg.norm(v_prev) * np.linalg.norm(v_c) + 1e-9)
+            X9 = 1 if cos_sim >= self.momentum_thresh else 0
         else:
             X9 = 0
-
-        # X10: positional bias (candidate appeared at this position % 10 before)
         X10 = 1 if self.context.get_positional_bias(c, step) > 0 else 0
-
-        # X11: high coherence state (running coherence above threshold)
         X11 = 1 if self.context.coherence_score >= 0.6 else 0
-
-        # X12: early in generation (step < 20, different behavior early vs late)
         X12 = 1 if step < 20 else 0
 
         return {
@@ -492,13 +472,12 @@ class SurjectionGenerator:
         out=list(seed)
         self.generation_state = list(seed)
         self.context = ContextTracker(window_size=8)  # Reset context
-        
-        # Initialize context with seed
+
         for i, w in enumerate(out):
             self.context.update(w, i)
-        
+
         print(f"\n[Automorphic Surjection Generator] seed: {' '.join(seed)}")
-        
+
         for step in range(length):
             cands=self.model.get(seed,[])
             if not cands:
@@ -529,8 +508,6 @@ class SurjectionGenerator:
                     X = self._bool_features_for_candidate(
                         c, sim_norm, base, q_lin, step, a_lin, p, cands
                     )
-                    # Enhanced contextual policy: accept if high similarity AND good context
-                    # (X0 and X4) and (X1 or (X2 and X3)) and (X8 and (X9 or X6))
                     accept = int(
                         (X['X0'] and X['X4']) and 
                         (X['X1'] or (X['X2'] and X['X3'])) and
@@ -540,18 +517,15 @@ class SurjectionGenerator:
 
             next_word=np.random.choice(cands,p=p)
 
-            # Update coverage
             v_next = self.feat.vec(next_word)
             a_chosen = self._nearest_anchor_idx(v_next)
             self.anchor_hits[a_chosen] += 1
 
-            # Update context tracker
             self.context.update(next_word, step + len(out))
             if len(out) >= 2:
                 v_prev = self.feat.vec(out[-1])
                 self.context.update_momentum(v_prev, v_next)
-            
-            # Update coherence based on similarity score
+
             if sim_scores:
                 coherence = sim_norm[cands.index(next_word)]
                 self.context.update_coherence(coherence)
@@ -562,7 +536,6 @@ class SurjectionGenerator:
 
             out.append(next_word)
             seed=tuple(out[-2:])
-        
         return " ".join(out)
 
 # ================================================================
@@ -592,7 +565,6 @@ def generate_with_implicants(gen: SurjectionGenerator, seed: str, length=80, gat
     gen.generation_state = list(seed)
     gen.context = ContextTracker(window_size=8)  # Reset context
     
-    # Initialize context with seed
     for i, w in enumerate(out):
         gen.context.update(w, i)
     
@@ -620,7 +592,6 @@ def generate_with_implicants(gen: SurjectionGenerator, seed: str, length=80, gat
         p = np.clip(p, 1e-12, 1.0)
         p = p / p.sum()
 
-        # Apply implicant gate with contextual features
         mask = np.ones(len(cands), dtype=int)
         if gate is not None and varorder is not None:
             for ci, c in enumerate(cands):
@@ -633,16 +604,15 @@ def generate_with_implicants(gen: SurjectionGenerator, seed: str, length=80, gat
         if mask.sum() == 0:
             mask[np.argmax(p)] = 1
 
-        p_masked = p * mask
+        p_masked = p + mask
         p_masked = p_masked / p_masked.sum()
 
         next_word=np.random.choice(cands,p=p_masked)
 
         v_next = gen.feat.vec(next_word)
         a_chosen = gen._nearest_anchor_idx(v_next)
-        gen.anchor_hits[a_chosen] += 1
+        gen.anchor_hits[a_chosen] += mask.sum()
         
-        # Update context tracker
         gen.context.update(next_word, step + len(out))
         if len(out) >= 2:
             v_prev = gen.feat.vec(out[-1])
@@ -683,17 +653,13 @@ def main():
     
     g=SurjectionGenerator(toks,model)
 
-    
-    # Phase C: interactive generation with contextual implicant gating
     while True:
         s=input("\nseed (exit to quit): ")
         if s=="exit":break
-        # Phase A: collect contextual logs for QMC
         print("\n[Phase A] Collecting contextual boolean logs for QMC...")
         _ = g.generate(s, length=400, enable_qmc_logging=True)
         print(f"Collected {len(g.qmc_logs)} candidate rows with contextual features")
 
-        # Phase B: learn minimized SOP with contextual variables
         varorder = ['X0','X1','X2','X3','X4','X5','X6','X7','X8','X9','X10','X11','X12']
         
         implicants, expr = learn_minimized_gate_from_logs(g.qmc_logs, varorder)
