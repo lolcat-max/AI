@@ -276,7 +276,7 @@ class SurjectionGenerator:
             
             v_next = self.feat.vec(next_word)
             aidx_chosen = self._nearest_anchor_idx(v_next)
-            self.anchor_hits[aidx_chosen] += 1
+            self.anchor_hits[aidx_chosen] += step
             self.context.update(next_word, step + len(out))
             
             if len(out) >= 2:
