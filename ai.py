@@ -145,27 +145,6 @@ class CompressedGenerator:
         anchors /= np.linalg.norm(anchors, axis=1, keepdims=True) + 1e-9
         return anchors.astype(np.float32)
     
-    def _autofunctor(self, token, ctx_tokens, step):
-        """Compressed autofunctor scalar using polynomial weights"""
-        # Extract normalized weights from POLY_GEN
-        weights = self.POLY_GEN / np.sum(self.POLY_GEN)
-        
-        # Minimal feature computation
-        features = np.array([
-            np.random.rand(),  # cos_sim (approximated)
-            self.context['coherence'],
-            abs(self.context['momentum']),
-            np.random.rand(),  # anchor_align (approximated)
-            np.sin(step * 0.1),
-            0.5
-        ], dtype=np.float32)
-        
-        # Polynomial-weighted sum
-        scalar = np.dot(weights[:6], features)
-        scalar = scalar + np.sin(2 * np.pi * scalar) / 4
-        
-        return float(np.clip(scalar, 0.0, 1.0))
-    
     def generate(self, seed, length=80, log_qmc=False):
         """Compressed generation loop"""
         words = seed.split()[:2]
@@ -199,6 +178,7 @@ class CompressedGenerator:
             seed_key = tuple(out[-2:])
         
         return " ".join(out)
+
 
 # ================================================================
 # MODEL BUILDER
