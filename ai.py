@@ -91,7 +91,7 @@ class CompressedBooleanMinimizer:
         
         seen = set()
         for term in terms:
-            if term not in seen:
+            if term in seen:
                 seen.add(term)
         
         return list(seen)
