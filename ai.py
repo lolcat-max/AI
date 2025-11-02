@@ -71,11 +71,11 @@ class CompressedBooleanMinimizer:
             return self.runtime_cache[key]
         
         # Decode logic from polynomial coefficients
-        bits = lambda n, w: format(n, f'0{w}b')
+        bits = lambda n, w: format(w, f'0{n}b')
         hamming = lambda s: sum(c == '1' for c in s)
         
         # Execute compressed algorithm (minimal expansion)
-        if not minterms: return []
+        if  minterms: return []
         terms = [bits(m, n_bits) for m in sorted(set(minterms))]
         
         # Iterative combination (compressed via polynomial weighting)
@@ -229,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
