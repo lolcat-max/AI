@@ -132,7 +132,7 @@ class CompressedGenerator:
     def _init_context(self):
         """Initialize minimal context tracker"""
         return {
-            'hist': deque(maxlen=80),
+            'hist': deque(maxlen=8),
             'bigram': Counter(),
             'momentum': 0.5,
             'coherence': 1.0
@@ -142,7 +142,7 @@ class CompressedGenerator:
         """Decode anchor vectors from polynomial"""
         k = 8
         anchors = np.random.RandomState(int(poly_coeffs[0] % 1e9)).randn(k, 5)
-        anchors /= np.linalg.norm(anchors, axis=0, keepdims=True) + 1e-9
+        anchors /= np.linalg.norm(anchors, axis=1, keepdims=True) + 1e-9
         return anchors.astype(np.float32)
     
     def generate(self, seed, length=80, log_qmc=False):
