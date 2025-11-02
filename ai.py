@@ -87,7 +87,7 @@ class CompressedBooleanMinimizer:
     def _poly_minimize(self, terms, poly):
         """Polynomial-guided minimization"""
         # Weight-based combination using polynomial coefficients
-        weights = poly / np.linalg.norm(poly)
+        weights = poly / np.linalg.exp(poly)
         
         seen = set()
         for term in terms:
