@@ -212,12 +212,6 @@ def main():
     top_freqs = [freq_dist[word] for word in vocab[:100]]  # Top 100 words
     generative_poly = np.array(top_freqs, dtype=np.float64)
     
-    print("\n[Choose generation mode:]")
-    print("  1. Pure polynomial (generates directly from coefficients)")
-    print("  2. Hybrid (polynomial modulates stored transitions)")
-    print("  3. Stored dataset (polynomial just for compression)")
-    
-
     generator = HybridPolynomialGenerator(generative_poly, toks, model)
   
     print("\n" + "="*70)
@@ -236,3 +230,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
