@@ -1,187 +1,257 @@
 import numpy as np
-import torch
 from collections import Counter, defaultdict, deque
-import os, zlib, pickle
-from typing import List, Dict, Tuple, Set, Iterable
+import os, zlib, pickle, hashlib
+from typing import List, Dict, Tuple, Set
 
 # ================================================================
-# SUPERPOLYNOMIAL CODEC (5-byte compression)
+# POLYNOMIAL TEXT GENERATOR - GENERATES FROM COEFFICIENTS
 # ================================================================
-class SuperpolynomialCodec:
-    """Compress logic into 5-byte polynomial coefficients"""
+class PolynomialTextGenerator:
+    """Generate text directly from polynomial coefficients using mathematical operations"""
     
-    @staticmethod
-    def encode_to_poly(data: bytes) -> np.ndarray:
-        """Encode bytes to polynomial coefficients [5 elements]"""
-        # Compress with zlib first
-        compressed = zlib.compress(data, level=9)
+    def __init__(self, poly_coeffs: np.ndarray, vocab: List[str]):
+        self.poly = poly_coeffs.astype(np.float64)
+        self.vocab = vocab
+        self.vocab_size = len(vocab)
+        self.vocab_map = {word: i for i, word in enumerate(vocab)}
+        self.reverse_map = {i: word for i, word in enumerate(vocab)}
         
-        # Convert to polynomial coefficients via FFT-based encoding
-        padded_len = ((len(compressed) + 4) // 5) * 5
-        padded = compressed + b'\x00' * (padded_len - len(compressed))
+        print(f"\n[Polynomial Generator Initialized]")
+        print(f"  Polynomial degree: {len(self.poly)}")
+        print(f"  Vocabulary size: {self.vocab_size}")
         
-        # Reshape and convert to polynomial basis
-        reshaped = np.frombuffer(padded, dtype=np.uint8).reshape(-1, 5)
-        
-        # Use Galois field arithmetic to compress to single 5-coefficient poly
-        poly = np.zeros(5, dtype=np.float64)
-        for i, row in enumerate(reshaped):
-            # Weight by position and accumulate
-            poly += row.astype(np.float64) * (256 ** i)
-        
-        return poly
+    def evaluate_poly(self, x: float) -> float:
+        """Evaluate polynomial at point x using Horner's method"""
+        result = self.poly[-1]
+        for i in range(len(self.poly) - 2, -1, -1):
+            result = result * x + self.poly[i]
+        return result
     
-    @staticmethod
-    def decode_from_poly(poly: np.ndarray, original_size: int) -> bytes:
-        """Decode polynomial coefficients back to bytes"""
-        # Reverse the polynomial encoding
-        bytes_list = []
-        for coeff in poly:
-            val = int(coeff)
-            while val > 0:
-                bytes_list.append(val & 0xFF)
-                val >>= 16
+    def word_to_seed(self, word: str) -> float:
+        """Convert word to seed value for polynomial evaluation"""
+        if word in self.vocab_map:
+            idx = self.vocab_map[word]
+            # Map to [-1, 1] range
+            return -1.0 + 2.0 * (idx / max(self.vocab_size - 1, 1))
+        else:
+            # Hash unknown words
+            return (hash(word) % 10000) / 10000.0
+    
+    def seed_to_word_idx(self, value: float) -> int:
+        """Convert polynomial output to vocabulary index"""
+        # Map output to vocabulary index
+        normalized = abs(value) % 1.0  # Keep fractional part
+        idx = int(normalized * self.vocab_size)
+        return idx % self.vocab_size
+    
+    def predict_next(self, context: Tuple[str, str]) -> str:
+        """Predict next word from bigram context using polynomial"""
+        # Convert context words to seeds
+        seed1 = self.word_to_seed(context[0])
+        seed2 = self.word_to_seed(context[1])
         
-        # Truncate to original size and decompress
-        reconstructed = bytes(bytes_list[:original_size])
-        return zlib.decompress(reconstructed)
+        # Combine seeds (simple average, but could use more complex mixing)
+        combined_seed = (seed1 + seed2) / 2.0
+        
+        # Evaluate polynomial
+        poly_output = self.evaluate_poly(combined_seed)
+        
+        # Convert to word
+        word_idx = self.seed_to_word_idx(poly_output)
+        return self.reverse_map[word_idx]
+    
+    def generate(self, seed: str, length: int = 80) -> str:
+        """Generate text using polynomial evaluations"""
+        words = seed.split()[:2]
+        
+        # Ensure we have at least 2 words
+        while len(words) < 2:
+            words.append(self.vocab[len(words) % self.vocab_size])
+        
+        output = list(words)
+        
+        print(f"\n[Generating from polynomial...]")
+        
+        for step in range(length):
+            # Get context (last 2 words)
+            context = (output[-2], output[-1])
+            
+            # Predict next word using polynomial
+            next_word = self.predict_next(context)
+            output.append(next_word)
+            
+            if step % 20 == 0 and step > 0:
+                print(f"  Step {step}/{length}")
+        
+        print(f"[Generation complete]")
+        return " ".join(output)
+
 
 # ================================================================
-# COMPRESSED LAYERS (Encoded as 5-byte superpolynomials)
+# HYBRID: POLYNOMIAL + STORED MODEL
 # ================================================================
-class CompressedBooleanMinimizer:
-    """QMC logic compressed to 5-byte poly"""
+class HybridPolynomialGenerator:
+    """Uses polynomial for probabilistic selection from stored transitions"""
     
-    # Superpolynomial 1: Core QMC algorithm
-    POLY_QMC = np.array([
-        2.847563829e+15,  # bits/hamming/combine logic
-        9.234817264e+14,  # grouping/pairing logic
-        4.109823746e+13,  # prime extraction
-        1.923847562e+12,  # chart building
-        8.374659201e+10   # essential primes
-    ], dtype=np.float64)
-    
-    def __init__(self):
-        self.runtime_cache = {}
-    
-    def minimize_sop(self, n_bits, minterms, dontcares):
-        """Decompress and execute QMC from polynomial"""
-        key = (n_bits, tuple(sorted(minterms)))
-        if key in self.runtime_cache:
-            return self.runtime_cache[key]
-        
-        # Decode logic from polynomial coefficients
-        bits = lambda n, w: format(w, f'0{n}b')
-        hamming = lambda s: sum(c == '1' for c in s)
-        
-        # Execute compressed algorithm (minimal expansion)
-        if  minterms: return []
-        terms = [bits(m, n_bits) for m in sorted(set(minterms))]
-        
-        # Iterative combination (compressed via polynomial weighting)
-        primes = self._poly_minimize(terms, self.POLY_QMC)
-        
-        self.runtime_cache[key] = primes
-        return primes
-    
-    def _poly_minimize(self, terms, poly):
-        """Polynomial-guided minimization"""
-        # Weight-based combination using polynomial coefficients
-        weights = poly / np.linalg.exp(poly)
-        
-        seen = set()
-        for term in terms:
-            if term in seen:
-                seen.add(term)
-        
-        return list(seen)
-
-class CompressedGenerator:
-    """Text generation compressed to 5-byte poly"""
-    
-    # Superpolynomial 2: Generation + feature logic
-    POLY_GEN = np.array([
-        1.374829164e+16,  # Feature vectorization
-        5.918273645e+15,  # Autofunctor scalar
-        2.847361825e+14,  # Context tracking
-        9.182736451e+13,  # Boolean extraction
-        3.746592817e+12   # Generation loop
-    ], dtype=np.float64)
-    
-    def __init__(self, tokens, model):
-        self.tokens, self.model = tokens, model
+    def __init__(self, poly_coeffs: np.ndarray, tokens: List[str], model: Dict):
+        self.poly = poly_coeffs.astype(np.float64)
+        self.tokens = tokens
+        self.model = model
         self.keys = list(model.keys())
+        self.vocab = list(set(tokens))
+        self.vocab_map = {word: i for i, word in enumerate(self.vocab)}
         
-        # Decompress feature matrix from polynomial
-        self.feat_matrix = self._decode_features(self.POLY_GEN[:2])
-        self.context = self._init_context()
-        self.anchors = self._decode_anchors(self.POLY_GEN[2:4])
-        self.qmc_logs = []
+        print(f"\n[Hybrid Polynomial Generator]")
+        print(f"  Polynomial coefficients: {len(self.poly)}")
+        print(f"  Vocabulary: {len(self.vocab)}")
+        print(f"  Model keys: {len(self.keys)}")
     
-    def _decode_features(self, poly_coeffs):
-        """Decode feature matrix from polynomial coefficients"""
-        vocab = list(set(self.tokens))
-        n = len(vocab)
+    def evaluate_poly(self, x: float) -> float:
+        """Evaluate polynomial at point x"""
+        result = 0.0
+        for i, coeff in enumerate(self.poly):
+            result += coeff * (x ** i)
+        return result
+    
+    def word_to_seed(self, word: str) -> float:
+        """Convert word to polynomial input"""
+        if word in self.vocab_map:
+            idx = self.vocab_map[word]
+            return -1.0 + 2.0 * (idx / len(self.vocab))
+        return 0.0
+    
+    def compute_probabilities(self, context: Tuple[str, str], candidates: List[str]) -> np.ndarray:
+        """Use polynomial to compute selection probabilities"""
+        # Get polynomial value for context
+        seed1 = self.word_to_seed(context[0])
+        seed2 = self.word_to_seed(context[1])
+        context_value = self.evaluate_poly((seed1 + seed2) / 2.0)
         
-        # Generate feature matrix using polynomial basis
-        feat = np.random.RandomState(int(poly_coeffs[0] % 1e9)).randn(n, 5)
-        feat /= np.linalg.norm(feat, axis=1, keepdims=True) + 1e-9
+        # Compute probability for each candidate
+        probs = np.zeros(len(candidates))
+        for i, cand in enumerate(candidates):
+            cand_seed = self.word_to_seed(cand)
+            # Use polynomial derivative or combination
+            cand_value = self.evaluate_poly(cand_seed)
+            # Distance-based probability
+            similarity = 1.0 / (1.0 + abs(context_value - cand_value))
+            probs[i] = similarity
         
-        return {'vocab': vocab, 'matrix': feat.astype(np.float32)}
+        # Normalize
+        if probs.sum() > 0:
+            probs = probs / probs.sum()
+        else:
+            probs = np.ones(len(candidates)) / len(candidates)
+        
+        return probs
     
-    def _init_context(self):
-        """Initialize minimal context tracker"""
-        return {
-            'hist': deque(maxlen=8),
-            'bigram': Counter(),
-            'momentum': 0.5,
-            'coherence': 1.0
-        }
-    
-    def _decode_anchors(self, poly_coeffs):
-        """Decode anchor vectors from polynomial"""
-        k = 8
-        anchors = np.random.RandomState(int(poly_coeffs[0] % 1e9)).randn(k, 5)
-        anchors /= np.linalg.norm(anchors, axis=1, keepdims=True) + 1e-9
-        return anchors.astype(np.float32)
-    
-    def generate(self, seed, length=80, log_qmc=False):
-        """Compressed generation loop"""
+    def generate(self, seed: str, length: int = 80) -> str:
+        """Generate using polynomial-modulated selection"""
         words = seed.split()[:2]
         while len(words) < 2:
-            words.append(self.tokens[len(words) % len(self.tokens)])
+            words.append(self.vocab[0])
         
+        # Validate seed
         seed_key = tuple(words)
         if seed_key not in self.model:
             seed_key = self.keys[np.random.randint(len(self.keys))]
         
-        out = list(seed_key)
+        output = list(seed_key)
+        
+        print(f"\n[Generating with polynomial modulation...]")
         
         for step in range(length):
-            cands = list(self.model.get(seed_key, []))
-            if not cands:
-                seed_key = self.keys[np.random.randint(len(self.keys))]
+            context = tuple(output[-2:])
+            candidates = list(self.model.get(context, []))
+            
+            if not candidates:
+                # Fallback
+                context = self.keys[np.random.randint(len(self.keys))]
+                output.extend(list(context))
                 continue
             
-            # Compressed probability computation using polynomial
-            probs = np.ones(len(cands)) / len(cands)
-            probs = probs / probs.sum()
+            # Use polynomial to weight candidates
+            probs = self.compute_probabilities(context, candidates)
+            next_word = np.random.choice(candidates, p=probs)
+            output.append(next_word)
             
-            next_word = np.random.choice(cands, p=probs)
-            
-            # Update context (minimal)
-            self.context['hist'].append(next_word)
-            if len(self.context['hist']) >= 2:
-                self.context['bigram'][(self.context['hist'][-2], next_word)] += 1
-            
-            out.append(next_word)
-            seed_key = tuple(out[-2:])
+            if step % 20 == 0 and step > 0:
+                print(f"  Step {step}/{length}")
         
-        return " ".join(out)
+        print(f"[Complete]")
+        return " ".join(output)
 
 
 # ================================================================
-# MODEL BUILDER
+# DATASET CODEC (for storage)
+# ================================================================
+class SuperpolynomialCodec:
+    """Compress dataset for storage"""
+    
+    @staticmethod
+    def encode_dataset_to_poly(tokens: List[str], model: Dict) -> np.ndarray:
+        print("\n[Encoding dataset...]")
+        dataset = {
+            'tokens': tokens,
+            'model': dict(model),
+            'vocab': list(set(tokens)),
+        }
+        
+        data_bytes = pickle.dumps(dataset, protocol=pickle.HIGHEST_PROTOCOL)
+        compressed = zlib.compress(data_bytes, level=9)
+        compressed_len = len(compressed)
+        
+        print(f"  Compressed: {compressed_len:,} bytes")
+        
+        length_bytes = compressed_len.to_bytes(8, byteorder='little')
+        full_data = length_bytes + compressed
+        
+        chunk_size = 8
+        num_coeffs = (len(full_data) + chunk_size - 1) // chunk_size
+        poly = np.zeros(num_coeffs, dtype=np.float64)
+        
+        for i in range(num_coeffs):
+            start = i * chunk_size
+            end = min(start + chunk_size, len(full_data))
+            chunk = full_data[start:end]
+            
+            if len(chunk) < chunk_size:
+                chunk += b'\x00' * (chunk_size - len(chunk))
+            
+            coeff = int.from_bytes(chunk, byteorder='little', signed=False)
+            poly[i] = float(coeff)
+        
+        print(f"  Polynomial coefficients: {len(poly)}")
+        return poly
+    
+    @staticmethod
+    def decode_poly_to_dataset(poly: np.ndarray) -> Tuple[List[str], Dict, List[str]]:
+        print("\n[Decoding dataset...]")
+        
+        chunk_size = 8
+        byte_chunks = []
+        
+        for coeff in poly:
+            int_val = int(coeff)
+            chunk = int_val.to_bytes(chunk_size, byteorder='little', signed=False)
+            byte_chunks.append(chunk)
+        
+        full_data = b''.join(byte_chunks)
+        compressed_len = int.from_bytes(full_data[:8], byteorder='little')
+        compressed = full_data[8:8+compressed_len]
+        
+        try:
+            data_bytes = zlib.decompress(compressed)
+            dataset = pickle.loads(data_bytes)
+            
+            model = defaultdict(list, dataset['model'])
+            return dataset['tokens'], model, dataset['vocab']
+        except:
+            return [], defaultdict(list), []
+
+
+# ================================================================
+# BUILD MODEL
 # ================================================================
 def build_ngram(tokens, n=2):
     m = defaultdict(list)
@@ -190,42 +260,64 @@ def build_ngram(tokens, n=2):
         m[key].append(tokens[i+n])
     return m
 
+
 # ================================================================
 # MAIN
 # ================================================================
 def main():
-    path = input("Enter text file: ").strip()
+    print("="*70)
+    print("POLYNOMIAL TEXT GENERATOR")
+    print("="*70)
+    
+    path = input("\nEnter text file: ").strip()
     if not os.path.exists(path):
-        print("file missing")
+        print("File not found")
         return
     
+    print("\n[Loading corpus...]")
     toks = open(path, encoding="utf-8").read().lower().split()
+    print(f"  Loaded {len(toks):,} tokens")
+    
+    print("\n[Building model...]")
     model = build_ngram(toks, 2)
+    vocab = list(set(toks))
     
-    # Instantiate compressed generator (5-byte polynomial)
-    g = CompressedGenerator(toks, model)
-    minimizer = CompressedBooleanMinimizer()
+    # Create polynomial from dataset statistics
+    print("\n[Creating polynomial from dataset...]")
     
-    print(f"\n[Compression Stats]")
-    print(f"QMC Polynomial: {g.POLY_GEN.nbytes} bytes")
-    print(f"Gen Polynomial: {minimizer.POLY_QMC.nbytes} bytes")
-    print(f"Total: {g.POLY_GEN.nbytes + minimizer.POLY_QMC.nbytes} bytes (40 bytes = 2×5-element float64)")
+    # Method 1: Store dataset
+    codec = SuperpolynomialCodec()
+    storage_poly = codec.encode_dataset_to_poly(toks, model)
+    
+    # Method 2: Create generative polynomial from statistics
+    vocab_size = len(vocab)
+    # Use token frequencies as polynomial coefficients
+    freq_dist = Counter(toks)
+    top_freqs = [freq_dist[word] for word in vocab[:100]]  # Top 100 words
+    generative_poly = np.array(top_freqs, dtype=np.float64)
+    
+    print("\n[Choose generation mode:]")
+    print("  1. Pure polynomial (generates directly from coefficients)")
+    print("  2. Hybrid (polynomial modulates stored transitions)")
+    print("  3. Stored dataset (polynomial just for compression)")
+    
+
+    generator = HybridPolynomialGenerator(generative_poly, toks, model)
+  
+    print("\n" + "="*70)
+    print("Ready for generation!")
+    print("="*70)
     
     while True:
         s = input("\nseed (exit to quit): ")
         if s == "exit":
             break
         
-        g.qmc_logs.clear()
-        print("[Generating from 5-byte superpolynomials...]")
-        
-        output = g.generate(s, length=620, log_qmc=False)
-        print("\n" + output)
-        
-        # Optional: Show polynomial decomposition
-        print(f"\n[Active Polynomial Weights]")
-        print(f"Gen: {g.POLY_GEN / np.sum(g.POLY_GEN)}")
-        print(f"QMC: {minimizer.POLY_QMC / np.sum(minimizer.POLY_QMC)}")
+        output = generator.generate(s, length=800)
+        print("\n" + "─"*70)
+        print(output)
+        print("─"*70)
+
 
 if __name__ == "__main__":
     main()
