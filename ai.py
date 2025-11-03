@@ -4,90 +4,6 @@ import os, zlib, pickle, hashlib
 from typing import List, Dict, Tuple, Set
 
 # ================================================================
-# POLYNOMIAL TEXT GENERATOR - GENERATES FROM COEFFICIENTS
-# ================================================================
-class PolynomialTextGenerator:
-    """Generate text directly from polynomial coefficients using mathematical operations"""
-    
-    def __init__(self, poly_coeffs: np.ndarray, vocab: List[str]):
-        self.poly = poly_coeffs.astype(np.float64)
-        self.vocab = vocab
-        self.vocab_size = len(vocab)
-        self.vocab_map = {word: i for i, word in enumerate(vocab)}
-        self.reverse_map = {i: word for i, word in enumerate(vocab)}
-        
-        print(f"\n[Polynomial Generator Initialized]")
-        print(f"  Polynomial degree: {len(self.poly)}")
-        print(f"  Vocabulary size: {self.vocab_size}")
-        
-    def evaluate_poly(self, x: float) -> float:
-        """Evaluate polynomial at point x using Horner's method"""
-        result = self.poly[-1]
-        for i in range(len(self.poly) - 2, -1, -1):
-            result = result * x + self.poly[i]
-        return result
-    
-    def word_to_seed(self, word: str) -> float:
-        """Convert word to seed value for polynomial evaluation"""
-        if word in self.vocab_map:
-            idx = self.vocab_map[word]
-            # Map to [-1, 1] range
-            return -1.0 + 2.0 * (idx / max(self.vocab_size - 1, 1))
-        else:
-            # Hash unknown words
-            return (hash(word) % 10000) / 10000.0
-    
-    def seed_to_word_idx(self, value: float) -> int:
-        """Convert polynomial output to vocabulary index"""
-        # Map output to vocabulary index
-        normalized = abs(value) % 1.0  # Keep fractional part
-        idx = int(normalized * self.vocab_size)
-        return idx % self.vocab_size
-    
-    def predict_next(self, context: Tuple[str, str]) -> str:
-        """Predict next word from bigram context using polynomial"""
-        # Convert context words to seeds
-        seed1 = self.word_to_seed(context[0])
-        seed2 = self.word_to_seed(context[1])
-        
-        # Combine seeds (simple average, but could use more complex mixing)
-        combined_seed = (seed1 + seed2) / 2.0
-        
-        # Evaluate polynomial
-        poly_output = self.evaluate_poly(combined_seed)
-        
-        # Convert to word
-        word_idx = self.seed_to_word_idx(poly_output)
-        return self.reverse_map[word_idx]
-    
-    def generate(self, seed: str, length: int = 80) -> str:
-        """Generate text using polynomial evaluations"""
-        words = seed.split()[:2]
-        
-        # Ensure we have at least 2 words
-        while len(words) < 2:
-            words.append(self.vocab[len(words) % self.vocab_size])
-        
-        output = list(words)
-        
-        print(f"\n[Generating from polynomial...]")
-        
-        for step in range(length):
-            # Get context (last 2 words)
-            context = (output[-2], output[-1])
-            
-            # Predict next word using polynomial
-            next_word = self.predict_next(context)
-            output.append(next_word)
-            
-            if step % 20 == 0 and step > 0:
-                print(f"  Step {step}/{length}")
-        
-        print(f"[Generation complete]")
-        return " ".join(output)
-
-
-# ================================================================
 # HYBRID: POLYNOMIAL + STORED MODEL
 # ================================================================
 class HybridPolynomialGenerator:
@@ -317,7 +233,6 @@ def main():
         print("\n" + "─"*70)
         print(output)
         print("─"*70)
-
 
 if __name__ == "__main__":
     main()
