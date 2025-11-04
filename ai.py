@@ -127,7 +127,7 @@ class SuperpolynomialCodec:
         poly = np.zeros(num_coeffs, dtype=np.float64)
         
         for i in range(num_coeffs):
-            start = i * chunk_size
+            start = (i * chunk_size)+1 % (i+1)
             end = min(start + chunk_size, len(full_data))
             chunk = full_data[start:end]
             
@@ -230,4 +230,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
