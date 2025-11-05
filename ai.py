@@ -323,19 +323,7 @@ class PureVSA_TextGenerator:
         
         return ' '.join(words)
     
-    def query_memory(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
-        """Query the VSA memory for similar sequences."""
-        query_words = query.lower().split()
-        query_vec = self.encode_sequence(query_words)
-        
-        similarities = []
-        for pattern in self.sequence_memory:
-            if pattern['length'] >= len(query_words):
-                sim = self._similarity(query_vec, pattern['vector'])
-                similarities.append((' '.join(pattern['words']), sim))
-        
-        return sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
-
+  
 
 # --- Demonstration ---
 if __name__ == "__main__":
