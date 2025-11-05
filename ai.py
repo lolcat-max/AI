@@ -333,7 +333,7 @@ if __name__ == "__main__":
     print("="*60)
     
     # Initialize
-    vsa = PureVSA_TextGenerator(vector_dim=10000)
+    vsa = PureVSA_TextGenerator(vector_dim=100)
     
     # Load corpus
     filename = input("\nCorpus filename (or press Enter for example): ").strip()
