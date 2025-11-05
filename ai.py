@@ -1,369 +1,379 @@
 import numpy as np
-from collections import Counter, defaultdict, deque
-import os, zlib, pickle, hashlib
-from typing import List, Dict, Tuple, Set
-
-# ================================================================
-# XOR BRANCHING ENGINE
-# ================================================================
-class XORBranchingEngine:
-    """Uses XOR logic to create contingent paths between low/high prob selections"""
+import hashlib
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict, Counter
+KB_LEN = 99999
+class PureVSA_TextGenerator:
+    """
+    Pure Vector Symbolic Architecture (VSA) text generation system.
+    Uses only VSA operations: binding, bundling, and permutation.
     
-    def __init__(self, threshold: float = 0.5, xor_strength: float = 0.3):
-        self.threshold = threshold  # Probability threshold for XOR branching
-        self.xor_strength = xor_strength  # How much XOR affects final probability
-        self.branch_history = deque(maxlen=500)
-        self.xor_state = 0  # Running XOR state
-        
-        print(f"[XOR Branching Engine]")
-        print(f"  Threshold: {self.threshold}")
-        print(f"  XOR strength: {self.xor_strength}")
+    Based on principles from Kanerva's Hyperdimensional Computing:
+    - All entities are high-dimensional vectors (10,000+ dimensions)
+    - Information is distributed across dimensions
+    - Computations use only vector operations
+    - Relations evaluated via vector similarity
+    """
     
-    def probability_to_bits(self, prob: float, num_bits: int = 8) -> int:
-        """Convert probability to integer bit pattern"""
-        scaled = int(prob * ((1 << num_bits) - 1))
-        return scaled & ((1 << num_bits) - 1)
+    def __init__(self, vector_dim: int = 10000):
+        """
+        Initialize pure VSA system.
+        
+        Args:
+            vector_dim: Dimensionality of hypervectors (typically 10,000)
+        """
+        self.vector_dim = vector_dim
+        
+        # VSA memory structures
+        self.atomic_vectors = {}  # Base hypervectors for words
+        self.sequence_memory = []  # Stored sequence patterns
+        self.position_vectors = {}  # Position encodings
+        
+        # Transition memory for better continuation
+        self.transition_memory = defaultdict(Counter)  # word/ngram -> next words
+        
+        # Pre-generate position vectors for sequence encoding
+        self._initialize_position_vectors(max_positions=100)
     
-    def bits_to_probability(self, bits: int, num_bits: int = 8) -> float:
-        """Convert bit pattern back to probability"""
-        max_val = (1 << num_bits) - 1
-        return (bits & max_val) / max_val
+    def _generate_random_hypervector(self, seed: str) -> np.ndarray:
+        """
+        Generate a random bipolar hypervector deterministically.
+        
+        VSA principle: Random high-dimensional vectors are quasi-orthogonal.
+        With D=10,000, can represent ~2^D distinct concepts.
+        """
+        hash_seed = int(hashlib.sha256(seed.encode('utf-8')).hexdigest(), 16) % (2**32)
+        rng = np.random.default_rng(hash_seed)
+        
+        # Bipolar vectors {-1, +1} are common in MAP (Multiply-Add-Permute) VSA
+        return rng.choice([-1.0, 1.0], size=self.vector_dim)
     
-    def xor_branch(self, probs: np.ndarray, candidates: List[str]) -> np.ndarray:
-        """Apply XOR branching to probability distribution"""
-        if len(probs) == 0:
-            return probs
+    def _initialize_position_vectors(self, max_positions: int):
+        """Generate position vectors for sequential encoding."""
+        for i in range(max_positions):
+            self.position_vectors[i] = self._generate_random_hypervector(f"POS_{i}")
+    
+    def _bind(self, vec1: np.ndarray, vec2: np.ndarray) -> np.ndarray:
+        """
+        VSA Binding operation (element-wise multiplication).
         
-        # Identify low and high probability candidates
-        low_mask = probs < self.threshold
-        high_mask = probs >= self.threshold
+        Properties:
+        - Associative and commutative
+        - Approximately involutory: bind(bind(A, B), B) ≈ A
+        - Creates new vector dissimilar to inputs
+        """
+        return np.multiply(vec1, vec2)
+    
+    def _unbind(self, bound_vec: np.ndarray, key_vec: np.ndarray) -> np.ndarray:
+        """
+        VSA Unbinding (inverse of binding).
+        For bipolar vectors, unbinding = binding (self-inverse).
+        """
+        return self._bind(bound_vec, key_vec)
+    
+    def _bundle(self, vectors: List[np.ndarray], normalize: bool = True) -> np.ndarray:
+        """
+        VSA Bundling operation (superposition via addition).
         
-        num_low = np.sum(low_mask)
-        num_high = np.sum(high_mask)
+        Properties:
+        - Similar to any constituent vector
+        - Noise-resistant: can recover components even with degradation
+        - Commutative and associative
+        """
+        if not vectors:
+            return np.zeros(self.vector_dim)
         
-        if num_low == 0 or num_high == 0:
-            return probs  # No branching possible
+        bundled = np.sum(vectors, axis=0)
         
-        # Convert probabilities to bit patterns
-        prob_bits = np.array([self.probability_to_bits(p) for p in probs])
+        if normalize:
+            # Binarize to maintain bipolar property
+            bundled = np.sign(bundled)
+            bundled[bundled == 0] = 1  # Handle exact zeros
         
-        # XOR low prob with high prob to create contingent paths
-        new_probs = probs.copy()
+        return bundled
+    
+    def _permute(self, vec: np.ndarray, shift: int = 1) -> np.ndarray:
+        """
+        VSA Permutation operation (coordinate rotation).
         
-        low_indices = np.where(low_mask)[0]
-        high_indices = np.where(high_mask)[0]
+        Used to create sequence-sensitive representations.
+        Different permutations create orthogonal vectors.
+        """
+        return np.roll(vec, shift)
+    
+    def _similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+        """
+        Cosine similarity between hypervectors.
         
-        # Create XOR pairings between low and high probability items
-        for i, low_idx in enumerate(low_indices):
-            # Pair with corresponding high probability item (circular)
-            high_idx = high_indices[i % len(high_indices)]
+        For bipolar vectors, this is proportional to Hamming similarity.
+        """
+        dot = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot / (norm1 * norm2)
+    
+    def get_word_vector(self, word: str) -> np.ndarray:
+        """Get or create atomic hypervector for a word."""
+        word = word.lower()
+        if word not in self.atomic_vectors:
+            self.atomic_vectors[word] = self._generate_random_hypervector(word)
+        return self.atomic_vectors[word]
+    
+    def encode_sequence(self, words: List[str]) -> np.ndarray:
+        """
+        Encode a sequence using VSA operations.
+        
+        Method: Bind each word to its position vector, then bundle.
+        This preserves both content and order information.
+        """
+        bound_vectors = []
+        
+        for i, word in enumerate(words):
+            if i >= len(self.position_vectors):
+                # Generate more position vectors if needed
+                self.position_vectors[i] = self._generate_random_hypervector(f"POS_{i}")
             
-            # XOR the bit patterns
-            low_bits = prob_bits[low_idx]
-            high_bits = prob_bits[high_idx]
-            xor_result = low_bits ^ high_bits
+            word_vec = self.get_word_vector(word)
+            pos_vec = self.position_vectors[i]
             
-            # Update XOR state
-            self.xor_state ^= xor_result
+            # Bind word to position
+            bound = self._bind(word_vec, pos_vec)
+            bound_vectors.append(bound)
+        
+        # Bundle all bound pairs into single hypervector
+        return self._bundle(bound_vectors)
+    
+    def encode_ngram_sequence(self, words: List[str], n: int = 3) -> Dict[Tuple[str, ...], np.ndarray]:
+        """
+        Encode sequences as n-gram VSA patterns.
+        Each n-gram is encoded using sequential binding and permutation.
+        """
+        ngram_vectors = {}
+        
+        for i in range(len(words) - n + 1):
+            ngram_words = tuple(words[i:i+n])
             
-            # Convert XOR result to probability boost
-            xor_prob = self.bits_to_probability(xor_result)
+            # Encode n-gram using permutation chaining
+            # Method: word1 ⊗ ρ(word2) ⊗ ρ²(word3) ...
+            vec = self.get_word_vector(ngram_words[0])
             
-            # Boost low probability by XOR result
-            boost = xor_prob * self.xor_strength
-            new_probs[low_idx] += boost
+            for j in range(1, n):
+                next_word = self.get_word_vector(ngram_words[j])
+                # Permute to encode position
+                permuted = self._permute(next_word, shift=j)
+                vec = self._bind(vec, permuted)
             
-            # Slightly reduce high probability (conservation)
-            new_probs[high_idx] -= boost * 0.5
+            ngram_vectors[ngram_words] = vec
         
-        # Ensure no negative probabilities
-        new_probs = np.maximum(new_probs, 0.001)
-        
-        # Record branching event
-        self.branch_history.append({
-            'num_low': num_low,
-            'num_high': num_high,
-            'xor_state': self.xor_state,
-            'avg_boost': np.mean(new_probs[low_mask] - probs[low_mask]) if num_low > 0 else 0
-        })
-        
-        return new_probs
+        return ngram_vectors
     
-    def get_statistics(self) -> Dict:
-        """Get branching statistics"""
-        if not self.branch_history:
-            return {'branches': 0}
+    def train_on_corpus(self, text: str):
+        """
+        Train the VSA system on a text corpus.
         
-        recent = list(self.branch_history)[-10:]
-        return {
-            'total_branches': len(self.branch_history),
-            'xor_state': self.xor_state,
-            'avg_low_candidates': np.mean([b['num_low'] for b in recent]),
-            'avg_high_candidates': np.mean([b['num_high'] for b in recent]),
-            'avg_boost': np.mean([b['avg_boost'] for b in recent])
-        }
-
-
-# ================================================================
-# HYBRID: POLYNOMIAL + STORED MODEL + XOR BRANCHING
-# ================================================================
-class HybridPolynomialGenerator:
-    """Uses polynomial for probabilistic selection with XOR branching"""
-    
-    def __init__(self, poly_coeffs: np.ndarray, tokens: List[str], model: Dict,
-                 xor_threshold: float = 0.5, xor_strength: float = 0.3):
-        self.poly = poly_coeffs.astype(np.float64)
-        self.tokens = tokens
-        self.model = model
-        self.keys = list(model.keys())
-        self.vocab = list(set(tokens))
-        self.vocab_map = {word: i for i, word in enumerate(self.vocab)}
+        Creates a distributed memory of sequential patterns.
+        """
+        import re
         
-        # Initialize XOR branching engine
-        self.xor_engine = XORBranchingEngine(xor_threshold, xor_strength)
+        # Tokenize
+        sentences = re.split(r'[.\n]+', text.lower())
+        sentences = [s.strip()+"." for s in sentences if s.strip()]
         
-        print(f"[Hybrid Polynomial Generator with XOR Branching]")
-        print(f"  Polynomial coefficients: {len(self.poly)}")
-        print(f"  Vocabulary: {len(self.vocab)}")
-        print(f"  Model keys: {len(self.keys)}")
-    
-    def evaluate_poly(self, x: float) -> float:
-        """Evaluate polynomial at point x"""
-        result = 0.0
-        for i, coeff in enumerate(self.poly):
-            result += coeff * (x ** i)
-        return result
-    
-    def word_to_seed(self, word: str) -> float:
-        """Convert word to polynomial input"""
-        if word in self.vocab_map:
-            idx = self.vocab_map[word]
-            return -1.0 + 2.0 * (idx / len(self.vocab))
-        return 0.0
-    
-    def word_to_hash_seed(self, word: str) -> int:
-        """Convert word to hash-based seed for XOR operations"""
-        return int(hashlib.md5(word.encode()).hexdigest()[:8], 16)
-    
-    def generate(self, seed: str, length: int = 80, enable_xor: bool = True) -> str:
-        """Generate using polynomial-modulated selection with XOR branching"""
-        words = seed.split()[:2]
-        while len(words) < 2:
-            words.append(self.vocab[0] if self.vocab else "the")
+        print(f"Training on {len(sentences)} sentences...")
         
-        # Validate seed
-        seed_key = tuple(words)
-        if seed_key not in self.model:
-            seed_key = self.keys[np.random.randint(len(self.keys))] if self.keys else tuple(words)
-        
-        output = list(seed_key)
-        
-        print(f"[Generating with polynomial + XOR branching...]")
-        print(f"  XOR branching: {'ENABLED' if enable_xor else 'DISABLED'}")
-        
-        next_word = words[-1] if words else ""
-        
-        for step in range(length):
-            context = tuple(output[-2:])
-            candidates = list(self.model.get(context, []))
-            
-            if not candidates:
-                # Fallback
-                if self.keys:
-                    context = self.keys[np.random.randint(len(self.keys))]
-                    output.extend(list(context))
+        # Build sequence memory using VSA encoding
+        for sentence in sentences:
+            words = sentence.split()
+            if len(words) < 2:
                 continue
             
-            # Use polynomial to compute base probabilities
-            probs = np.zeros(len(candidates))
-            for i, cand in enumerate(candidates):
-                cand_seed = self.word_to_seed(cand)
-                cand_value = self.evaluate_poly(cand_seed)
-                context_value = self.evaluate_poly(self.word_to_seed(next_word))
-                
-                # Distance-based similarity
-                similarity = 1.0 / (1.0 + abs(context_value - cand_value))
-                
-                # Add hash-based variation
-                hash_seed = self.word_to_hash_seed(cand)
-                hash_factor = (hash_seed % 1000) / 1000.0
-                
-                probs[i] = similarity * (0.7 + 0.6 * hash_factor)
+            # Build transition memory (for longer generation)
+            for n in range(1, min(4, len(words))):
+                for i in range(len(words) - n):
+                    context = ' '.join(words[i:i+n])
+                    next_word = words[i+n]
+                    self.transition_memory[context][next_word] += 1
             
-            # Normalize base probabilities
-            if probs.sum() > 0:
-                probs = probs / probs.sum()
+            # Encode full sequence
+            seq_vector = self.encode_sequence(words)
+            self.sequence_memory.append({
+                'vector': seq_vector,
+                'words': words,
+                'length': len(words)
+            })
+            
+            # Also encode n-grams for local patterns
+            ngram_vecs = self.encode_ngram_sequence(words, n=3)
+            for ngram, vec in ngram_vecs.items():
+                self.sequence_memory.append({
+                    'vector': vec,
+                    'words': list(ngram),
+                    'length': len(ngram)
+                })
+        
+        print(f"Stored {len(self.sequence_memory)} VSA patterns in memory")
+        print(f"Built transition memory with {len(self.transition_memory)} contexts")
+    
+    def predict_next_word_hybrid(self, context: List[str], top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        Hybrid prediction using both VSA and transition memory.
+        Combines symbolic VSA operations with statistical patterns.
+        """
+        if not context:
+            return []
+        
+        candidates = Counter()
+        
+        # Method 1: Transition memory (fast, statistical)
+        for n in range(min(len(context), 3), 0, -1):
+            context_key = ' '.join(context[-n:])
+            if context_key in self.transition_memory:
+                for word, count in self.transition_memory[context_key].items():
+                    candidates[word] += count * (n / 3.0)  # Weight by context length
+        
+        # Method 2: VSA similarity (slower, semantic)
+        if len(candidates) < top_k:
+            context_vec = self.encode_sequence(context[-3:])
+            
+            # Check all patterns for semantic matches
+            for pattern in self.sequence_memory:
+                if pattern['length'] <= len(context):
+                    continue
+                
+                # Compare context to pattern prefix
+                pattern_context = pattern['words'][:len(context)]
+                pattern_vec = self.encode_sequence(pattern_context)
+                similarity = self._similarity(context_vec, pattern_vec)
+                
+                if similarity > 0.4:  # Lower threshold for more variety
+                    # Get next word from pattern
+                    if len(pattern['words']) > len(context):
+                        next_word = pattern['words'][len(context)]
+                        candidates[next_word] += similarity * 100  # Scale to compete with counts
+        
+        if not candidates:
+            return []
+        
+        # Normalize and return top-k
+        max_score = max(candidates.values())
+        normalized = [(word, score/max_score) for word, score in candidates.items()]
+        return sorted(normalized, key=lambda x: x[1], reverse=True)[:top_k]
+    
+    def generate_text(self, seed: str, max_words: int = 500, temperature: float = 0.8, 
+                     min_words: int = 50, stop_on_period: bool = False) -> str:
+        """
+        Generate text using pure VSA operations with enhanced continuation.
+        
+        Args:
+            seed: Starting text
+            max_words: Maximum words to generate
+            temperature: Sampling randomness (0=greedy, 1=uniform)
+            min_words: Minimum words before allowing stop
+            stop_on_period: Whether to stop at sentence end
+        
+        Returns:
+            Generated text
+        """
+        words = seed.lower().split()
+        consecutive_failures = 0
+        
+        for iteration in range(max_words):
+            # Use hybrid prediction
+            predictions = self.predict_next_word_hybrid(words[-5:], top_k=15)
+            
+            if not predictions:
+                consecutive_failures += 1
+                
+                # Try with shorter context
+                if len(words) > 1:
+                    predictions = self.predict_next_word_hybrid(words[-2:], top_k=15)
+                
+                if not predictions and consecutive_failures > 3:
+                    print(f"[Stopped after {iteration} words - no predictions]")
+                    break
+                
+                if not predictions:
+                    continue
             else:
-                probs = np.ones(len(candidates)) / len(candidates)
+                consecutive_failures = 0
             
-            # Apply XOR branching to create contingent paths
-            if enable_xor:
-                probs = self.xor_engine.xor_branch(probs, candidates)
+            # Sample with temperature
+            if temperature > 0 and len(predictions) > 1:
+                scores = np.array([score for _, score in predictions])
+                scores = np.maximum(scores, 0.001)
                 
-                # Re-normalize after XOR branching
-                if probs.sum() > 0:
-                    probs = probs / probs.sum()
-                else:
-                    probs = np.ones(len(candidates)) / len(candidates)
+                # Apply temperature
+                scores = scores ** (1.0 / temperature)
+                probs = scores / scores.sum()
+                
+                next_word = np.random.choice([w for w, _ in predictions], p=probs)
+            else:
+                next_word = predictions[0][0]
             
-            # Select next word
-            next_word = np.random.choice(candidates, p=probs)
-            output.append(next_word)
+            words.append(next_word)
             
-            if step % 20 == 0 and step > 0:
-                stats = self.xor_engine.get_statistics()
-                print(f"  Step {step}/{length} | XOR branches: {stats.get('total_branches', 0)} | XOR state: {stats.get('xor_state', 0):08x}")
+            # Optional early stopping at sentence boundaries
+            if stop_on_period and iteration >= min_words:
+                if next_word in ['.', '!', '?']:
+                    break
         
-        print(f"[Complete]")
+        return ' '.join(words)
+    
+    def query_memory(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
+        """Query the VSA memory for similar sequences."""
+        query_words = query.lower().split()
+        query_vec = self.encode_sequence(query_words)
         
-        # Final statistics
-        if enable_xor:
-            stats = self.xor_engine.get_statistics()
-            print(f"[XOR Branching Statistics]")
-            for key, val in stats.items():
-                print(f"  {key}: {val}")
+        similarities = []
+        for pattern in self.sequence_memory:
+            if pattern['length'] >= len(query_words):
+                sim = self._similarity(query_vec, pattern['vector'])
+                similarities.append((' '.join(pattern['words']), sim))
         
-        return " ".join(output)
+        return sorted(similarities, key=lambda x: x[1], reverse=True)[:top_k]
 
 
-# ================================================================
-# DATASET CODEC (for storage)
-# ================================================================
-class SuperpolynomialCodec:
-    """Compress dataset for storage"""
+# --- Demonstration ---
+if __name__ == "__main__":
+    print("="*60)
+    print("Pure VSA Text Generation System")
+    print("Based on Hyperdimensional Computing principles")
+    print("="*60)
     
-    @staticmethod
-    def encode_dataset_to_poly(tokens: List[str], model: Dict) -> np.ndarray:
-        print("[Encoding dataset...]")
-        dataset = {
-            'tokens': tokens,
-            'model': dict(model),
-            'vocab': list(set(tokens)),
-        }
-        
-        data_bytes = pickle.dumps(dataset, protocol=pickle.HIGHEST_PROTOCOL)
-        compressed = zlib.compress(data_bytes, level=9)
-        compressed_len = len(compressed)
-        
-        print(f"  Compressed: {compressed_len:,} bytes")
-        
-        length_bytes = compressed_len.to_bytes(16, byteorder='little')
-        full_data = length_bytes + compressed
-        
-        chunk_size = 8
-        num_coeffs = (len(full_data) + chunk_size - 1) // chunk_size
-        poly = np.zeros(num_coeffs, dtype=np.float64)
-        
-        for i in range(num_coeffs):
-            start = i * chunk_size
-            end = min(start + chunk_size, len(full_data))
-            chunk = full_data[start:end]
-            
-            if len(chunk) < chunk_size:
-                chunk += b'\\x00' * (chunk_size - len(chunk))
-            
-            coeff = int.from_bytes(chunk, byteorder='little', signed=False)
-            poly[i] = float(coeff)
-        
-        print(f"  Polynomial coefficients: {len(poly)}")
-        return poly
+    # Initialize
+    vsa = PureVSA_TextGenerator(vector_dim=10000)
     
-    @staticmethod
-    def decode_poly_to_dataset(poly: np.ndarray) -> Tuple[List[str], Dict, List[str]]:
-        print("[Decoding dataset...]")
-        
-        chunk_size = 8
-        byte_chunks = []
-        
-        for coeff in poly:
-            int_val = int(coeff)
-            chunk = int_val.to_bytes(chunk_size, byteorder='little', signed=False)
-            byte_chunks.append(chunk)
-        
-        full_data = b''.join(byte_chunks)
-        compressed_len = int.from_bytes(full_data[:16], byteorder='little')
-        compressed = full_data[16:16+compressed_len]
-        
+    # Load corpus
+    filename = input("\nCorpus filename (or press Enter for example): ").strip()
+    
+    if filename:
         try:
-            data_bytes = zlib.decompress(compressed)
-            dataset = pickle.loads(data_bytes)
-            
-            model = defaultdict(list, dataset['model'])
-            return dataset['tokens'], model, dataset['vocab']
+            with open(filename, 'r', encoding='utf-8') as f:
+                corpus = f.read()[:KB_LEN]
+            print(f"Loaded from {filename}")
         except Exception as e:
-            print(f"  Decode error: {e}")
-            return [], defaultdict(list), []
-
-
-# ================================================================
-# BUILD MODEL
-# ================================================================
-def build_ngram(tokens: List[str], n: int = 2) -> Dict[Tuple[str, ...], List[str]]:
-    m = defaultdict(list)
-    L = len(tokens)
-    if n <= 0 or L <= n:
-        return dict(m)
-
-    for i in range(L - n):
-        key = tuple(tokens[i:i + n])
-        m[key].append(tokens[i + n])
-
-    return dict(m)
-
-
-# ================================================================
-# MAIN
-# ================================================================
-def main():
-    print("="*70)
-    print("POLYNOMIAL TEXT GENERATOR WITH XOR BRANCHING")
-    print("="*70)
+            print(f"Error: {e}")
+            filename = None
     
-    path = input("Enter text file: ").strip()
-    if not os.path.exists(path):
-        print("File not found")
-        return
+    if not filename:
+        corpus = """the quick brown fox jumps over the lazy dog.
+        a dog is a loyal companion. the cat sat on the mat.
+        birds fly in the sky. fish swim in the ocean.
+        the sun rises in the east. the moon shines at night.
+        people walk on the street. cars drive on the road.
+        trees grow in the forest. flowers bloom in spring."""
     
-    print("[Loading corpus...]")
-    toks = open(path, encoding="utf-8").read().lower().split()
-    print(f"  Loaded {len(toks):,} tokens")
-    
-    print("[Building model...]")
-    model = build_ngram(toks, 2)
-    vocab = list(set(toks))
-    
-
-    xor_threshold = 0.1
-    xor_strength = 0.9
-    
-    # Create polynomial from dataset statistics
-    print("[Creating polynomial from dataset...]")
-    vocab_size = len(vocab)
-    freq_dist = Counter(toks)
-    top_freqs = [freq_dist[word] for word in vocab[:100]]
-    generative_poly = np.array(top_freqs, dtype=np.float64)
-    
-    generator = HybridPolynomialGenerator(
-        generative_poly, 
-        toks, 
-        model,
-        xor_threshold=xor_threshold,
-        xor_strength=xor_strength
-    )
-  
-    print("" + "="*70)
-    print("Ready for generation with XOR branching!")
-    print("="*70)
+    # Train
+    vsa.train_on_corpus(corpus)
     
     while True:
-        s = input("seed (or 'exit' to quit): ")
-        length = 800
-        enable_xor = True
-        
-        output = generator.generate(s, length=length, enable_xor=enable_xor)
-        print("" + "─"*70)
-        print(output)
-        print("─"*70)
-
-if __name__ == "__main__":
-    main()
+        user_input = input("\n> ").strip()
+       
+        generated = vsa.generate_text(user_input, max_words=800, 
+                                        temperature=0.7, min_words=100)
+        print(f"\nGenerated ({len(generated.split())} words):\n{generated}")
+           
