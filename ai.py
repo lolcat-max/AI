@@ -4,12 +4,114 @@ import os, zlib, pickle, hashlib
 from typing import List, Dict, Tuple, Set
 
 # ================================================================
-# HYBRID: POLYNOMIAL + STORED MODEL
+# XOR BRANCHING ENGINE
+# ================================================================
+class XORBranchingEngine:
+    """Uses XOR logic to create contingent paths between low/high prob selections"""
+    
+    def __init__(self, threshold: float = 0.5, xor_strength: float = 0.3):
+        self.threshold = threshold  # Probability threshold for XOR branching
+        self.xor_strength = xor_strength  # How much XOR affects final probability
+        self.branch_history = deque(maxlen=500)
+        self.xor_state = 0  # Running XOR state
+        
+        print(f"[XOR Branching Engine]")
+        print(f"  Threshold: {self.threshold}")
+        print(f"  XOR strength: {self.xor_strength}")
+    
+    def probability_to_bits(self, prob: float, num_bits: int = 8) -> int:
+        """Convert probability to integer bit pattern"""
+        scaled = int(prob * ((1 << num_bits) - 1))
+        return scaled & ((1 << num_bits) - 1)
+    
+    def bits_to_probability(self, bits: int, num_bits: int = 8) -> float:
+        """Convert bit pattern back to probability"""
+        max_val = (1 << num_bits) - 1
+        return (bits & max_val) / max_val
+    
+    def xor_branch(self, probs: np.ndarray, candidates: List[str]) -> np.ndarray:
+        """Apply XOR branching to probability distribution"""
+        if len(probs) == 0:
+            return probs
+        
+        # Identify low and high probability candidates
+        low_mask = probs < self.threshold
+        high_mask = probs >= self.threshold
+        
+        num_low = np.sum(low_mask)
+        num_high = np.sum(high_mask)
+        
+        if num_low == 0 or num_high == 0:
+            return probs  # No branching possible
+        
+        # Convert probabilities to bit patterns
+        prob_bits = np.array([self.probability_to_bits(p) for p in probs])
+        
+        # XOR low prob with high prob to create contingent paths
+        new_probs = probs.copy()
+        
+        low_indices = np.where(low_mask)[0]
+        high_indices = np.where(high_mask)[0]
+        
+        # Create XOR pairings between low and high probability items
+        for i, low_idx in enumerate(low_indices):
+            # Pair with corresponding high probability item (circular)
+            high_idx = high_indices[i % len(high_indices)]
+            
+            # XOR the bit patterns
+            low_bits = prob_bits[low_idx]
+            high_bits = prob_bits[high_idx]
+            xor_result = low_bits ^ high_bits
+            
+            # Update XOR state
+            self.xor_state ^= xor_result
+            
+            # Convert XOR result to probability boost
+            xor_prob = self.bits_to_probability(xor_result)
+            
+            # Boost low probability by XOR result
+            boost = xor_prob * self.xor_strength
+            new_probs[low_idx] += boost
+            
+            # Slightly reduce high probability (conservation)
+            new_probs[high_idx] -= boost * 0.5
+        
+        # Ensure no negative probabilities
+        new_probs = np.maximum(new_probs, 0.001)
+        
+        # Record branching event
+        self.branch_history.append({
+            'num_low': num_low,
+            'num_high': num_high,
+            'xor_state': self.xor_state,
+            'avg_boost': np.mean(new_probs[low_mask] - probs[low_mask]) if num_low > 0 else 0
+        })
+        
+        return new_probs
+    
+    def get_statistics(self) -> Dict:
+        """Get branching statistics"""
+        if not self.branch_history:
+            return {'branches': 0}
+        
+        recent = list(self.branch_history)[-10:]
+        return {
+            'total_branches': len(self.branch_history),
+            'xor_state': self.xor_state,
+            'avg_low_candidates': np.mean([b['num_low'] for b in recent]),
+            'avg_high_candidates': np.mean([b['num_high'] for b in recent]),
+            'avg_boost': np.mean([b['avg_boost'] for b in recent])
+        }
+
+
+# ================================================================
+# HYBRID: POLYNOMIAL + STORED MODEL + XOR BRANCHING
 # ================================================================
 class HybridPolynomialGenerator:
-    """Uses polynomial for probabilistic selection from stored transitions"""
+    """Uses polynomial for probabilistic selection with XOR branching"""
     
-    def __init__(self, poly_coeffs: np.ndarray, tokens: List[str], model: Dict):
+    def __init__(self, poly_coeffs: np.ndarray, tokens: List[str], model: Dict,
+                 xor_threshold: float = 0.5, xor_strength: float = 0.3):
         self.poly = poly_coeffs.astype(np.float64)
         self.tokens = tokens
         self.model = model
@@ -17,7 +119,10 @@ class HybridPolynomialGenerator:
         self.vocab = list(set(tokens))
         self.vocab_map = {word: i for i, word in enumerate(self.vocab)}
         
-        print(f"\n[Hybrid Polynomial Generator]")
+        # Initialize XOR branching engine
+        self.xor_engine = XORBranchingEngine(xor_threshold, xor_strength)
+        
+        print(f"[Hybrid Polynomial Generator with XOR Branching]")
         print(f"  Polynomial coefficients: {len(self.poly)}")
         print(f"  Vocabulary: {len(self.vocab)}")
         print(f"  Model keys: {len(self.keys)}")
@@ -36,45 +141,27 @@ class HybridPolynomialGenerator:
             return -1.0 + 2.0 * (idx / len(self.vocab))
         return 0.0
     
-    def compute_probabilities(self, context: Tuple[str, str], candidates: List[str]) -> np.ndarray:
-        """Use polynomial to compute selection probabilities"""
-        # Get polynomial value for context
-        seed1 = self.word_to_seed(context[0])
-        seed2 = self.word_to_seed(context[1])
-        context_value = self.evaluate_poly((seed1 + seed2) / 2.0)
-        
-        # Compute probability for each candidate
-        probs = np.zeros(len(candidates))
-        for i, cand in enumerate(candidates):
-            cand_seed = self.word_to_seed(cand)
-            # Use polynomial derivative or combination
-            cand_value = self.evaluate_poly(cand_seed)
-            # Distance-based probability
-            similarity = 1.0 / (1.0 + abs(context_value - cand_value))
-            probs[i] = similarity
-        
-        # Normalize
-        if probs.sum() > 0:
-            probs = probs / probs.sum()
-        else:
-            probs = np.ones(len(candidates)) / len(candidates)
-        
-        return probs
+    def word_to_hash_seed(self, word: str) -> int:
+        """Convert word to hash-based seed for XOR operations"""
+        return int(hashlib.md5(word.encode()).hexdigest()[:8], 16)
     
-    def generate(self, seed: str, length: int = 80) -> str:
-        """Generate using polynomial-modulated selection"""
+    def generate(self, seed: str, length: int = 80, enable_xor: bool = True) -> str:
+        """Generate using polynomial-modulated selection with XOR branching"""
         words = seed.split()[:2]
         while len(words) < 2:
-            words.append(self.vocab[0])
+            words.append(self.vocab[0] if self.vocab else "the")
         
         # Validate seed
         seed_key = tuple(words)
         if seed_key not in self.model:
-            seed_key = self.keys[np.random.randint(len(self.keys))]
+            seed_key = self.keys[np.random.randint(len(self.keys))] if self.keys else tuple(words)
         
         output = list(seed_key)
         
-        print(f"\n[Generating with polynomial modulation...]")
+        print(f"[Generating with polynomial + XOR branching...]")
+        print(f"  XOR branching: {'ENABLED' if enable_xor else 'DISABLED'}")
+        
+        next_word = words[-1] if words else ""
         
         for step in range(length):
             context = tuple(output[-2:])
@@ -82,19 +169,60 @@ class HybridPolynomialGenerator:
             
             if not candidates:
                 # Fallback
-                context = self.keys[np.random.randint(len(self.keys))]
-                output.extend(list(context))
+                if self.keys:
+                    context = self.keys[np.random.randint(len(self.keys))]
+                    output.extend(list(context))
                 continue
             
-            # Use polynomial to weight candidates
-            probs = self.compute_probabilities(context, candidates)
+            # Use polynomial to compute base probabilities
+            probs = np.zeros(len(candidates))
+            for i, cand in enumerate(candidates):
+                cand_seed = self.word_to_seed(cand)
+                cand_value = self.evaluate_poly(cand_seed)
+                context_value = self.evaluate_poly(self.word_to_seed(next_word))
+                
+                # Distance-based similarity
+                similarity = 1.0 / (1.0 + abs(context_value - cand_value))
+                
+                # Add hash-based variation
+                hash_seed = self.word_to_hash_seed(cand)
+                hash_factor = (hash_seed % 1000) / 1000.0
+                
+                probs[i] = similarity * (0.7 + 0.6 * hash_factor)
+            
+            # Normalize base probabilities
+            if probs.sum() > 0:
+                probs = probs / probs.sum()
+            else:
+                probs = np.ones(len(candidates)) / len(candidates)
+            
+            # Apply XOR branching to create contingent paths
+            if enable_xor:
+                probs = self.xor_engine.xor_branch(probs, candidates)
+                
+                # Re-normalize after XOR branching
+                if probs.sum() > 0:
+                    probs = probs / probs.sum()
+                else:
+                    probs = np.ones(len(candidates)) / len(candidates)
+            
+            # Select next word
             next_word = np.random.choice(candidates, p=probs)
             output.append(next_word)
             
             if step % 20 == 0 and step > 0:
-                print(f"  Step {step}/{length}")
+                stats = self.xor_engine.get_statistics()
+                print(f"  Step {step}/{length} | XOR branches: {stats.get('total_branches', 0)} | XOR state: {stats.get('xor_state', 0):08x}")
         
         print(f"[Complete]")
+        
+        # Final statistics
+        if enable_xor:
+            stats = self.xor_engine.get_statistics()
+            print(f"[XOR Branching Statistics]")
+            for key, val in stats.items():
+                print(f"  {key}: {val}")
+        
         return " ".join(output)
 
 
@@ -106,7 +234,7 @@ class SuperpolynomialCodec:
     
     @staticmethod
     def encode_dataset_to_poly(tokens: List[str], model: Dict) -> np.ndarray:
-        print("\n[Encoding dataset...]")
+        print("[Encoding dataset...]")
         dataset = {
             'tokens': tokens,
             'model': dict(model),
@@ -119,7 +247,7 @@ class SuperpolynomialCodec:
         
         print(f"  Compressed: {compressed_len:,} bytes")
         
-        length_bytes = compressed_len.to_bytes(8, byteorder='little')
+        length_bytes = compressed_len.to_bytes(16, byteorder='little')
         full_data = length_bytes + compressed
         
         chunk_size = 8
@@ -127,12 +255,12 @@ class SuperpolynomialCodec:
         poly = np.zeros(num_coeffs, dtype=np.float64)
         
         for i in range(num_coeffs):
-            start = (i * chunk_size)+1 % (i+1)
+            start = i * chunk_size
             end = min(start + chunk_size, len(full_data))
             chunk = full_data[start:end]
             
             if len(chunk) < chunk_size:
-                chunk += b'\x00' * (chunk_size - len(chunk))
+                chunk += b'\\x00' * (chunk_size - len(chunk))
             
             coeff = int.from_bytes(chunk, byteorder='little', signed=False)
             poly[i] = float(coeff)
@@ -142,7 +270,7 @@ class SuperpolynomialCodec:
     
     @staticmethod
     def decode_poly_to_dataset(poly: np.ndarray) -> Tuple[List[str], Dict, List[str]]:
-        print("\n[Decoding dataset...]")
+        print("[Decoding dataset...]")
         
         chunk_size = 8
         byte_chunks = []
@@ -153,8 +281,8 @@ class SuperpolynomialCodec:
             byte_chunks.append(chunk)
         
         full_data = b''.join(byte_chunks)
-        compressed_len = int.from_bytes(full_data[:8], byteorder='little')
-        compressed = full_data[8:8+compressed_len]
+        compressed_len = int.from_bytes(full_data[:16], byteorder='little')
+        compressed = full_data[16:16+compressed_len]
         
         try:
             data_bytes = zlib.decompress(compressed)
@@ -162,19 +290,25 @@ class SuperpolynomialCodec:
             
             model = defaultdict(list, dataset['model'])
             return dataset['tokens'], model, dataset['vocab']
-        except:
+        except Exception as e:
+            print(f"  Decode error: {e}")
             return [], defaultdict(list), []
 
 
 # ================================================================
 # BUILD MODEL
 # ================================================================
-def build_ngram(tokens, n=2):
+def build_ngram(tokens: List[str], n: int = 2) -> Dict[Tuple[str, ...], List[str]]:
     m = defaultdict(list)
-    for i in range(len(tokens) - n):
-        key = tuple(tokens[i:i+n])
-        m[key].append(tokens[i+n])
-    return m
+    L = len(tokens)
+    if n <= 0 or L <= n:
+        return dict(m)
+
+    for i in range(L - n):
+        key = tuple(tokens[i:i + n])
+        m[key].append(tokens[i + n])
+
+    return dict(m)
 
 
 # ================================================================
@@ -182,49 +316,52 @@ def build_ngram(tokens, n=2):
 # ================================================================
 def main():
     print("="*70)
-    print("POLYNOMIAL TEXT GENERATOR")
+    print("POLYNOMIAL TEXT GENERATOR WITH XOR BRANCHING")
     print("="*70)
     
-    path = input("\nEnter text file: ").strip()
+    path = input("Enter text file: ").strip()
     if not os.path.exists(path):
         print("File not found")
         return
     
-    print("\n[Loading corpus...]")
+    print("[Loading corpus...]")
     toks = open(path, encoding="utf-8").read().lower().split()
     print(f"  Loaded {len(toks):,} tokens")
     
-    print("\n[Building model...]")
+    print("[Building model...]")
     model = build_ngram(toks, 2)
     vocab = list(set(toks))
     
+
+    xor_threshold = 0.1
+    xor_strength = 0.9
+    
     # Create polynomial from dataset statistics
-    print("\n[Creating polynomial from dataset...]")
-    
-    # Method 1: Store dataset
-    codec = SuperpolynomialCodec()
-    storage_poly = codec.encode_dataset_to_poly(toks, model)
-    
-    # Method 2: Create generative polynomial from statistics
+    print("[Creating polynomial from dataset...]")
     vocab_size = len(vocab)
-    # Use token frequencies as polynomial coefficients
     freq_dist = Counter(toks)
-    top_freqs = [freq_dist[word] for word in vocab[:100]]  # Top 100 words
+    top_freqs = [freq_dist[word] for word in vocab[:100]]
     generative_poly = np.array(top_freqs, dtype=np.float64)
     
-    generator = HybridPolynomialGenerator(generative_poly, toks, model)
+    generator = HybridPolynomialGenerator(
+        generative_poly, 
+        toks, 
+        model,
+        xor_threshold=xor_threshold,
+        xor_strength=xor_strength
+    )
   
-    print("\n" + "="*70)
-    print("Ready for generation!")
+    print("" + "="*70)
+    print("Ready for generation with XOR branching!")
     print("="*70)
     
     while True:
-        s = input("\nseed (exit to quit): ")
-        if s == "exit":
-            break
+        s = input("seed (or 'exit' to quit): ")
+        length = 800
+        enable_xor = True
         
-        output = generator.generate(s, length=800)
-        print("\n" + "─"*70)
+        output = generator.generate(s, length=length, enable_xor=enable_xor)
+        print("" + "─"*70)
         print(output)
         print("─"*70)
 
