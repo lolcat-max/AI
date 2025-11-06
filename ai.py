@@ -137,9 +137,7 @@ print("TEXT GENERATION AT DIFFERENT FOLD STATES")
 print("="*70)
 
 fold_states = [0.0, 0.25, 0.5, 0.75, 1.0]
-start_words = ['the', 'neural', 'origami', 'knowledge', 'attention']
 
-generated_texts = []
 while True:
     text = llm.generate_text(start_word=input("USER: "), max_words=800, fold_state=41.0)
     print(text)  
