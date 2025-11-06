@@ -141,7 +141,7 @@ start_words = ['the', 'neural', 'origami', 'knowledge', 'attention']
 
 generated_texts = []
 while True:
-    text = llm.generate_text(start_word=input("USER: "), max_words=800, fold_state=4.0)
+    text = llm.generate_text(start_word=input("USER: "), max_words=800, fold_state=41.0)
     print(text)  
     print()
     
