@@ -143,4 +143,5 @@ generated_texts = []
 while True:
     text = llm.generate_text(start_word=input("USER: "), max_words=800, fold_state=1.0)
     print(text)  
+    print()
     
