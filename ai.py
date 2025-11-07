@@ -221,7 +221,7 @@ class OrigamiLLM:
             judgments[rule] = compliance
             score *= compliance
         
-        score = max(0, min(1, score ** (1/(len(rules)+1))))  # Geometric mean for overall score
+        score = max(0,score)  # Geometric mean for overall score
         
         return {
             "overall_score": score,
