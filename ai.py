@@ -2,7 +2,7 @@ import math
 import random
 import hashlib
 from functools import singledispatch
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,7 +22,7 @@ def _swap_index_pairs(n: int, rng: np.random.Generator, swap_frac: float = 0.3):
         return []
     k = max(1, int(swap_frac * n) // 2)
     idx = rng.permutation(n)
-    pairs = [(int(idx[2*i]), int(idx[i+1])) for i in range(min(k, n // 2))]
+    pairs = [(int(idx[2*i]), int(idx[2*i+1])) for i in range(min(k, n // 2))]
     return pairs
 
 def _apply_pairs_permutation(seq, pairs):
@@ -117,7 +117,7 @@ class EmbeddedTemplateMatcher:
     def __init__(self, vector_dim=128):
         self.vector_dim = vector_dim
         self.templates: List[Tuple[str, np.ndarray]] = []
-        self.word_vectors: dict[str, np.ndarray] = {}
+        self.word_vectors: Dict[str, np.ndarray] = {}
 
     def _rng_from_word(self, word: str) -> np.random.Generator:
         hash_bytes = hashlib.sha256(word.encode("utf-8")).digest()
@@ -168,110 +168,170 @@ class EmbeddedTemplateMatcher:
 
 
 # ================================================================
-# OrigamiLLM (n-gram + templates + dtype sublimate)
+# N-grams and Modulus Avalanche Utilities
 # ================================================================
 
-class OrigamiLLM:
-    def __init__(self):
-        filename = input("Filename: ").strip()
-        with open(filename, encoding="utf-8") as f:
-            text = f.read()
-        self.corpus = text.lower().split(".")
+def build_ngrams(corpus_sentences: List[str]) -> Tuple[Dict[str, List[str]], Dict[Tuple[str, str], List[str]]]:
+    bigrams: Dict[str, List[str]] = {}
+    trigrams: Dict[Tuple[str, str], List[str]] = {}
+    for sentence in corpus_sentences:
+        words = sentence.split()
+        if len(words) < 3:
+            continue
+        for i in range(len(words) - 1):
+            w0, w1 = words[i], words[i + 1]
+            bigrams.setdefault(w0, []).append(w1)
+        for i in range(len(words) - 2):
+            key = (words[i], words[i + 1])
+            trigrams.setdefault(key, []).append(words[i + 2])
+    return bigrams, trigrams
 
-        self.bigrams: dict[str, List[str]] = {}
-        self.trigrams: dict[Tuple[str, str], List[str]] = {}
-        self.build_model()
+def avalanche_list_mod(lst: List[str], rounds: int, m: int) -> List[str]:
+    # Duplicate entries by cycling bucket ((r) % m) each round to avalanche list mass in phases
+    out = list(lst)
+    n = len(out)
+    for r in range(rounds):
+        bucket = r % max(m, 1)
+        extra = [out[i] for i in range(n) if (i % m) == bucket]
+        out.extend(extra)
+        n = len(out)
+    return out
 
-        self.template_matcher = EmbeddedTemplateMatcher()
-        self.template_matcher.build_templates_from_corpus(self.corpus)
+def avalanche_ngrams_mod(bigrams: Dict[str, List[str]],
+                         trigrams: Dict[Tuple[str, str], List[str]],
+                         rounds: int,
+                         m: int):
+    for w in list(bigrams.keys()):
+        bigrams[w] = avalanche_list_mod(bigrams[w], rounds=rounds, m=m)
+    for k in list(trigrams.keys()):
+        trigrams[k] = avalanche_list_mod(trigrams[k], rounds=rounds, m=m)
 
-    def build_model(self):
-        for sentence in self.corpus:
-            words = sentence.split()
-            if len(words) < 3:
-                continue
-            for i in range(len(words) - 1):
-                if words[i] not in self.bigrams:
-                    self.bigrams[words[i]] = []
-                self.bigrams[words[i]].append(words[i + 1])
-            for i in range(len(words) - 2):
-                key = (words[i], words[i + 1])
-                if key not in self.trigrams:
-                    self.trigrams[key] = []
-                self.trigrams[key].append(words[i + 2])
+def avalanche_probs_mod(probs: np.ndarray, m: int, rounds: int, eps: float = 1e-12) -> np.ndarray:
+    # Repeatedly smooth probabilities by modulus buckets, then renormalize to keep a valid p
+    p = probs.astype(float, copy=True)
+    p = np.maximum(p, eps)
+    total = p.sum()
+    p = p / total if total > 0 else np.ones_like(p) / max(1, p.size)
+    n = p.size
+    for r in range(rounds):
+        bucket_sums = np.zeros(m, dtype=float)
+        bucket_counts = np.zeros(m, dtype=float)
+        for i in range(n):
+            b = i % m
+            bucket_sums[b] += p[i]
+            bucket_counts[b] += 1.0
+        bucket_avg = bucket_sums / np.maximum(bucket_counts, 1.0)
+        b_avg_vec = np.fromiter((bucket_avg[i % m] for i in range(n)), dtype=float, count=n)
+        mix = 0.5 + 0.5 * (r + 1) / max(rounds, 1)  # ramp mixing across rounds
+        p = (1.0 - mix) * p + mix * b_avg_vec
+        p = np.maximum(p, eps)
+        s = p.sum()
+        p = p / s if s > 0 else np.ones_like(p) / max(1, p.size)
+    return p
 
-    def generate_text(
-        self,
-        start_word: Optional[str] = None,
-        max_words: int = 200,
-        stack_state: float = 1.0,
-        chirality_strength: float = 1.0,
-        swap_frac: float = 0.35,
-    ) -> str:
-        if not self.bigrams:
-            return ""
-        if start_word is None or start_word not in self.bigrams:
-            start_word = random.choice(list(self.bigrams.keys()))
 
-        result = [start_word]
-        current_word = start_word
+# ================================================================
+# Single-function text generator using modulus avalanche
+# ================================================================
 
-        for _ in range(max_words - 1):
-            use_model = random.random() < stack_state
-            candidates: List[str] = []
+def generate_text_once_mod5(
+    filename: str,
+    start_word: Optional[str] = None,
+    max_words: int = 200,
+    stack_state: float = 1.0,
+    chirality_strength: float = 1.0,
+    swap_frac: float = 0.35,
+    avalanche_rounds: int = 3,
+    mod: int = 5,
+    use_sublimate: bool = False,
+    rng_seed: Optional[int] = None,
+) -> str:
+    rng = np.random.default_rng(rng_seed)
 
-            if use_model:
-                trigram_key = tuple(result[-2:]) if len(result) >= 2 else None
-                if trigram_key and trigram_key in self.trigrams:
-                    candidates = self.trigrams[trigram_key]
-                elif current_word in self.bigrams:
-                    candidates = self.bigrams[current_word]
+    # Read and prepare corpus
+    with open(filename, encoding="utf-8") as f:
+        text = f.read().lower()
+    corpus = [s.strip() for s in text.split(".") if s.strip()]
 
-            if not candidates and self.bigrams:
-                candidates = [random.choice(list(self.bigrams.keys())) for _ in range(5)]
+    # Build n-grams
+    bigrams, trigrams = build_ngrams(corpus)
 
-            probs = np.ones(len(candidates), dtype=float)
-            s = float(probs.sum())
-            probs = probs / s if s > 0 else probs
+    # Avalanche dataset (lists) by modulus buckets, repeatedly
+    avalanche_ngrams_mod(bigrams, trigrams, rounds=avalanche_rounds, m=mod)
 
-            context = " ".join(result[-5:])
-            best_template_tuple = self.template_matcher.find_best_template(context)
+    # Templates
+    tmpl = EmbeddedTemplateMatcher()
+    tmpl.build_templates_from_corpus(corpus, num_templates=50)
 
-            if chirality_strength > 0 and best_template_tuple is not None and candidates:
-                template_text, _ = best_template_tuple
-                template_words = template_text.split()
-                try:
-                    idx = template_words.index(result[-1])
-                    if idx < len(template_words) - 1:
-                        template_next_word = template_words[idx + 1]
-                        if template_next_word in candidates:
-                            boost_idx = candidates.index(template_next_word)
-                            twist_factor = math.exp(chirality_strength)
-                            probs[boost_idx] += 5.0 * chirality_strength * twist_factor
-                except (ValueError, IndexError):
-                    pass
+    if not bigrams:
+        return ""
 
-            total = float(probs.sum())
-            probs = probs / total if total > 0 else np.ones_like(probs) / max(1, len(probs))
+    # Seed
+    if start_word is None or start_word not in bigrams:
+        start_word = rng.choice(list(bigrams.keys()))
 
+    result = [start_word]
+    current = start_word
+
+    for _ in range(max_words - 1):
+        use_model = rng.random() < stack_state
+        candidates: List[str] = []
+
+        if use_model:
+            if len(result) >= 2:
+                tri_key = (result[-2], result[-1])
+                if tri_key in trigrams:
+                    candidates = trigrams[tri_key]
+            if not candidates and current in bigrams:
+                candidates = bigrams[current]
+
+        if not candidates and bigrams:
+            vocab = list(bigrams.keys())
+            k = min(5, len(vocab))
+            candidates = list(rng.choice(vocab, size=k, replace=False))
+
+        # Base uniform probs
+        probs = np.ones(len(candidates), dtype=float)
+        probs /= probs.sum() if probs.sum() > 0 else 1.0
+
+        # Template-driven boost (chirality)
+        context_text = " ".join(result[-5:])
+        best_t = tmpl.find_best_template(context_text)
+        if chirality_strength > 0 and best_t is not None and candidates:
+            template_text, _ = best_t
+            t_words = template_text.split()
+            try:
+                idx = t_words.index(result[-1])
+                if idx < len(t_words) - 1:
+                    tnext = t_words[idx + 1]
+                    if tnext in candidates:
+                        bidx = candidates.index(tnext)
+                        twist = math.exp(chirality_strength)
+                        probs[bidx] += 5.0 * chirality_strength * twist
+            except ValueError:
+                pass
+
+        # Optional deterministic “sublimation” swap before modulus avalanche
+        if use_sublimate and len(candidates) > 1:
             candidates, probs = sublimate_candidates_and_probs(
-                candidates, probs, context=context, swap_frac=swap_frac
+                candidates, probs, context=context_text, swap_frac=swap_frac
             )
 
-            if candidates:
-                next_word = np.random.choice(candidates, p=probs)
-            else:
-                next_word = random.choice(list(self.bigrams.keys())) if self.bigrams else "end"
+        # Normalize then avalanche probabilities by modulus buckets repeatedly
+        s = probs.sum()
+        probs = probs / s if s > 0 else np.ones_like(probs) / max(1, probs.size)
+        probs = avalanche_probs_mod(probs, m=mod, rounds=avalanche_rounds)
 
-            result.append(next_word)
-            current_word = next_word
+        # Final choice with valid p
+        next_word = rng.choice(candidates, p=probs)
+        result.append(next_word)
+        current = next_word
 
-        generated = " ".join(result)
-        return generated
+    return " ".join(result)
 
 
 # ================================================================
-# Chiral stacked 2D geometry with vsplit
+# Chiral stacked 2D geometry with vsplit (optional visualization)
 # ================================================================
 
 def wrap_angle_pi(theta: float) -> float:
@@ -295,7 +355,6 @@ def create_2d_layer(num_points=100, size=1.0, layer_id=0):
     return points
 
 def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spacing=0.1):
-    # Build one combined (N_total, 3) array; each layer contributes the same number of rows
     all_layers = []
     points_per_layer = None
     for i in range(num_layers):
@@ -314,8 +373,6 @@ def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spac
         all_layers.append(stacked_points)
         for j in range(num_layers):
             layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
-            if points_per_layer is None:
-                points_per_layer = len(layer_points)
             chiral_twist_raw = j * np.deg2rad(twist_angle)
             chiral_twist = wrap_angle_pi(chiral_twist_raw)
             rot_matrix = np.array([
@@ -326,12 +383,10 @@ def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spac
             z = np.full((len(twisted_points), 1), i * z_spacing)
             stacked_points = np.hstack((twisted_points, z))
             all_layers.append(stacked_points)
-    # Concatenate once; do not use vstack here, as splitting is requested via vsplit later
     combined = np.concatenate(all_layers, axis=0)
     return combined, points_per_layer
 
 def split_layers_with_vsplit(combined: np.ndarray, points_per_layer: int) -> List[np.ndarray]:
-    # Recover equal-sized layers row-wise using np.vsplit
     n_total = combined.shape[0]
     if n_total % points_per_layer != 0:
         raise ValueError("Total rows not divisible by points_per_layer for equal vsplit.")
@@ -353,8 +408,7 @@ def interpolate_chirality(base_layers: List[np.ndarray], chiral_layers: List[np.
             interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
             interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
             interpolated_layers.append(interp_layer)
-        
-    return interpolated_layers*8
+    return interpolated_layers * 8
 
 def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
     if ax is None:
@@ -374,43 +428,25 @@ def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
 
 if __name__ == "__main__":
     print("="*70)
-    print("CHIRAL STACKED 2D LLM - TEXT GENERATION DEMO (vsplit edition)")
+    print("CHIRAL STACKED 2D LLM - SINGLE-FUNCTION TEXT GENERATION (modulus avalanche)")
     print("="*70)
 
-    llm = OrigamiLLM()
-
-    base_twist = 0.0
-    chiral_twist = 15.0
-
-    # Get combined arrays
-    base_combined, ppl = create_stacked_chiral_layers_combined(num_layers=4, twist_angle=base_twist)
-    chiral_combined, _ = create_stacked_chiral_layers_combined(num_layers=4, twist_angle=chiral_twist)
-
-    # Recover per-layer arrays using vsplit
-    base_layers = split_layers_with_vsplit(base_combined, ppl)
-    chiral_layers = split_layers_with_vsplit(chiral_combined, ppl)
-
-    print("\n" + "="*70)
-    print("INTERACTIVE TEXT GENERATION")
-    print("="*70)
-
+    filename = input("Filename: ").strip()
     while True:
-        try:
-            start_word = input("USER (start word): ").strip()
-        except EOFError:
-            break
-        if not start_word:
-            continue
+        start = input("Start word (blank for auto): ").strip() or None
 
-        print("\n--- GENERATED TEXT ---")
-        text = llm.generate_text(
-            start_word=start_word,
+        text = generate_text_once_mod5(
+            filename=filename,
+            start_word=start,
             max_words=800,
             stack_state=1.0,
             chirality_strength=1.0,
             swap_frac=0.95,
+            avalanche_rounds=8,
+            mod=5,
+            use_sublimate=False,
+            rng_seed=None,
         )
+        print("\n--- GENERATED TEXT ---")
         print(text)
         print("-" * 22 + "\n")
-        # To visualize, uncomment:
-        # visualize_stacked_layers(interpolate_chirality(base_layers, chiral_layers, 1.0))
