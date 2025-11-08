@@ -347,6 +347,12 @@ def interpolate_chirality(base_layers: List[np.ndarray], chiral_layers: List[np.
         interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
         interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
         interpolated_layers.append(interp_layer)
+        for i in range(len(base_layers)):
+            base_layer = base_layers[i]
+            chiral_layer = chiral_layers[i]
+            interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
+            interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
+            interpolated_layers.append(interp_layer)
     return interpolated_layers
 
 def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
@@ -401,7 +407,7 @@ if __name__ == "__main__":
             max_words=800,
             stack_state=1.0,
             chirality_strength=1.0,
-            swap_frac=0.35,
+            swap_frac=0.95,
         )
         print(text)
         print("-" * 22 + "\n")
