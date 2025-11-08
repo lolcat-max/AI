@@ -2,17 +2,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import random
-from collections import Counter, defaultdict
+from functools import singledispatch
+from typing import List, Tuple, Optional
 import hashlib
-import re  # Added for rule parsing and judgment
 
 # ================================================================
-# NEW: EMBEDDED TEMPLATE ENGINE
+# Deterministic dtype-based "sublimation" swaps
 # ================================================================
-# dtype_swap_sublimation.py
-from functools import singledispatch
-import hashlib
-import numpy as np
 
 def _rng_from_context(context: str) -> np.random.Generator:
     h = hashlib.sha256(context.encode("utf-8")).digest()
@@ -78,10 +74,7 @@ def _(x: np.ndarray, *, context: str = "", swap_frac: float = 0.3, casting: str 
         pairs = _swap_index_pairs(arr.size, rng, swap_frac)
         out = _apply_pairs_permutation_array(arr, pairs)
         out = safe_cast(out, arr.dtype, casting=casting)
-    elif kind in ("S", "U", "O"):
-        pairs = _swap_index_pairs(arr.size, rng, swap_frac)
-        out = _apply_pairs_permutation_array(arr, pairs)
-    elif kind in ("V",):
+    elif kind in ("S", "U", "O", "V"):
         pairs = _swap_index_pairs(arr.size, rng, swap_frac)
         out = _apply_pairs_permutation_array(arr, pairs)
     else:
@@ -92,7 +85,7 @@ def _(x: np.ndarray, *, context: str = "", swap_frac: float = 0.3, casting: str 
     return out.reshape(x.shape)
 
 def sublimate_candidates_and_probs(
-    candidates: list[str],
+    candidates: List[str],
     probs: np.ndarray,
     *,
     context: str,
@@ -113,18 +106,15 @@ def sublimate_candidates_and_probs(
         new_probs = new_probs / s
     return new_candidates, new_probs
 
-
 # ================================================================
 # Embedded Template Engine
 # ================================================================
+
 class EmbeddedTemplateMatcher:
-    """
-    Finds and uses semantic templates derived from the corpus to guide text generation.
-    """
     def __init__(self, vector_dim=128):
         self.vector_dim = vector_dim
-        self.templates = []        # List[(template_text, template_vector)]
-        self.word_vectors = {}     # word -> vector
+        self.templates: List[Tuple[str, np.ndarray]] = []
+        self.word_vectors: dict[str, np.ndarray] = {}
 
     def _rng_from_word(self, word: str) -> np.random.Generator:
         hash_bytes = hashlib.sha256(word.encode("utf-8")).digest()
@@ -151,7 +141,7 @@ class EmbeddedTemplateMatcher:
         norm = np.linalg.norm(avg_vec)
         return avg_vec / norm if norm > 0 else np.zeros(self.vector_dim)
 
-    def build_templates_from_corpus(self, corpus: list, num_templates: int = 50):
+    def build_templates_from_corpus(self, corpus: List[str], num_templates: int = 50):
         step = max(1, len(corpus) // max(1, num_templates))
         for i in range(0, len(corpus), step):
             sentence = corpus[i]
@@ -159,7 +149,7 @@ class EmbeddedTemplateMatcher:
                 template_vector = self._get_sentence_vector(sentence)
                 self.templates.append((sentence, template_vector))
 
-    def find_best_template(self, context: str) -> tuple | None:
+    def find_best_template(self, context: str) -> Optional[Tuple[str, np.ndarray]]:
         if not self.templates or not context:
             return None
         context_vector = self._get_sentence_vector(context)
@@ -174,22 +164,22 @@ class EmbeddedTemplateMatcher:
         return None
 
 # ================================================================
-# OrigamiLLM (n-gram + templates + optional degradation + dtype sublimate)
+# OrigamiLLM (n-gram + templates + dtype sublimate)
 # ================================================================
+
 class OrigamiLLM:
     def __init__(self):
-        filename = input("Filename: ")
+        filename = input("Filename: ").strip()
         with open(filename, encoding="utf-8") as f:
             text = f.read()
         self.corpus = text.lower().split(".")
 
-        self.bigrams: dict[str, list[str]] = {}
-        self.trigrams: dict[tuple[str, str], list[str]] = {}
+        self.bigrams: dict[str, List[str]] = {}
+        self.trigrams: dict[Tuple[str, str], List[str]] = {}
         self.build_model()
 
         self.template_matcher = EmbeddedTemplateMatcher()
         self.template_matcher.build_templates_from_corpus(self.corpus)
-
 
     def build_model(self):
         for sentence in self.corpus:
@@ -206,7 +196,14 @@ class OrigamiLLM:
                     self.trigrams[key] = []
                 self.trigrams[key].append(words[i + 2])
 
-    def generate_text(self, start_word=None, max_words=200, stack_state=1.0, chirality_strength=1.0, swap_frac=0.35):
+    def generate_text(
+        self,
+        start_word: Optional[str] = None,
+        max_words: int = 200,
+        stack_state: float = 1.0,
+        chirality_strength: float = 1.0,
+        swap_frac: float = 0.35,
+    ) -> str:
         if not self.bigrams:
             return ""
         if start_word is None or start_word not in self.bigrams:
@@ -215,12 +212,9 @@ class OrigamiLLM:
         result = [start_word]
         current_word = start_word
 
-        for step in range(max_words - 1):
-            context7 = " ".join(result[-7:])
-         
-
+        for _ in range(max_words - 1):
             use_model = random.random() < stack_state
-            candidates = []
+            candidates: List[str] = []
 
             if use_model:
                 trigram_key = tuple(result[-2:]) if len(result) >= 2 else None
@@ -229,16 +223,13 @@ class OrigamiLLM:
                 elif current_word in self.bigrams:
                     candidates = self.bigrams[current_word]
 
-            if not candidates:
-                if self.bigrams:
-                    candidates = [random.choice(list(self.bigrams.keys())) for _ in range(5)]
+            if not candidates and self.bigrams:
+                candidates = [random.choice(list(self.bigrams.keys())) for _ in range(5)]
 
-            # Base probabilities (uniform over candidates)
             probs = np.ones(len(candidates), dtype=float)
             s = float(probs.sum())
             probs = probs / s if s > 0 else probs
 
-            # Template tuning
             context = " ".join(result[-5:])
             best_template_tuple = self.template_matcher.find_best_template(context)
 
@@ -256,20 +247,14 @@ class OrigamiLLM:
                 except (ValueError, IndexError):
                     pass
 
-            # Normalize to ensure a valid probability vector for np.random.choice
             total = float(probs.sum())
             probs = probs / total if total > 0 else np.ones_like(probs) / max(1, len(probs))
 
-            # Apply deterministic type-based swapping sublimation to candidates and probs
             candidates, probs = sublimate_candidates_and_probs(
                 candidates, probs, context=context, swap_frac=swap_frac
             )
 
-            # Optional degradation: corrupt probabilities after sublimation
-
-         
             if candidates:
-                # np.random.choice expects 1D p that sums to 1
                 next_word = np.random.choice(candidates, p=probs)
             else:
                 next_word = random.choice(list(self.bigrams.keys())) if self.bigrams else "end"
@@ -280,7 +265,10 @@ class OrigamiLLM:
         generated = " ".join(result)
         return generated
 
-# Chiral stacked 2D geometry utilities (unchanged)
+# ================================================================
+# Chiral stacked 2D geometry utilities
+# ================================================================
+
 def create_2d_layer(num_points=100, size=1.0, layer_id=0):
     x = np.linspace(-size/2, size/2, int(np.sqrt(num_points)))
     y = np.linspace(-size/2, size/2, int(np.sqrt(num_points)))
@@ -297,8 +285,10 @@ def create_stacked_chiral_layers(num_layers=8, twist_angle=15.0, z_spacing=0.1):
     for i in range(num_layers):
         layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
         chiral_twist = i * np.deg2rad(twist_angle)
-        rot_matrix = np.array([[np.cos(chiral_twist), -np.sin(chiral_twist)],
-                               [np.sin(chiral_twist), np.cos(chiral_twist)]])
+        rot_matrix = np.array([
+            [np.cos(chiral_twist), -np.sin(chiral_twist)],
+            [np.sin(chiral_twist),  np.cos(chiral_twist)],
+        ])
         twisted_points = layer_points @ rot_matrix
         z = np.full((len(twisted_points), 1), i * z_spacing)
         stacked_points = np.hstack((twisted_points, z))
@@ -327,6 +317,10 @@ def visualize_stacked_layers(layers, ax=None):
     ax.set_zlabel('Z')
     plt.show()
 
+# ================================================================
+# Demo / CLI
+# ================================================================
+
 if __name__ == "__main__":
     print("="*70)
     print("CHIRAL STACKED 2D LLM - TEXT GENERATION DEMO")
@@ -344,7 +338,10 @@ if __name__ == "__main__":
     print("="*70)
 
     while True:
-        start_word = input("USER (start word): ").strip()
+        try:
+            start_word = input("USER (start word): ").strip()
+        except EOFError:
+            break
         if not start_word:
             continue
 
@@ -358,5 +355,5 @@ if __name__ == "__main__":
         )
         print(text)
         print("-" * 22 + "\n")
-        # Optionally:
-        # visualize_stacked_layers(interpolate_chirality(base_layers, chiral_layers, 1.0))
+        # To visualize, uncomment the next line:
+        # visualize_stacked_layers(interpolate_chirality(base_layers, chiral_layers,, 1.0))
