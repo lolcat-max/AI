@@ -1,10 +1,12 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import math
 import random
+import hashlib
 from functools import singledispatch
 from typing import List, Tuple, Optional
-import hashlib
+
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 # ================================================================
 # Deterministic dtype-based "sublimation" swaps
@@ -18,9 +20,9 @@ def _rng_from_context(context: str) -> np.random.Generator:
 def _swap_index_pairs(n: int, rng: np.random.Generator, swap_frac: float = 0.3):
     if n <= 1:
         return []
-    k = max(1, int(swap_frac * n) // 2)
+    k = max(1, int(swap_frac * n) // 4)
     idx = rng.permutation(n)
-    pairs = [(int(idx[2*i]), int(idx[2*i+1])) for i in range(min(k, n // 2))]
+    pairs = [(int(idx[2*i]), int(idx[i+1])) for i in range(min(k, n // 2))]
     return pairs
 
 def _apply_pairs_permutation(seq, pairs):
@@ -106,6 +108,7 @@ def sublimate_candidates_and_probs(
         new_probs = new_probs / s
     return new_candidates, new_probs
 
+
 # ================================================================
 # Embedded Template Engine
 # ================================================================
@@ -162,6 +165,7 @@ class EmbeddedTemplateMatcher:
         if best_similarity > 0.4:
             return self.templates[best_idx]
         return None
+
 
 # ================================================================
 # OrigamiLLM (n-gram + templates + dtype sublimate)
@@ -242,8 +246,8 @@ class OrigamiLLM:
                         template_next_word = template_words[idx + 1]
                         if template_next_word in candidates:
                             boost_idx = candidates.index(template_next_word)
-                            twist_factor = 1 + np.sin(np.pi * chirality_strength)
-                            probs[boost_idx] += 10.0 * chirality_strength * twist_factor
+                            twist_factor = math.exp(chirality_strength)
+                            probs[boost_idx] += 5.0 * chirality_strength * twist_factor
                 except (ValueError, IndexError):
                     pass
 
@@ -265,26 +269,41 @@ class OrigamiLLM:
         generated = " ".join(result)
         return generated
 
+
 # ================================================================
-# Chiral stacked 2D geometry utilities
+# Chiral stacked 2D geometry with vsplit
 # ================================================================
 
+def wrap_angle_pi(theta: float) -> float:
+    # Wrap angle to (-pi, pi] using C-like remainder via np.fmod
+    theta = np.fmod(theta + np.pi, 2 * np.pi)
+    if theta <= 0:
+        theta += 2 * np.pi
+    return theta - np.pi
+
 def create_2d_layer(num_points=100, size=1.0, layer_id=0):
-    x = np.linspace(-size/2, size/2, int(np.sqrt(num_points)))
-    y = np.linspace(-size/2, size/2, int(np.sqrt(num_points)))
+    side = int(np.sqrt(num_points))
+    x = np.linspace(-size/2, size/2, side)
+    y = np.linspace(-size/2, size/2, side)
     X, Y = np.meshgrid(x, y)
-    Y[::2] += (y[1] - y[0]) / 2
+    if side > 1:
+        Y[::2] *= (y[1] - y[0]) / 2
     points = np.column_stack((X.ravel()[:num_points], Y.ravel()[:num_points]))
     theta = np.deg2rad(layer_id * 30)
     rot_matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
     points = points @ rot_matrix
     return points
 
-def create_stacked_chiral_layers(num_layers=8, twist_angle=15.0, z_spacing=0.1):
-    layers = []
+def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spacing=0.1):
+    # Build one combined (N_total, 3) array; each layer contributes the same number of rows
+    all_layers = []
+    points_per_layer = None
     for i in range(num_layers):
         layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
-        chiral_twist = i * np.deg2rad(twist_angle)
+        if points_per_layer is None:
+            points_per_layer = len(layer_points)
+        chiral_twist_raw = i * np.deg2rad(twist_angle)
+        chiral_twist = wrap_angle_pi(chiral_twist_raw)
         rot_matrix = np.array([
             [np.cos(chiral_twist), -np.sin(chiral_twist)],
             [np.sin(chiral_twist),  np.cos(chiral_twist)],
@@ -292,10 +311,20 @@ def create_stacked_chiral_layers(num_layers=8, twist_angle=15.0, z_spacing=0.1):
         twisted_points = layer_points @ rot_matrix
         z = np.full((len(twisted_points), 1), i * z_spacing)
         stacked_points = np.hstack((twisted_points, z))
-        layers.append(stacked_points)
-    return layers
+        all_layers.append(stacked_points)
+    # Concatenate once; do not use vstack here, as splitting is requested via vsplit later
+    combined = np.concatenate(all_layers, axis=0)
+    return combined, points_per_layer
 
-def interpolate_chirality(base_layers, chiral_layers, t):
+def split_layers_with_vsplit(combined: np.ndarray, points_per_layer: int) -> List[np.ndarray]:
+    # Recover equal-sized layers row-wise using np.vsplit
+    n_total = combined.shape[0]
+    if n_total % points_per_layer != 0:
+        raise ValueError("Total rows not divisible by points_per_layer for equal vsplit.")
+    n_layers = n_total // points_per_layer
+    return list(np.vsplit(combined, n_layers))
+
+def interpolate_chirality(base_layers: List[np.ndarray], chiral_layers: List[np.ndarray], t: float):
     smooth_t = t * t * (3 - 2 * t)
     interpolated_layers = []
     for i in range(len(base_layers)):
@@ -306,7 +335,7 @@ def interpolate_chirality(base_layers, chiral_layers, t):
         interpolated_layers.append(interp_layer)
     return interpolated_layers
 
-def visualize_stacked_layers(layers, ax=None):
+def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
     if ax is None:
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
@@ -317,21 +346,28 @@ def visualize_stacked_layers(layers, ax=None):
     ax.set_zlabel('Z')
     plt.show()
 
+
 # ================================================================
 # Demo / CLI
 # ================================================================
 
 if __name__ == "__main__":
     print("="*70)
-    print("CHIRAL STACKED 2D LLM - TEXT GENERATION DEMO")
+    print("CHIRAL STACKED 2D LLM - TEXT GENERATION DEMO (vsplit edition)")
     print("="*70)
 
     llm = OrigamiLLM()
 
     base_twist = 0.0
     chiral_twist = 15.0
-    base_layers = create_stacked_chiral_layers(num_layers=4, twist_angle=base_twist)
-    chiral_layers = create_stacked_chiral_layers(num_layers=4, twist_angle=chiral_twist)
+
+    # Get combined arrays
+    base_combined, ppl = create_stacked_chiral_layers_combined(num_layers=4, twist_angle=base_twist)
+    chiral_combined, _ = create_stacked_chiral_layers_combined(num_layers=4, twist_angle=chiral_twist)
+
+    # Recover per-layer arrays using vsplit
+    base_layers = split_layers_with_vsplit(base_combined, ppl)
+    chiral_layers = split_layers_with_vsplit(chiral_combined, ppl)
 
     print("\n" + "="*70)
     print("INTERACTIVE TEXT GENERATION")
@@ -355,5 +391,5 @@ if __name__ == "__main__":
         )
         print(text)
         print("-" * 22 + "\n")
-        # To visualize, uncomment the next line:
-        # visualize_stacked_layers(interpolate_chirality(base_layers, chiral_layers,, 1.0))
+        # To visualize, uncomment:
+        # visualize_stacked_layers(interpolate_chirality(base_layers, chiral_layers, 1.0))
