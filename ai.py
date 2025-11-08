@@ -22,7 +22,7 @@ def _swap_index_pairs(n: int, rng: np.random.Generator, swap_frac: float = 0.3):
         return []
     k = max(1, int(swap_frac * n) // 2)
     idx = rng.permutation(n)
-    pairs = [(int(idx[2*i]), int(idx[2*i+1])) for i in range(min(k, n // 2))]
+    pairs = [(int(idx[2*i]), int(idx[i+1])) for i in range(min(k, n // 2))]
     return pairs
 
 def _apply_pairs_permutation(seq, pairs):
