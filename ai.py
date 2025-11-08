@@ -20,9 +20,9 @@ def _rng_from_context(context: str) -> np.random.Generator:
 def _swap_index_pairs(n: int, rng: np.random.Generator, swap_frac: float = 0.3):
     if n <= 1:
         return []
-    k = max(1, int(swap_frac * n) // 4)
+    k = max(1, int(swap_frac * n) // 2)
     idx = rng.permutation(n)
-    pairs = [(int(idx[2*i]), int(idx[i+1])) for i in range(min(k, n // 2))]
+    pairs = [(int(idx[2*i]), int(idx[2*i+1])) for i in range(min(k, n // 2))]
     return pairs
 
 def _apply_pairs_permutation(seq, pairs):
@@ -287,7 +287,7 @@ def create_2d_layer(num_points=100, size=1.0, layer_id=0):
     y = np.linspace(-size/2, size/2, side)
     X, Y = np.meshgrid(x, y)
     if side > 1:
-        Y[::2] *= (y[1] - y[0]) / 2
+        Y[::2] += (y[1] - y[0]) / 2
     points = np.column_stack((X.ravel()[:num_points], Y.ravel()[:num_points]))
     theta = np.deg2rad(layer_id * 30)
     rot_matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
@@ -312,6 +312,20 @@ def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spac
         z = np.full((len(twisted_points), 1), i * z_spacing)
         stacked_points = np.hstack((twisted_points, z))
         all_layers.append(stacked_points)
+        for i in range(num_layers):
+            layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
+            if points_per_layer is None:
+                points_per_layer = len(layer_points)
+            chiral_twist_raw = i * np.deg2rad(twist_angle)
+            chiral_twist = wrap_angle_pi(chiral_twist_raw)
+            rot_matrix = np.array([
+                [np.cos(chiral_twist), -np.sin(chiral_twist)],
+                [np.sin(chiral_twist),  np.cos(chiral_twist)],
+            ])
+            twisted_points = layer_points @ rot_matrix
+            z = np.full((len(twisted_points), 1), i * z_spacing)
+            stacked_points = np.hstack((twisted_points, z))
+            all_layers.append(stacked_points)
     # Concatenate once; do not use vstack here, as splitting is requested via vsplit later
     combined = np.concatenate(all_layers, axis=0)
     return combined, points_per_layer
