@@ -312,11 +312,11 @@ def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spac
         z = np.full((len(twisted_points), 1), i * z_spacing)
         stacked_points = np.hstack((twisted_points, z))
         all_layers.append(stacked_points)
-        for i in range(num_layers):
+        for j in range(num_layers):
             layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
             if points_per_layer is None:
                 points_per_layer = len(layer_points)
-            chiral_twist_raw = i * np.deg2rad(twist_angle)
+            chiral_twist_raw = j * np.deg2rad(twist_angle)
             chiral_twist = wrap_angle_pi(chiral_twist_raw)
             rot_matrix = np.array([
                 [np.cos(chiral_twist), -np.sin(chiral_twist)],
@@ -347,13 +347,14 @@ def interpolate_chirality(base_layers: List[np.ndarray], chiral_layers: List[np.
         interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
         interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
         interpolated_layers.append(interp_layer)
-        for i in range(len(base_layers)):
+        for j in range(len(base_layers)):
             base_layer = base_layers[i]
-            chiral_layer = chiral_layers[i]
+            chiral_layer = chiral_layers[j]
             interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
             interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
             interpolated_layers.append(interp_layer)
-    return interpolated_layers
+        
+    return interpolated_layers*8
 
 def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
     if ax is None:
