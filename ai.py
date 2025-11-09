@@ -373,109 +373,20 @@ class OrigamiLLM:
 
 
 # ================================================================
-# Optional geometry visualizer (unchanged)
-# ================================================================
-
-def wrap_angle_pi(theta: float) -> float:
-    theta = np.fmod(theta + np.pi, 2 * np.pi)
-    if theta <= 0:
-        theta += 2 * np.pi
-    return theta - np.pi
-
-def create_2d_layer(num_points=100, size=1.0, layer_id=0):
-    side = int(np.sqrt(num_points))
-    x = np.linspace(-size/2, size/2, side)
-    y = np.linspace(-size/2, size/2, side)
-    X, Y = np.meshgrid(x, y)
-    if side > 1:
-        Y[::2] += (y[1] - y[0]) / 2
-    points = np.column_stack((X.ravel()[:num_points], Y.ravel()[:num_points]))
-    theta = np.deg2rad(layer_id * 30)
-    rot_matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-    points = points @ rot_matrix
-    return points
-
-def create_stacked_chiral_layers_combined(num_layers=8, twist_angle=15.0, z_spacing=0.1):
-    all_layers = []
-    points_per_layer = None
-    for i in range(num_layers):
-        layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
-        if points_per_layer is None:
-            points_per_layer = len(layer_points)
-        chiral_twist_raw = i * np.deg2rad(twist_angle)
-        chiral_twist = wrap_angle_pi(chiral_twist_raw)
-        rot_matrix = np.array([
-            [np.cos(chiral_twist), -np.sin(chiral_twist)],
-            [np.sin(chiral_twist),  np.cos(chiral_twist)],
-        ])
-        twisted_points = layer_points @ rot_matrix
-        z = np.full((len(twisted_points), 1), i * z_spacing)
-        stacked_points = np.hstack((twisted_points, z))
-        all_layers.append(stacked_points)
-        for j in range(num_layers):
-            layer_points = create_2d_layer(num_points=50, size=1.0, layer_id=i)
-            chiral_twist_raw = j * np.deg2rad(twist_angle)
-            chiral_twist = wrap_angle_pi(chiral_twist_raw)
-            rot_matrix = np.array([
-                [np.cos(chiral_twist), -np.sin(chiral_twist)],
-                [np.sin(chiral_twist),  np.cos(chiral_twist)],
-            ])
-            twisted_points = layer_points @ rot_matrix
-            z = np.full((len(twisted_points), 1), i * z_spacing)
-            stacked_points = np.hstack((twisted_points, z))
-            all_layers.append(stacked_points)
-    combined = np.concatenate(all_layers, axis=0)
-    return combined, points_per_layer
-
-def split_layers_with_vsplit(combined: np.ndarray, points_per_layer: int) -> List[np.ndarray]:
-    n_total = combined.shape[0]
-    if n_total % points_per_layer != 0:
-        raise ValueError("Total rows not divisible by points_per_layer for equal vsplit.")
-    n_layers = n_total // points_per_layer
-    return list(np.vsplit(combined, n_layers))
-
-def interpolate_chirality(base_layers: List[np.ndarray], chiral_layers: List[np.ndarray], t: float):
-    smooth_t = t * t * (3 - 2 * t)
-    interpolated_layers = []
-    for i in range(len(base_layers)):
-        base_layer = base_layers[i]
-        chiral_layer = chiral_layers[i]
-        interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
-        interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
-        interpolated_layers.append(interp_layer)
-        for j in range(len(base_layers)):
-            base_layer = base_layers[i]
-            chiral_layer = chiral_layers[j]
-            interp_xy = (1 - smooth_t) * base_layer[:, :2] + smooth_t * chiral_layer[:, :2]
-            interp_layer = np.hstack((interp_xy, base_layer[:, 2:]))
-            interpolated_layers.append(interp_layer)
-    return interpolated_layers * 8
-
-def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
-    if ax is None:
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-    for layer in layers:
-        ax.scatter(layer[:, 0], layer[:, 1], layer[:, 2], s=10)
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    plt.show()
-
-
-# ================================================================
-# Tkinter GUI with HF dataset dropdowns, generic loader, corpus KB limit, editable text reinforcement, beta slider, and mode dropdown
+# Tkinter GUI with dataset loaders, corpus limit, output length, editable text reinforcement, beta slider, and mode dropdown
 # ================================================================
 
 class RLApp(tk.Tk):
     HF_DATASETS = [
         "facebook/natural_reasoning",
+        "ag_news"
+
     ]
 
     def __init__(self):
         super().__init__()
         self.title("OrigamiLLM RL GUI")
-        self.geometry("1700x860")
+        self.geometry("1800x860")
 
         # --- Source selectors ---
         source_bar = ttk.Frame(self)
@@ -544,7 +455,7 @@ class RLApp(tk.Tk):
         self.memory = RLMemory("rl_cache.sqlite")
         self.current_text_source: str = ""
 
-        # --- Top controls: start word, generate, RL, mode, beta, corpus KB limit ---
+        # --- Top controls: start word, generate, RL, mode, beta, corpus KB limit, output length ---
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
 
@@ -613,6 +524,21 @@ class RLApp(tk.Tk):
         self.corpus_kb_lbl = ttk.Label(top, text=f"{self.corpus_kb_var.get():d}")
         self.corpus_kb_lbl.pack(side="left", padx=4)
 
+        ttk.Label(top, text="Output length:").pack(side="left", padx=(12, 2))
+        self.out_len_var = tk.IntVar(value=300)
+        self.out_len_scale = ttk.Scale(
+            top,
+            from_=10,
+            to=3000,
+            orient="horizontal",
+            length=260,
+            variable=self.out_len_var,
+            command=lambda v: self.on_len_change(v),
+        )
+        self.out_len_scale.pack(side="left", padx=6)
+        self.out_len_lbl = ttk.Label(top, text=f"{self.out_len_var.get():d}")
+        self.out_len_lbl.pack(side="left", padx=4)
+
         # Text area
         text_frame = ttk.Frame(self)
         text_frame.pack(fill="both", expand=True, padx=8, pady=8)
@@ -632,12 +558,9 @@ class RLApp(tk.Tk):
     def _set_controls_by_source(self, source: str):
         is_hf = (source == "HF dataset")
         is_gen = (source == "Generic")
-        # File button
         self.file_btn.configure(state="normal" if source == "File" else "disabled")
-        # HF controls
         for w in (self.hf_ds_combo, self.hf_split_combo, self.hf_load_btn):
             w.configure(state="normal" if is_hf else "disabled")
-        # Generic controls
         for w in (self.builder_combo, self.data_files_entry, self.json_field_entry, self.generic_load_btn):
             w.configure(state="normal" if is_gen else "disabled")
 
@@ -672,6 +595,17 @@ class RLApp(tk.Tk):
         if snapped != self.corpus_kb_var.get():
             self.corpus_kb_var.set(snapped)
         self.corpus_kb_lbl.config(text=f"{self.corpus_kb_var.get():d}")
+
+    def on_len_change(self, value: str):
+        try:
+            v = float(value)
+        except Exception:
+            return
+        step = 10
+        snapped = int(round(v / step) * step)
+        if snapped != self.out_len_var.get():
+            self.out_len_var.set(snapped)
+        self.out_len_lbl.config(text=f"{self.out_len_var.get():d}")
 
     # ---------- Corpus ingestion ----------
     def on_open_file(self):
@@ -714,7 +648,6 @@ class RLApp(tk.Tk):
             kb = int(self.corpus_kb_var.get())
             self.status.config(text=f"Loaded HF dataset: {ds_id} ({split}), size={len(ds)} | limit={kb} KB")
         except Exception as e:
-            # If scripts are not supported for this ID, advise using Generic loader
             if "scripts" in str(e).lower() and "supported" in str(e).lower():
                 messagebox.showinfo(
                     "Script unsupported",
@@ -827,9 +760,10 @@ class RLApp(tk.Tk):
         start = self.start_var.get().strip() or None
         beta = float(self.beta_var.get())
         params = self.get_mode_params()
+        max_len = int(self.out_len_var.get())
         text, decisions = self.llm.generate_text_rl(
             start_word=start,
-            max_words=300,
+            max_words=max_len,
             stack_state=params["stack_state"],
             chirality_strength=params["chirality_strength"],
             swap_frac=params["swap_frac"],
@@ -840,7 +774,7 @@ class RLApp(tk.Tk):
         self.text.delete("1.0", "end")
         self.text.insert("1.0", text)
         self.status.config(
-            text=f"Generated {len(text.split())} tokens | β={beta:.2f} | Mode={self.mode_var.get()} | {self.current_text_source}"
+            text=f"Generated {len(text.split())} tokens (target {max_len}) | β={beta:.2f} | Mode={self.mode_var.get()} | {self.current_text_source}"
         )
 
     def on_reward(self):
