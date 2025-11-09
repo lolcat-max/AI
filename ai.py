@@ -2,7 +2,7 @@ import math
 import random
 import hashlib
 from functools import singledispatch
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,6 +11,14 @@ import matplotlib.pyplot as plt
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import sqlite3
+import os
+
+# Optional: Hugging Face datasets
+_HAS_HF = True
+try:
+    from datasets import load_dataset  # pip install datasets
+except Exception:
+    _HAS_HF = False
 
 
 # ================================================================
@@ -247,9 +255,12 @@ class RLMemory:
 # ================================================================
 
 class OrigamiLLM:
-    def __init__(self, filename: str):
-        with open(filename, encoding="utf-8") as f:
-            text = f.read()
+    def __init__(self, filename: Optional[str] = None, *, text: Optional[str] = None):
+        if text is None:
+            if filename is None:
+                raise ValueError("filename or text must be provided")
+            with open(filename, encoding="utf-8") as f:
+                text = f.read()
         self.corpus = text.lower().split(".")
         self.bigrams: Dict[str, List[str]] = {}
         self.trigrams: Dict[Tuple[str, str], List[str]] = {}
@@ -362,7 +373,7 @@ class OrigamiLLM:
 
 
 # ================================================================
-# Chiral stacked 2D geometry with vsplit (optional visualizer)
+# Optional geometry visualizer (unchanged)
 # ================================================================
 
 def wrap_angle_pi(theta: float) -> float:
@@ -453,35 +464,91 @@ def visualize_stacked_layers(layers: List[np.ndarray], ax=None):
 
 
 # ================================================================
-# Tkinter GUI with editable text reinforcement (persistent RL)
+# Tkinter GUI with HF dataset dropdowns, generic loader, corpus KB limit, editable text reinforcement, beta slider, and mode dropdown
 # ================================================================
 
 class RLApp(tk.Tk):
+    HF_DATASETS = [
+        "facebook/natural_reasoning",
+    ]
+
     def __init__(self):
         super().__init__()
         self.title("OrigamiLLM RL GUI")
-        self.geometry("1000x720")
+        self.geometry("1700x860")
 
-        self.filename = filedialog.askopenfilename(
-            title="Select corpus file (.txt)",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        # --- Source selectors ---
+        source_bar = ttk.Frame(self)
+        source_bar.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(source_bar, text="Source:").pack(side="left")
+        self.source_var = tk.StringVar(value="File")
+        self.source_combo = ttk.Combobox(
+            source_bar, textvariable=self.source_var, state="readonly",
+            values=["File", "HF dataset", "Generic"], width=12
         )
-        if not self.filename:
-            messagebox.showerror("Error", "No corpus file selected.")
-            self.destroy()
-            return
+        self.source_combo.pack(side="left", padx=6)
+        self.source_combo.bind("<<ComboboxSelected>>", lambda e: self.on_source_change())
 
-        # Models and memory
-        self.llm = OrigamiLLM(self.filename)
+        # File loader
+        self.file_btn = ttk.Button(source_bar, text="Open file...", command=self.on_open_file)
+        self.file_btn.pack(side="left", padx=6)
+
+        # HF dataset controls
+        ttk.Label(source_bar, text="Dataset:").pack(side="left", padx=(12, 2))
+        self.hf_ds_var = tk.StringVar(value=self.HF_DATASETS[0])
+        self.hf_ds_combo = ttk.Combobox(
+            source_bar, textvariable=self.hf_ds_var, state="readonly",
+            values=self.HF_DATASETS, width=26
+        )
+        self.hf_ds_combo.pack(side="left", padx=6)
+
+        ttk.Label(source_bar, text="Split:").pack(side="left", padx=(12, 2))
+        self.hf_split_var = tk.StringVar(value="train")
+        self.hf_split_combo = ttk.Combobox(
+            source_bar, textvariable=self.hf_split_var, state="readonly",
+            values=["train", "validation", "test"], width=12
+        )
+        self.hf_split_combo.pack(side="left", padx=6)
+
+        self.hf_load_btn = ttk.Button(source_bar, text="Load HF", command=self.on_load_hf)
+        self.hf_load_btn.pack(side="left", padx=6)
+
+        # Generic builder controls
+        ttk.Label(source_bar, text="Builder:").pack(side="left", padx=(12, 2))
+        self.builder_var = tk.StringVar(value="text")  # csv|json|parquet|text|arrow|webdataset
+        self.builder_combo = ttk.Combobox(
+            source_bar, textvariable=self.builder_var, state="readonly",
+            values=["text", "csv", "json", "parquet", "arrow", "webdataset"], width=12
+        )
+        self.builder_combo.pack(side="left", padx=6)
+
+        ttk.Label(source_bar, text="data_files:").pack(side="left", padx=(12, 2))
+        self.data_files_var = tk.StringVar()
+        self.data_files_entry = ttk.Entry(source_bar, width=44, textvariable=self.data_files_var)
+        self.data_files_entry.pack(side="left", padx=6)
+
+        ttk.Label(source_bar, text="json field:").pack(side="left", padx=(12, 2))
+        self.json_field_var = tk.StringVar()
+        self.json_field_entry = ttk.Entry(source_bar, width=16, textvariable=self.json_field_var)
+        self.json_field_entry.pack(side="left", padx=6)
+
+        self.generic_load_btn = ttk.Button(source_bar, text="Load generic", command=self.on_load_generic)
+        self.generic_load_btn.pack(side="left", padx=6)
+
+        # Visibility by source
+        self._set_controls_by_source("File")
+
+        # --- Model + memory initialization ---
+        self.llm: Optional[OrigamiLLM] = None
         self.memory = RLMemory("rl_cache.sqlite")
+        self.current_text_source: str = ""
 
-        # UI
+        # --- Top controls: start word, generate, RL, mode, beta, corpus KB limit ---
         top = ttk.Frame(self)
         top.pack(fill="x", padx=8, pady=8)
 
         ttk.Label(top, text="Start word:").pack(side="left")
-
-        # Editable, focused Entry with variable and Return binding
         self.start_var = tk.StringVar()
         self.start_entry = ttk.Entry(top, width=24, textvariable=self.start_var)
         self.start_entry.state(["!disabled", "!readonly"])
@@ -490,22 +557,32 @@ class RLApp(tk.Tk):
         self.start_entry.focus_set()
         self.start_entry.bind("<Return>", lambda e: self.on_generate())
 
-        self.gen_button = ttk.Button(top, text="Generate", command=self.on_generate)
+        self.gen_button = ttk.Button(top, text="Generate", command=self.on_generate, state="disabled")
         self.gen_button.pack(side="left", padx=6)
 
-        self.reward_button = ttk.Button(top, text="Reward (+)", command=self.on_reward)
+        self.reward_button = ttk.Button(top, text="Reward (+)", command=self.on_reward, state="disabled")
         self.reward_button.pack(side="left", padx=6)
-        self.punish_button = ttk.Button(top, text="Punish (-)", command=self.on_punish)
+        self.punish_button = ttk.Button(top, text="Punish (-)", command=self.on_punish, state="disabled")
         self.punish_button.pack(side="left", padx=6)
 
-        # Toggle: learn from edited text vs last generated decisions
         self.use_edited_var = tk.BooleanVar(value=True)
         self.use_edited_chk = ttk.Checkbutton(
             top, text="Train on edited text", variable=self.use_edited_var
         )
         self.use_edited_chk.pack(side="left", padx=8)
 
-        # Slider with DoubleVar, snapping step, and live label
+        ttk.Label(top, text="Mode:").pack(side="left", padx=(12, 2))
+        self.mode_var = tk.StringVar(value="Template+RL")
+        self.mode_combo = ttk.Combobox(
+            top,
+            textvariable=self.mode_var,
+            state="readonly",
+            values=["Uniform only", "RL only", "Template only", "Template+RL", "Chaotic"],
+            width=16,
+        )
+        self.mode_combo.pack(side="left", padx=6)
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda e: self.on_mode_change())
+
         ttk.Label(top, text="RL β:").pack(side="left", padx=(12, 2))
         self.beta_var = tk.DoubleVar(value=2.0)
         self.beta_scale = ttk.Scale(
@@ -513,7 +590,7 @@ class RLApp(tk.Tk):
             from_=0.0,
             to=6.0,
             orient="horizontal",
-            length=240,
+            length=220,
             variable=self.beta_var,
             command=lambda v: self.on_beta_change(v),
         )
@@ -521,21 +598,60 @@ class RLApp(tk.Tk):
         self.beta_value_lbl = ttk.Label(top, text=f"{self.beta_var.get():.2f}")
         self.beta_value_lbl.pack(side="left", padx=4)
 
+        ttk.Label(top, text="Corpus limit (KB):").pack(side="left", padx=(12, 2))
+        self.corpus_kb_var = tk.IntVar(value=2048)  # default 2 MB
+        self.corpus_kb_scale = ttk.Scale(
+            top,
+            from_=64,
+            to=1024*256,   # up to 256 MB in KB units
+            orient="horizontal",
+            length=260,
+            variable=self.corpus_kb_var,
+            command=lambda v: self.on_kb_change(v),
+        )
+        self.corpus_kb_scale.pack(side="left", padx=6)
+        self.corpus_kb_lbl = ttk.Label(top, text=f"{self.corpus_kb_var.get():d}")
+        self.corpus_kb_lbl.pack(side="left", padx=4)
+
+        # Text area
         text_frame = ttk.Frame(self)
         text_frame.pack(fill="both", expand=True, padx=8, pady=8)
         self.text = tk.Text(text_frame, wrap="word")
         self.text.pack(fill="both", expand=True)
 
+        # Status bar
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", padx=8, pady=8)
-        self.status = ttk.Label(bottom, text="Ready.")
+        self.status = ttk.Label(bottom, text="Select a source: File, HF dataset, or Generic.")
         self.status.pack(side="left")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.last_decisions: List[Tuple[str, str]] = []
 
+    # ---------- UI visibility ----------
+    def _set_controls_by_source(self, source: str):
+        is_hf = (source == "HF dataset")
+        is_gen = (source == "Generic")
+        # File button
+        self.file_btn.configure(state="normal" if source == "File" else "disabled")
+        # HF controls
+        for w in (self.hf_ds_combo, self.hf_split_combo, self.hf_load_btn):
+            w.configure(state="normal" if is_hf else "disabled")
+        # Generic controls
+        for w in (self.builder_combo, self.data_files_entry, self.json_field_entry, self.generic_load_btn):
+            w.configure(state="normal" if is_gen else "disabled")
+
+    def on_source_change(self):
+        source = self.source_var.get()
+        self._set_controls_by_source(source)
+        self.status.config(text=f"Source = {source}.")
+        self._set_generate_enabled(False)
+
+    # ---------- Sliders and labels ----------
+    def on_mode_change(self):
+        self.status.config(text=f"Mode set to {self.mode_var.get()}.")
+
     def on_beta_change(self, value: str):
-        # Snap ttk.Scale to 0.05 steps and update label
         try:
             v = float(value)
         except Exception:
@@ -546,11 +662,141 @@ class RLApp(tk.Tk):
             self.beta_var.set(snapped)
         self.beta_value_lbl.config(text=f"{self.beta_var.get():.2f}")
 
+    def on_kb_change(self, value: str):
+        try:
+            v = float(value)
+        except Exception:
+            return
+        step = 64  # KB
+        snapped = int(round(v / step) * step)
+        if snapped != self.corpus_kb_var.get():
+            self.corpus_kb_var.set(snapped)
+        self.corpus_kb_lbl.config(text=f"{self.corpus_kb_var.get():d}")
+
+    # ---------- Corpus ingestion ----------
+    def on_open_file(self):
+        path = filedialog.askopenfilename(
+            title="Select corpus file (.txt)",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            kb = max(1, int(self.corpus_kb_var.get()))
+            size_bytes = kb * 1024
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                text = f.read(size_bytes)
+            self.llm = OrigamiLLM(text=text)
+            self.current_text_source = f"File: {os.path.basename(path)} (<= {kb} KB)"
+            self._set_generate_enabled(True)
+            self.status.config(text=f"Loaded file (<= {kb} KB): {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+
+    def on_load_hf(self):
+        if not _HAS_HF:
+            messagebox.showerror("Missing dependency", "Install 'datasets' to use HF datasets.")
+            return
+        ds_id = self.hf_ds_var.get()
+        split = self.hf_split_var.get()
+        try:
+            if ":" in ds_id:
+                base, config = ds_id.split(":", 1)
+                ds = load_dataset(base, config, split=split)
+            else:
+                ds = load_dataset(ds_id, split=split)
+            corpus_text = self._flatten_dataset_to_text(ds)
+            if not corpus_text.strip():
+                raise RuntimeError("Loaded dataset produced empty text; try another split/dataset.")
+            self.llm = OrigamiLLM(text=corpus_text)
+            self.current_text_source = f"HF: {ds_id} [{split}]"
+            self._set_generate_enabled(True)
+            kb = int(self.corpus_kb_var.get())
+            self.status.config(text=f"Loaded HF dataset: {ds_id} ({split}), size={len(ds)} | limit={kb} KB")
+        except Exception as e:
+            # If scripts are not supported for this ID, advise using Generic loader
+            if "scripts" in str(e).lower() and "supported" in str(e).lower():
+                messagebox.showinfo(
+                    "Script unsupported",
+                    "This dataset relies on a deprecated loader script.\nUse the Generic loader (csv/json/parquet/text) with data_files instead."
+                )
+            else:
+                messagebox.showerror("HF load error", str(e))
+
+    def on_load_generic(self):
+        if not _HAS_HF:
+            messagebox.showerror("Missing dependency", "Install 'datasets' to use generic loader.")
+            return
+        builder = self.builder_var.get()
+        split = self.hf_split_var.get()
+        raw = self.data_files_var.get().strip()
+        if not raw:
+            messagebox.showerror("Input required", "Provide one or more data_files paths or hf:// URLs.")
+            return
+        files = [p for p in raw.replace(",", " ").split() if p]
+        kwargs = {"data_files": files}
+        field = self.json_field_var.get().strip()
+        if builder == "json" and field:
+            kwargs["field"] = field
+        try:
+            ds = load_dataset(builder, **kwargs, split=split)
+            corpus_text = self._flatten_dataset_to_text(ds)
+            if not corpus_text.strip():
+                raise RuntimeError("Generic load produced empty text; check builder/data_files/field.")
+            self.llm = OrigamiLLM(text=corpus_text)
+            self.current_text_source = f"{builder} data_files [{split}]"
+            self._set_generate_enabled(True)
+            kb = int(self.corpus_kb_var.get())
+            self.status.config(text=f"Loaded generic dataset: builder={builder}, files={len(files)}, split={split}, size={len(ds)} | limit={kb} KB")
+        except Exception as e:
+            messagebox.showerror("Generic load error", str(e))
+
+    def _flatten_dataset_to_text(self, ds) -> str:
+        def collect_text(obj: Any, out: List[str]):
+            if isinstance(obj, str):
+                out.append(obj)
+            elif isinstance(obj, list):
+                for x in obj:
+                    collect_text(x, out)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    collect_text(v, out)
+
+        chunks: List[str] = []
+        kb = max(1, int(self.corpus_kb_var.get()))
+        limit_bytes = kb * 1024
+        used = 0
+        max_items = min(len(ds), 50000)
+
+        for i in range(max_items):
+            if used >= limit_bytes:
+                break
+            ex = ds[i]
+            pieces: List[str] = []
+            collect_text(ex, pieces)
+            if not pieces:
+                continue
+            seg = " ".join(pieces)
+            seg_b = seg.encode("utf-8")
+            if used + len(seg_b) > limit_bytes:
+                remain = limit_bytes - used
+                if remain <= 0:
+                    break
+                seg = seg_b[:remain].decode("utf-8", errors="ignore")
+                seg_b = seg.encode("utf-8")
+            chunks.append(seg)
+            used += len(seg_b)
+
+        return "\n".join(chunks)
+
+    def _set_generate_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        self.gen_button.configure(state=state)
+        self.reward_button.configure(state=state)
+        self.punish_button.configure(state=state)
+
+    # ---------- RL helpers ----------
     def build_decisions_from_text(self, txt: str) -> List[Tuple[str, str]]:
-        """
-        Reconstruct (context, action) from edited text, using up to 5-token history
-        as context and the current token as the action, matching generation-time context.
-        """
         words = txt.lower().split()
         decisions: List[Tuple[str, str]] = []
         for i in range(1, len(words)):
@@ -559,24 +805,48 @@ class RLApp(tk.Tk):
             decisions.append((ctx, act))
         return decisions
 
+    def get_mode_params(self):
+        mode = self.mode_var.get()
+        if mode == "Uniform only":
+            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.0, use_rl=False)
+        if mode == "RL only":
+            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.2, use_rl=True)
+        if mode == "Template only":
+            return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=False)
+        if mode == "Template+RL":
+            return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=True)
+        if mode == "Chaotic":
+            return dict(stack_state=1.0, chirality_strength=0.7, swap_frac=0.95, use_rl=True)
+        return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=True)
+
+    # ---------- Actions ----------
     def on_generate(self):
+        if self.llm is None:
+            self.status.config(text="No corpus loaded; select File, HF dataset, or Generic.")
+            return
         start = self.start_var.get().strip() or None
         beta = float(self.beta_var.get())
+        params = self.get_mode_params()
         text, decisions = self.llm.generate_text_rl(
             start_word=start,
             max_words=300,
-            stack_state=1.0,
-            chirality_strength=1.0,
-            swap_frac=0.5,
-            rl_memory=self.memory,
-            rl_beta=beta,
+            stack_state=params["stack_state"],
+            chirality_strength=params["chirality_strength"],
+            swap_frac=params["swap_frac"],
+            rl_memory=self.memory if params["use_rl"] else None,
+            rl_beta=beta if params["use_rl"] else 0.0,
         )
         self.last_decisions = decisions
         self.text.delete("1.0", "end")
         self.text.insert("1.0", text)
-        self.status.config(text=f"Generated {len(text.split())} tokens with β={beta:.2f}.")
+        self.status.config(
+            text=f"Generated {len(text.split())} tokens | β={beta:.2f} | Mode={self.mode_var.get()} | {self.current_text_source}"
+        )
 
     def on_reward(self):
+        if self.llm is None:
+            self.status.config(text="No corpus loaded.")
+            return
         if self.use_edited_var.get():
             text_now = self.text.get("1.0", "end-1c")
             decisions = self.build_decisions_from_text(text_now)
@@ -589,6 +859,9 @@ class RLApp(tk.Tk):
         self.status.config(text="Rewarded current sample (+1).")
 
     def on_punish(self):
+        if self.llm is None:
+            self.status.config(text="No corpus loaded.")
+            return
         if self.use_edited_var.get():
             text_now = self.text.get("1.0", "end-1c")
             decisions = self.build_decisions_from_text(text_now)
@@ -608,11 +881,10 @@ class RLApp(tk.Tk):
 
 
 # ================================================================
-# Demo / CLI
+# Main
 # ================================================================
 
 if __name__ == "__main__":
     app = RLApp()
     if app.winfo_exists():
         app.mainloop()
-
