@@ -6,6 +6,7 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import convolve
 
 # GUI + persistence
 import tkinter as tk
@@ -19,6 +20,17 @@ try:
     from datasets import load_dataset  # pip install datasets
 except Exception:
     _HAS_HF = False
+
+
+# ================================================================
+# Symplectic Form Definition
+# ================================================================
+
+def J(n: int) -> np.ndarray:
+    """Canonical symplectic form J_n = [[0, I_n], [-I_n, 0]]."""
+    I = np.eye(n)
+    O = np.zeros((n, n))
+    return np.block([[O, I], [-I, O]])
 
 
 # ================================================================
@@ -209,7 +221,7 @@ class RLMemory:
                 (context, a)
             ).fetchone()
             if row is not None:
-                qs[i] = float(row[1])
+                qs[i] = float(row[0])
         return qs
 
     def update_batch(self, decisions: List[Tuple[str, str]], reward: float):
@@ -295,8 +307,46 @@ class OrigamiLLM:
             swap_frac=swap_frac,
             rl_memory=None,
             rl_beta=0.0,
+            use_matrix=False,
         )
         return text
+
+    def apply_matrix_transform(
+        self, probs: np.ndarray, beta: float, epsilon: float, alpha: float, delta: float, iota: float
+    ) -> np.ndarray:
+        """
+        Applies one of four randomly chosen convolutional kernels based on the matrix.
+        """
+        if probs.size <= 4:
+            return probs
+
+        # The four kernels from the matrix rows
+        kernels = [
+            np.array([beta, -epsilon, epsilon, beta]),
+            np.array([1, -beta, epsilon, -epsilon]),
+            np.array([delta, alpha, iota, -epsilon]),
+            np.array([0, 0, 0, 0]),
+        ]
+        
+        # Randomly choose a kernel to apply
+        kernel = random.choice(kernels)
+        
+        # If the kernel is all zeros, return the original probabilities
+        if np.all(kernel == 0):
+            return probs
+            
+        # Apply the convolution
+        convolved_probs = convolve(probs, kernel, mode='same')
+        
+        # The result of a convolution is not guaranteed to be a valid probability distribution.
+        # We need to ensure all values are non-negative and then re-normalize.
+        
+        # Make all probabilities non-negative
+        convolved_probs[convolved_probs < 0] = 0
+        
+        # Re-normalize
+        s = convolved_probs.sum()
+        return convolved_probs / s if s > 0 else probs
 
     def generate_text_rl(
         self,
@@ -307,6 +357,7 @@ class OrigamiLLM:
         swap_frac: float,
         rl_memory: Optional[RLMemory],
         rl_beta: float = 2.0,
+        use_matrix: bool = False,
     ) -> Tuple[str, List[Tuple[str, str]]]:
         if not self.bigrams:
             return "", []
@@ -357,7 +408,16 @@ class OrigamiLLM:
                     candidates, probs, context=context, swap_frac=swap_frac
                 )
 
-            if rl_memory is not None and len(candidates) > 0:
+            # --- APPLY EITHER RL BIAS OR THE NEW MATRIX TRANSFORM ---
+            if use_matrix:
+                # For simplicity, we'll use beta from the RL slider and set the other greek letters to constants.
+                # You can experiment with making these dynamic as well.
+                epsilon = 0.1
+                alpha = 0.5
+                delta = 0.2
+                iota = 0.3
+                probs = self.apply_matrix_transform(probs, rl_beta, epsilon, alpha, delta, iota)
+            elif rl_memory is not None and len(candidates) > 0:
                 probs = rl_memory.bias_probs(context, candidates, probs, beta=rl_beta)
 
             total = float(probs.sum())
@@ -488,7 +548,7 @@ class RLApp(tk.Tk):
             top,
             textvariable=self.mode_var,
             state="readonly",
-            values=["Uniform only", "RL only", "Template only", "Template+RL", "Chaotic"],
+            values=["Uniform only", "RL only", "Template only", "Template+RL", "Chaotic", "Matrix"],
             width=16,
         )
         self.mode_combo.pack(side="left", padx=6)
@@ -741,16 +801,18 @@ class RLApp(tk.Tk):
     def get_mode_params(self):
         mode = self.mode_var.get()
         if mode == "Uniform only":
-            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.0, use_rl=False)
+            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.0, use_rl=False, use_matrix=False)
         if mode == "RL only":
-            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.2, use_rl=True)
+            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.2, use_rl=True, use_matrix=False)
         if mode == "Template only":
-            return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=False)
+            return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=False, use_matrix=False)
         if mode == "Template+RL":
-            return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=True)
+            return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=True, use_matrix=False)
         if mode == "Chaotic":
-            return dict(stack_state=1.0, chirality_strength=0.7, swap_frac=0.95, use_rl=True)
-        return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=True)
+            return dict(stack_state=1.0, chirality_strength=0.7, swap_frac=0.95, use_rl=True, use_matrix=False)
+        if mode == "Matrix":
+            return dict(stack_state=1.0, chirality_strength=0.0, swap_frac=0.1, use_rl=True, use_matrix=True)
+        return dict(stack_state=1.0, chirality_strength=1.0, swap_frac=0.35, use_rl=True, use_matrix=False)
 
     # ---------- Actions ----------
     def on_generate(self):
@@ -769,6 +831,7 @@ class RLApp(tk.Tk):
             swap_frac=params["swap_frac"],
             rl_memory=self.memory if params["use_rl"] else None,
             rl_beta=beta if params["use_rl"] else 0.0,
+            use_matrix=params["use_matrix"],
         )
         self.last_decisions = decisions
         self.text.delete("1.0", "end")
