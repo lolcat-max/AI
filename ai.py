@@ -260,5 +260,6 @@ while True:
     )):
         tokens.append(token)
         print(token, end=' ', flush=True)
-    
     print()
+    print()
+
