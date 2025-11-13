@@ -305,5 +305,6 @@ if __name__ == "__main__":
             concept1, concept2, query_concept = parts
             generate_unprovable_truth(vsa, concept1, concept2, query_concept)
         else:
-            print("Usage: truth <concept1> <concept2> <query_concept>")
+            print("Usage: <concept1> <concept2> <query_concept>")
         continue
+
