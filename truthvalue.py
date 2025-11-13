@@ -1,4 +1,4 @@
-KB_LEN = 999
+KB_LEN = -1
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
