@@ -202,6 +202,7 @@ def find_closest_symbol(vsa: VectorSymbolicArchitecture, vector: np.ndarray) -> 
             if sim > max_sim:
                 max_sim = sim
                 closest_symbol = symbol
+                print(symbol, sim)
     return closest_symbol, max_sim
 
 def generate_unprovable_truth(vsa, concept1, concept2, query_concept):
@@ -303,4 +304,3 @@ if __name__ == "__main__":
         else:
             print("Usage: <concept1> <concept2> <query_concept>")
         continue
-
