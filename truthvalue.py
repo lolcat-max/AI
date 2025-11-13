@@ -236,10 +236,6 @@ def generate_unprovable_truth(vsa, concept1, concept2, query_concept):
 # DEMONSTRATION ENTRYPOINT
 # =====================================================================
 if __name__ == "__main__":
-    print("="*80)
-    print("ENHANCED TRANSITIONING FOR TEXT GENERATION (MULTITHREADED + SAVE/LOAD)")
-    print("="*80)
-
     vsa = VectorSymbolicArchitecture(dimensions=8)
     trans_encoder = TransitionEncoder(vsa)
 
@@ -307,4 +303,3 @@ if __name__ == "__main__":
         else:
             print("Usage: <concept1> <concept2> <query_concept>")
         continue
-
