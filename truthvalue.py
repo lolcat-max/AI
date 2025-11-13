@@ -206,7 +206,7 @@ def find_closest_symbol(vsa: VectorSymbolicArchitecture, vector: np.ndarray) -> 
 
 def generate_unprovable_truth(vsa, concept1, concept2, query_concept):
     '''Generates a novel concept by binding two concepts and unbinding a third.'''
-    print(f"\n[3] GENERATING TRUTH")
+    print(f"\nGENERATING TRUTH")
     print(f"  Query: What is the relationship between '{concept1}' and '{concept2}' from the perspective of '{query_concept}'?")
     
     # Ensure concepts are in the codebook
@@ -303,3 +303,4 @@ if __name__ == "__main__":
         else:
             print("Usage: <concept1> <concept2> <query_concept>")
         continue
+
