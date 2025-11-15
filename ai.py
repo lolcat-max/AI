@@ -20,7 +20,7 @@ def ai_inference(q1_words, q2_words, n=2):
     ngrams_q1 = get_ngrams_set(q1_words, n)
     ngrams_q2 = get_ngrams_set(q2_words, n)
     duplicate_ngrams = ngrams_q1.intersection(ngrams_q2)
-    return len(duplicate_ngrams) != 0 and a1 >= a2
+    return len(duplicate_ngrams) != 0 and a1 <= a2
 
 def generate_text_guided_seed(transitions, n=2, length=50, window_size=4, seed=None):
     # Initialize prefix from seed if possible, else random
