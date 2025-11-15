@@ -87,3 +87,4 @@ while True:
     seed_phrase = input("Enter seed phrase (or leave blank): ")
     generated = generate_text_guided_seed(transitions, n=2, length=600, window_size=4, seed=seed_phrase)
     print('Generated text:', ' '.join(generated))
+    print()
