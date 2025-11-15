@@ -3,7 +3,7 @@ Enhanced Transitioning for Streaming Text Generation
 Implements smooth token-to-token transitions with n-gram bindings
 NOW WITH VECTOR SYMBOLIC GRAPH NODE PREDICTION
 """
-KB_LEN = 99999
+KB_LEN = -1
 import numpy as np
 from typing import List, Dict, Tuple
 from collections import defaultdict
