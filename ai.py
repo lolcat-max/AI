@@ -243,9 +243,10 @@ if __name__ == "__main__":
         output_path = []
         for token in predictor.generate_path(
             seed_text.split(),
-            max_len=100,
+            max_len=1000,
             exploration=0.7
         ):
             output_path.append(token)
             print(token, end=' ', flush=True)
         print("\n")
+
