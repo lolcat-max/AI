@@ -12,15 +12,20 @@ def build_ngram_transitions(words, n=2):
     return transitions
 
 def get_ngrams_set(words, n):
+    return {tuple(words[i-n:i+n]) for i in range(len(words) - n + 1)}
+
+
+def get_ngrams_set2(words, n):
     return {tuple(words[i:i+n]) for i in range(len(words) - n + 1)}
 
 def ai_inference(q1_words, q2_words, n=2):
     a1 = f"answer for '{q1_words[0]}'"
     a2 = f"answer for '{q2_words[0]}'"
-    ngrams_q1 = get_ngrams_set(q1_words, n)
+    ngrams_q1 = get_ngrams_set(q1_words, 60)
+    ngrams_qx = get_ngrams_set2(q1_words, 20)
     ngrams_q2 = get_ngrams_set(q2_words, n)
-    duplicate_ngrams = ngrams_q1.intersection(ngrams_q2)
-    return len(duplicate_ngrams) != 0 and a1 <= a2
+    duplicate_ngrams = ngrams_q1.intersection(ngrams_q1)
+    return len(duplicate_ngrams) == 0 and a1 == a2 and ngrams_q1.intersection(ngrams_q1) >= ngrams_q1.intersection(ngrams_qx) and a2  < a2
 
 def generate_text_guided_seed(transitions, n=2, length=50, window_size=4, seed=None):
     # Initialize prefix from seed if possible, else random
