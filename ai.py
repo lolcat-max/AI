@@ -1,9 +1,9 @@
 """
 Enhanced Transitioning for Streaming Text Generation
 Implements smooth token-to-token transitions with n-gram bindings
-NOW WITH VECTOR SYMBOLIC GRAPH NODE PREDICTION
+NOW WITH SAVE/LOAD FOR THE FULL VSA GRAPH MODEL
 """
-KB_LEN = -1
+KB_LEN = -1 
 import numpy as np
 from typing import List, Dict, Tuple
 from collections import defaultdict
@@ -59,12 +59,12 @@ class VectorSymbolicArchitecture:
 
 
 # =====================================================================
-# VSA GRAPH (replaces TransitionEncoder)
+# VSA GRAPH (with Full Model Save/Load)
 # =====================================================================
 class VSAGraph:
     """
-    Represents the corpus as a graph where tokens are nodes and
-    n-gram transitions are directed, weighted edges, encoded using VSA.
+    Represents the corpus as a graph with full save/load capabilities
+    for both the graph structure and the VSA codebook.
     """
     def __init__(self, vsa):
         self.vsa = vsa
@@ -93,16 +93,12 @@ class VSAGraph:
             return self.trigram_edges[key]
 
     def _process_path_batch(self, paths: List[List[str]]) -> Tuple[int, int]:
-        bigram_count = 0
-        trigram_count = 0
         for path in paths:
             for i in range(len(path) - 1):
                 self._add_bigram_edge(path[i], path[i+1])
-                bigram_count += 1
             for i in range(len(path) - 2):
                 self._add_trigram_edge(path[i], path[i+1], path[i+2])
-                trigram_count += 1
-        return bigram_count, trigram_count
+        return 0, 0
 
     def learn_graph_from_corpus(self, corpus: List[List[str]], max_workers: int = 8, batch_size: int = 100):
         print("Learning graph structure from corpus...")
@@ -117,7 +113,6 @@ class VSAGraph:
         print(f"  ✓ Graph built with {len(self.trigram_edges)} unique trigram edges.")
 
     def predict_next_nodes(self, context_path: List[str]) -> List[Tuple[str, float]]:
-        """Predicts potential next nodes given a context path."""
         if not context_path:
             return []
         
@@ -137,26 +132,29 @@ class VSAGraph:
 
     def save_model(self, directory: str):
         os.makedirs(directory, exist_ok=True)
+        # Save the VSA codebook
+        self.vsa.save_codebook(os.path.join(directory, "codebook.pkl"))
+        # Save the graph edges
         with open(os.path.join(directory, "bigram_edges.pkl"), 'wb') as f:
             pickle.dump(self.bigram_edges, f)
         with open(os.path.join(directory, "trigram_edges.pkl"), 'wb') as f:
             pickle.dump(self.trigram_edges, f)
-        print(f"✓ Graph model saved in {directory}")
+        print(f"✓ Full graph model saved in {directory}")
 
     def load_model(self, directory: str):
+        # Load the VSA codebook
+        self.vsa.load_codebook(os.path.join(directory, "codebook.pkl"))
+        # Load the graph edges
         with open(os.path.join(directory, "bigram_edges.pkl"), 'rb') as f:
             self.bigram_edges = pickle.load(f)
         with open(os.path.join(directory, "trigram_edges.pkl"), 'rb') as f:
             self.trigram_edges = pickle.load(f)
-        print(f"✓ Graph model loaded from {directory}")
+        print(f"✓ Full graph model loaded from {directory}")
 
 # =====================================================================
-# GRAPH NODE PREDICTOR (replaces AdaptiveTransitionGenerator)
+# GRAPH NODE PREDICTOR
 # =====================================================================
 class GraphNodePredictor:
-    """
-    Generates sequences by traversing the VSAGraph, predicting the next node at each step.
-    """
     def __init__(self, vsa, vsa_graph):
         self.vsa = vsa
         self.vsa_graph = vsa_graph
@@ -166,9 +164,11 @@ class GraphNodePredictor:
         for _ in range(max_len):
             candidate_nodes = self.vsa_graph.predict_next_nodes(current_path)
             if not candidate_nodes:
-                break
-            
-            if np.random.random() < exploration:
+                # If no candidates, pick a random token from the codebook
+                all_tokens = list(self.vsa.codebook.keys())
+                if not all_tokens: break
+                next_node = np.random.choice(all_tokens)
+            elif np.random.random() < exploration:
                 idx = min(len(candidate_nodes) - 1, int(np.random.exponential(1.5)))
                 next_node = candidate_nodes[idx][0]
             else:
@@ -176,7 +176,6 @@ class GraphNodePredictor:
             
             yield next_node
             current_path.append(next_node)
-            # Online learning: dynamically add the traversed edge
             if len(current_path) >= 2:
                 self.vsa_graph._add_bigram_edge(current_path[-2], current_path[-1])
 
@@ -185,51 +184,68 @@ class GraphNodePredictor:
 # =====================================================================
 if __name__ == "__main__":
     print("="*80)
-    print("VECTOR SYMBOLIC GRAPH NODE PREDICTION FOR TEXT GENERATION")
+    print("VECTOR SYMBOLIC GRAPH NODE PREDICTION (WITH SAVE/LOAD)")
     print("="*80)
 
     vsa = VectorSymbolicArchitecture(dimensions=2048)
     vsa_graph = VSAGraph(vsa)
-    model_dir = "vsa_graph_model"
 
-    
-    # --- Training Phase ---
-    print("\n[1] TRAINING: Building Graph from Corpus")
-    print("-"*80)
-    filename = input("Filename: ")
-    with open(filename, encoding="utf-8") as f:
-        raw_text = f.read()[:KB_LEN]
+    choice = input("[N]ew model or [L]oad existing? ").strip().lower()
 
-    sentences = raw_text.strip().split("\n")
-    corpus = [s.split() for s in sentences if s]
-    print(f"Corpus loaded: {len(corpus)} paths (sequences)")
+    if choice == 'l':
+        model_dir = input("Enter model directory to load: ").strip()
+        try:
+            vsa_graph.load_model(model_dir)
+        except FileNotFoundError:
+            print(f"Error: Directory '{model_dir}' not found. Please check the path.")
+            exit()
+    else:
+        # --- Training Phase ---
+        print("\n[1] TRAINING: Building New Graph from Corpus")
+        print("-"*80)
+        
+        while True:
+            try:
+                filename = input("Enter corpus filename: ").strip()
+                with open(filename, 'r', encoding='utf-8') as f:
+                    raw_text = f.read()
+                break
+            except FileNotFoundError:
+                print(f"Error: File '{filename}' not found. Please try again.")
 
-    vsa_graph.learn_graph_from_corpus(corpus, max_workers=4, batch_size=10)
+        slice_end = None if KB_LEN < 0 else KB_LEN
+        sentences = raw_text[:slice_end].strip().split("\n")
+        corpus = [s.split() for s in sentences if s]
+        print(f"Corpus loaded: {len(corpus)} paths (sequences)")
 
-    print("\nBuilding node vocabulary...")
-    for path in tqdm(corpus, desc="Vocabulary", ncols=80):
-        for token_node in path:
-            vsa.add_to_codebook(token_node)
-    print(f"  ✓ Vocabulary size: {len(vsa.codebook)} unique nodes")
+        vsa_graph.learn_graph_from_corpus(corpus, max_workers=4, batch_size=10)
 
-    vsa.save_codebook(os.path.join(model_dir, "codebook.pkl"))
-    vsa_graph.save_model(model_dir)
+        print("\nBuilding node vocabulary...")
+        for path in tqdm(corpus, desc="Vocabulary", ncols=80):
+            for token_node in path:
+                vsa.add_to_codebook(token_node)
+        print(f"  ✓ Vocabulary size: {len(vsa.codebook)} unique nodes")
+
+        model_dir = input("Enter directory to save model: ").strip()
+        vsa_graph.save_model(model_dir)
 
     # --- Generation Phase ---
     print("\n[2] PREDICTION: Generating Text by Traversing the Graph")
     print("-"*80)
     predictor = GraphNodePredictor(vsa, vsa_graph)
+    
     while True:
-        seed_text = input("USER: ")
-        print(f"SEED PATH: '{seed_text}'")
+        seed_text = input("USER (type 'exit' to quit): ").strip()
+        if seed_text.lower() == 'exit':
+            break
         
         print("GENERATED PATH: ", end='')
         output_path = []
         for token in predictor.generate_path(
             seed_text.split(),
-            max_len=800,
-            exploration=0.8
+            max_len=100,
+            exploration=0.7
         ):
             output_path.append(token)
             print(token, end=' ', flush=True)
-        print("\n\nDemonstration complete.")
+        print("\n")
