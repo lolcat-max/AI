@@ -86,5 +86,5 @@ words = read_text_file(input("Filename: "))
 while True:
     transitions = build_ngram_transitions(words, n=2)
     seed_phrase = input("Enter seed phrase (or leave blank): ")
-    generated = generate_text_guided_seed(transitions, n=2, length=50, window_size=4, seed=seed_phrase)
+    generated = generate_text_guided_seed(transitions, n=2, length=600, window_size=8, seed=seed_phrase)
     print('Generated text:', ' '.join(generated))
