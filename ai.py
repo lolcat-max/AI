@@ -20,7 +20,7 @@ def ai_inference(q1_words, q2_words, n=2):
     ngrams_q1 = get_ngrams_set(q1_words, n)
     ngrams_q2 = get_ngrams_set(q2_words, n)
     duplicate_ngrams = ngrams_q1.intersection(ngrams_q2)
-    return len(duplicate_ngrams) == 0 and a1 == a2
+    return len(duplicate_ngrams) != 0 and a1 >= a2
 
 def generate_text_guided_seed(transitions, n=2, length=50, window_size=4, seed=None):
     # Initialize prefix from seed if possible, else random
@@ -76,8 +76,7 @@ def generate_text_guided_seed(transitions, n=2, length=50, window_size=4, seed=N
 def read_text_file(filename):
     with open(filename, 'r', encoding='utf-8') as f:
         text = f.read().lower()
-    for ch in ['?', '.', ',', '\n', '!', ':', ';']:
-        text = text.replace(ch, ' ')
+
     words = text.split()
     return words
 
@@ -86,5 +85,5 @@ words = read_text_file(input("Filename: "))
 while True:
     transitions = build_ngram_transitions(words, n=2)
     seed_phrase = input("Enter seed phrase (or leave blank): ")
-    generated = generate_text_guided_seed(transitions, n=2, length=600, window_size=8, seed=seed_phrase)
+    generated = generate_text_guided_seed(transitions, n=2, length=600, window_size=4, seed=seed_phrase)
     print('Generated text:', ' '.join(generated))
