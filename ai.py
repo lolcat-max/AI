@@ -1,183 +1,256 @@
-import math
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=4096):
+class Vocab:
+    def __init__(self, specials=None):
+        self.token2idx = {}
+        self.idx2token = {}
+        self.specials = specials or []
+        for t in self.specials:
+            self.add_token(t)
+
+    def add_token(self, token):
+        if token not in self.token2idx:
+            idx = len(self.token2idx)
+            self.token2idx[token] = idx
+            self.idx2token[idx] = token
+
+    def build(self, token_lists):
+        for tokens in token_lists:
+            for t in tokens:
+                self.add_token(t)
+
+    def encode(self, tokens):
+        unk = self.token2idx.get("<unk>")
+        return [self.token2idx.get(t, unk) for t in tokens]
+
+    def decode(self, indices):
+        return [self.idx2token.get(i, "<unk>") for i in indices]
+
+    def __len__(self):
+        return len(self.token2idx)
+
+
+def preprocess(text):
+    text = text.lower()
+    #text = re.sub(r"[^a-z0-9\s]", "", text)
+    return text.strip().split()
+
+
+def build_ngrams(tokens, n=2):
+    # Build list of n-grams from tokens
+    return [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+
+
+def pad_sequences(sequences, pad_idx):
+    max_len = max(len(seq) for seq in sequences)
+    padded = [seq + [pad_idx] * (max_len - len(seq)) for seq in sequences]
+    return torch.tensor(padded, dtype=torch.long)
+
+
+def read_corpus(input_path, output_path):
+    with open(input_path, "r", encoding="utf-8") as f_in:
+        inputs = [line.strip() for line in f_in if line.strip()]
+    with open(output_path, "r", encoding="utf-8") as f_out:
+        outputs = [line.strip() for line in f_out if line.strip()]
+    return inputs, outputs
+
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim=128, hid_dim=256):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, d_model, 2).float()
-                             * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer('pe', pe)
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
+        self.lstm = nn.LSTM(emb_dim, hid_dim, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(hid_dim * 2, hid_dim)
 
-    def forward(self, x):
-        seq_len = x.size(1)
-        return x + self.pe[:, :seq_len]
+    def forward(self, src):
+        embedded = self.embedding(src)
+        outputs, (hidden, cell) = self.lstm(embedded)
+        hidden_cat = torch.cat((hidden[-2], hidden[-1]), dim=1)
+        hidden = torch.tanh(self.fc(hidden_cat)).unsqueeze(0)
+        cell = torch.zeros_like(hidden)
+        return outputs, hidden, cell
 
 
-class FoldingIsomorphismEmbedding(nn.Module):
-    def __init__(self, vocab_size, embed_dim, fold_dim):
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, emb_dim=128, hid_dim=256):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.embed_norm = nn.LayerNorm(embed_dim, eps=1e-5)
-        self.fold_proj = nn.Linear(embed_dim, fold_dim)
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
+        self.lstm = nn.LSTM(emb_dim, hid_dim, batch_first=True)
+        self.fc_out = nn.Linear(hid_dim, vocab_size)
 
-    def forward(self, input_ids):
-        embed = self.embedding(input_ids)
-        embed = self.embed_norm(embed)
-        fold_embed = self.fold_proj(embed)
-        similarity = torch.matmul(fold_embed, fold_embed.transpose(-1, -2))
-        similarity = torch.clamp(similarity, min=-10.0, max=10.0)
-        return embed, fold_embed, similarity
+    def forward(self, input, hidden, cell):
+        input = input.unsqueeze(1)  # (batch, 1)
+        embedded = self.embedding(input)  # (batch, 1, emb_dim)
+        outputs, (hidden, cell) = self.lstm(embedded, (hidden, cell))  # (batch, 1, hid_dim)
+        prediction = self.fc_out(outputs.squeeze(1))  # (batch, vocab_size)
+        return prediction, hidden, cell
 
 
-class IsomorphicFoldLLM(nn.Module):
-    def __init__(
-        self,
-        vocab_size,
-        embed_dim=128,
-        fold_dim=64,
-        d_model=256,
-        nhead=8,
-        num_layers=2,
-        max_seq_len=8192,
-    ):
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, device):
         super().__init__()
-        self.fold_embedder = FoldingIsomorphismEmbedding(
-            vocab_size, embed_dim, fold_dim
-        )
-        self.input_proj = nn.Linear(embed_dim, d_model)
-        self.pos_enc = PositionalEncoding(d_model, max_len=max_seq_len)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.device = device
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=512,
-            dropout=0.1,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.lm_head = nn.Linear(d_model, vocab_size)
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        batch_size, trg_len = trg.shape
+        trg_vocab_size = self.decoder.fc_out.out_features
 
-    def forward(self, input_ids):
-        embed, _, _ = self.fold_embedder(input_ids)
-        x = self.input_proj(embed)
-        x = self.pos_enc(x)
-        x = self.transformer(x)
-        logits = self.lm_head(x)
-        return logits
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
 
+        encoder_outputs, hidden, cell = self.encoder(src)
 
-def build_bigrams(words):
-    return [words[i] + " " + words[i + 1] for i in range(len(words) - 1)]
+        input = trg[:, 0]  # Start token
+
+        for t in range(1, trg_len):
+            output, hidden, cell = self.decoder(input, hidden, cell)
+            outputs[:, t, :] = output
+
+            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
+            top1 = output.argmax(1)
+            input = trg[:, t] if teacher_force else top1
+
+        return outputs
 
 
-def bigrams_from_text(text):
-    words = text.lower().split()
-    if len(words) < 2:
-        return []
-    return [words[i] + " " + words[i + 1] for i in range(len(words) - 1)]
+def train_model(
+    model,
+    src_tensor,
+    trg_tensor,
+    optimizer,
+    criterion,
+    epochs=3,
+    batch_size=32,
+    device="cpu",
+):
+    model.train()
+    n_samples = src_tensor.size(0)
+
+    for epoch in range(epochs):
+        permutation = torch.randperm(n_samples)
+        epoch_loss = 0.0
+
+        for i in range(0, n_samples, batch_size):
+            idxs = permutation[i : i + batch_size]
+            batch_src = src_tensor[idxs].to(device)
+            batch_trg = trg_tensor[idxs].to(device)
+
+            optimizer.zero_grad()
+            output = model(batch_src, batch_trg)
+            output_dim = output.shape[-1]
+
+            loss = criterion(
+                output[:, 1:].reshape(-1, output_dim), batch_trg[:, 1:].reshape(-1)
+            )
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item() * batch_src.size(0)
+
+        print(f"Epoch {epoch+1} Loss: {epoch_loss / n_samples:.4f}")
 
 
-def interactive_chat(model, bigram2idx, idx2bigram, device='cpu', max_len=700):
+def generate_sequence(
+    model, src_tensor, trg_vocab, max_len=30, device="cpu", temperature=1.0
+):
     model.eval()
-    print("You can now chat with the model. Type 'exit' to quit.")
-    while True:
-        user_input = input("User: ")
-        if user_input.strip().lower() == 'exit':
-            break
+    with torch.no_grad():
+        batch_size = src_tensor.size(0)
+        encoder_outputs, hidden, cell = model.encoder(src_tensor.to(device))
 
-        user_bigrams = bigrams_from_text(user_input)
-        if not user_bigrams:
-            print("Please enter at least two words.")
-            continue
+        inputs = torch.tensor(
+            [trg_vocab.token2idx["<sos>"]] * batch_size, device=device
+        )
 
-        token_ids = []
-        for bg in user_bigrams:
-            if bg in bigram2idx:
-                token_ids.append(bigram2idx[bg])
-            else:
-                print(f"Bigram '{bg}' is unknown; skipping.")
-        
-        if len(token_ids) == 0:
-            print("No known bigrams to process.")
-            continue
-        
-        input_ids = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(device)
-        generated = token_ids[:]
+        generated_tokens = [[] for _ in range(batch_size)]
 
         for _ in range(max_len):
-            logits = model(input_ids)
-            logits = logits[:, -1, :]
-            logits = logits - logits.max(dim=-1, keepdim=True)[0]
-            probs = F.softmax(logits, dim=-1)
-            
-            next_token_id = torch.multinomial(probs, num_samples=1).item()
-            generated.append(next_token_id)
-            input_ids = torch.tensor(generated, dtype=torch.long).unsqueeze(0).to(device)
+            output, hidden, cell = model.decoder(inputs, hidden, cell)
+            logits = output / temperature
+            probs = torch.softmax(logits, dim=1)
+            inputs = torch.multinomial(probs, 1).squeeze(1)
 
-        pred_bigrams = [idx2bigram.get(idx, '<UNK>') for idx in generated]
-        print("Model:", " ".join(pred_bigrams))
+            for i, token_idx in enumerate(inputs.tolist()):
+                generated_tokens[i].append(token_idx)
 
+        decoded = [
+            trg_vocab.decode(tokens) for tokens in generated_tokens
+        ]
 
-def train_demo():
-    filename = input("Enter training corpus filename: ")
-    with open(filename, "r", encoding="utf-8") as f:
-        corpus = f.read().lower().split()[:8190]
+        # Cut off tokens after <eos>
+        for i in range(len(decoded)):
+            if "<eos>" in decoded[i]:
+                idx = decoded[i].index("<eos>")
+                decoded[i] = decoded[i][:idx]
 
-    bigrams = build_bigrams(corpus)
-    if len(bigrams) < 10:
-        print("Warning: very small corpus, training may be unstable.")
-    print(f"Num tokens: {len(corpus)}; Num bigrams: {len(bigrams)}")
+        return decoded
 
-    vocab = sorted(set(bigrams))
-    bigram2idx = {bg: i for i, bg in enumerate(vocab)}
-    idx2bigram = {i: bg for bg, i in bigram2idx.items()}
-    print(f"Vocab size: {len(vocab)}")
-
-    token_ids = torch.tensor(
-        [bigram2idx[bg] for bg in bigrams], dtype=torch.long
-    ).unsqueeze(0)
-
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = IsomorphicFoldLLM(vocab_size=len(vocab)).to(device)
+    input_file = "xaa"
+    output_file = "xab"
 
-    optimizer = optim.Adam(model.parameters(), lr=5e-4, weight_decay=3)
-    criterion = nn.CrossEntropyLoss()
+    raw_inputs, raw_outputs = read_corpus(input_file, output_file)
 
-    model.train()
-    for epoch in range(5):
-        optimizer.zero_grad()
-        input_ids = token_ids[:, :-1].to(device)
-        targets = token_ids[:, 1:].to(device)
+    input_tokens = [build_ngrams(preprocess(s), n=2) for s in raw_inputs]
+    output_tokens = [build_ngrams(preprocess(s), n=2) for s in raw_outputs]
 
-        logits = model(input_ids)
-        logits = logits - logits.max(dim=-1, keepdim=True)[0]
-        logits = torch.clamp(logits, min=-20.0, max=20.0)
+    input_specials = ["<pad>", "<unk>"]
+    output_specials = ["<pad>", "<unk>", "<sos>", "<eos>"]
 
-        loss = criterion(
-            logits.view(-1, logits.size(-1)), targets.view(-1)
-        )
+    input_vocab = Vocab(specials=input_specials)
+    output_vocab = Vocab(specials=output_specials)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+    input_vocab.build(input_tokens)
+    output_vocab.build(output_tokens)
 
-        print(f"Epoch {epoch} Loss: {loss.item():.6f}")
+    input_indices = [input_vocab.encode(toks)[:16] for toks in input_tokens]   # truncate max_len=16
+    output_indices = [output_vocab.encode(["<sos>"] + toks + ["<eos>"])[:18] for toks in output_tokens]  # truncate
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            print("Invalid loss detected, aborting training.")
+    src_tensor = pad_sequences(input_indices, input_vocab.token2idx["<pad>"]).to(device)
+    trg_tensor = pad_sequences(output_indices, output_vocab.token2idx["<pad>"]).to(device)
+
+    # Drastically reduce embedding and hidden dims
+    encoder = Encoder(len(input_vocab), emb_dim=8, hid_dim=16).to(device)
+    decoder = Decoder(len(output_vocab), emb_dim=8, hid_dim=16).to(device)
+    model = Seq2Seq(encoder, decoder, device).to(device)
+
+    # Use float16 mixed precision if GPU available (optional advanced)
+    if device.type == 'cuda':
+        model = model.half()
+        src_tensor = src_tensor.half()
+        trg_tensor = trg_tensor.half()
+
+    optimizer = optim.Adam(model.parameters())
+    criterion = nn.CrossEntropyLoss(ignore_index=output_vocab.token2idx["<pad>"])
+
+    # Use very small batch size for memory
+    train_model(model, src_tensor, trg_tensor, optimizer, criterion, epochs=3, batch_size=2, device=device)
+
+    # Interactive demo
+    while True:
+        sentence = input("\nEnter input sentence (or type exit): ").strip()
+        if sentence.lower() == "exit":
             break
 
-    interactive_chat(model, bigram2idx, idx2bigram, device=device)
+        tokenized = build_ngrams(preprocess(sentence), n=2)[:16]  # truncate input length
+        encoded = input_vocab.encode(tokenized)
+        if len(encoded) == 0:
+            print("Input contains unknown tokens.")
+            continue
+
+        src = torch.tensor([encoded], device=device)
+        if device.type == 'cuda':
+            src = src.half()
+        outputs = generate_sequence(model, src, output_vocab, max_len=800, device=device, temperature=0.8)
+        print("Generated symbolic equation:", " ".join(outputs[0]))
 
 
 if __name__ == "__main__":
-    train_demo()
+    main()
