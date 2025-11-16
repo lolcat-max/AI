@@ -194,7 +194,7 @@ def generate_sequence(
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     input_file = "xaa"
-    output_file = "xab"
+    output_file = "xaa"
 
     raw_inputs, raw_outputs = read_corpus(input_file, output_file)
 
