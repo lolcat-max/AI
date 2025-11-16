@@ -47,7 +47,7 @@ class IsomorphicFoldLLM(nn.Module):
         d_model=256,
         nhead=8,
         num_layers=2,
-        max_seq_len=4096,
+        max_seq_len=8192,
     ):
         super().__init__()
         self.fold_embedder = FoldingIsomorphismEmbedding(
@@ -130,7 +130,7 @@ def interactive_chat(model, bigram2idx, idx2bigram, device='cpu', max_len=700):
 def train_demo():
     filename = input("Enter training corpus filename: ")
     with open(filename, "r", encoding="utf-8") as f:
-        corpus = f.read().lower().split()[:4000]
+        corpus = f.read().lower().split()[:8190]
 
     bigrams = build_bigrams(corpus)
     if len(bigrams) < 10:
