@@ -20,9 +20,10 @@ class Vocab:
             self.idx2token[idx] = token
 
     def build(self, token_lists):
-        for tokens in token_lists:
+        for i, tokens in enumerate(token_lists):
             for t in tokens:
-                self.add_token(t)
+                if t in token_lists[i-2]:
+                    self.add_token(t)
 
     def encode(self, tokens):
         unk = self.token2idx.get("<unk>")
@@ -38,7 +39,7 @@ class Vocab:
 def preprocess(text):
     text = text.lower()
     #text = re.sub(r"[^a-z0-9\s]", "", text)
-    return text.strip().split()
+    return text.split()
 
 
 def build_ngrams(tokens, n=2):
@@ -106,7 +107,7 @@ class Seq2Seq(nn.Module):
 
         encoder_outputs, hidden, cell = self.encoder(src)
 
-        input = trg[:, 0]  # Start token
+        input = trg[:, -1]  # Start token
 
         for t in range(1, trg_len):
             output, hidden, cell = self.decoder(input, hidden, cell)
@@ -173,7 +174,7 @@ def generate_sequence(
         for _ in range(max_len):
             output, hidden, cell = model.decoder(inputs, hidden, cell)
             logits = output / temperature
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=-1)
             inputs = torch.multinomial(probs, 1).squeeze(1)
 
             for i, token_idx in enumerate(inputs.tolist()):
