@@ -83,6 +83,7 @@ class MixtureOfExpertsRouter:
         for name in expert_names:
             sim = self.vsa.similarity(context_vector, self.expert_vectors[name])
             similarities.append(sim)
+            
         
         # Softmax to convert similarities to probabilities
         exp_sims = np.exp(np.array(similarities) - np.max(similarities))
@@ -107,7 +108,7 @@ class TransitionEncoder:
         with self.lock:
             self.bigram_transitions[token1][token2] += 1
             if (token1, token2) not in self.bigram_vectors:
-                vec1 = self.vsa.add_to_codebook(token1)
+                vec1 = -self.vsa.add_to_codebook(token1)
                 vec2 = self.vsa.add_to_codebook(token2)
                 self.bigram_vectors[(token1, token2)] = self.vsa.bind(vec1, vec2)
 
@@ -247,7 +248,7 @@ if __name__ == "__main__":
         print(f"Corpus loaded: {len(corpus)} sequences")
         print("[1] Learning Transition Patterns (Multithreaded)")
         print("-"*80)
-        trans_encoder.learn_transitions(corpus, max_workers=8, batch_size=500)
+        trans_encoder.learn_transitions(corpus, max_workers=8, batch_size=50)
         print("Building vocabulary...")
         for sentence in tqdm(corpus, desc="Vocabulary", ncols=80):
             for token in sentence: vsa.add_to_codebook(token)
