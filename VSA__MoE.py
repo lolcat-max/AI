@@ -229,7 +229,7 @@ if __name__ == "__main__":
     print("MIXTURE OF EXPERTS FOR TEXT GENERATION (VSA + MULTITHREADING + SAVE/LOAD)")
     print("="*80)
 
-    vsa = VectorSymbolicArchitecture(dimensions=4096)
+    vsa = VectorSymbolicArchitecture(dimensions=64)
     trans_encoder = TransitionEncoder(vsa)
 
     choice = input("[N]ew model or [L]oad existing? ").strip().lower()
@@ -271,4 +271,5 @@ if __name__ == "__main__":
         ):
             print(token, end=' ', flush=True)
         print("\n")
+
 
