@@ -13,7 +13,7 @@ import pickle
 import os
 from scipy.stats import qmc
 import math
-KB_LEN = 9999
+KB_LEN = -1
 class IntDefaultDict(defaultdict):
     def __init__(self, *args, **kwargs):
         if args:
