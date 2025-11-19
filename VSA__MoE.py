@@ -267,7 +267,8 @@ if __name__ == "__main__":
         for token in moe_gen.stream_generation(
             user_input.split(),
             max_tokens=800,
-            temperature=0.9
+            temperature=0.7
         ):
             print(token, end=' ', flush=True)
         print("\n")
+
