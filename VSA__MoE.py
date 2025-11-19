@@ -1,7 +1,7 @@
 """
 Enhanced Transitioning for Streaming Text Generation
 Implements smooth token-to-token transitions with n-gram bindings
-NOW WITH A TRUE MIXTURE OF EXPERTS (MOE) MODEL, MULTITHREADING, PROGRESS BARS, AND SAVE/LOAD
+NOW WITH SOBOL SEQUENCES, TRUE MoE, MULTITHREADING, PROGRESS BARS, AND SAVE/LOAD
 """
 KB_LEN = -1
 import numpy as np
@@ -12,28 +12,43 @@ from tqdm import tqdm
 import threading
 import pickle
 import os
+from scipy.stats import qmc
+import math
 
 class IntDefaultDict(defaultdict):
     def __init__(self, *args, **kwargs):
-        # Case 1: user explicitly passed a default factory
         if args:
-            default = args[0]
-            super().__init__(default)
+            super().__init__(args[0])
         else:
-            # Case 2: no default factory passed → use int
             super().__init__(int)
-        
+
 # =====================================================================
-# VECTOR SYMBOLIC ARCHITECTURE
+# VECTOR SYMBOLIC ARCHITECTURE WITH SOBOL SEQUENCES
 # =====================================================================
 class VectorSymbolicArchitecture:
-    def __init__(self, dimensions: int = 2048):
+    def __init__(self, dimensions: int = 2048, scramble: bool = True):
         self.dimensions = dimensions
         self.codebook: Dict[str, np.ndarray] = {}
         self.lock = threading.Lock()
+        self.sobol_engine = qmc.Sobol(d=min(dimensions, 21201), scramble=scramble)
+        self._sobol_counter = 0
+        self._sobol_buffer = None
+        self._buffer_size = 0
+
+    def _refill_sobol_buffer(self, n_points: int):
+        power = max(1, math.ceil(math.log2(n_points)))
+        self._buffer_size = 2 ** power
+        uniform_samples = self.sobol_engine.random(self._buffer_size)
+        self._sobol_buffer = qmc.scale(uniform_samples, l_bounds=-3, u_bounds=3)
+        self._sobol_counter = 0
 
     def create_vector(self, normalize: bool = True) -> np.ndarray:
-        vec = np.random.randn(self.dimensions)
+        if self._sobol_buffer is None or self._sobol_counter >= self._buffer_size:
+            self._refill_sobol_buffer(1024)
+        
+        vec = self._sobol_buffer[self._sobol_counter].copy()
+        self._sobol_counter += 1
+        
         if normalize:
             vec = vec / np.linalg.norm(vec)
         return vec
@@ -68,79 +83,112 @@ class VectorSymbolicArchitecture:
         print(f"✓ Codebook loaded from {filepath}")
 
 # =====================================================================
-# MIXTURE OF EXPERTS ROUTER (NEW)
+# MIXTURE OF EXPERTS ROUTER WITH CACHING
 # =====================================================================
 class MixtureOfExpertsRouter:
-    """A VSA-based router to select between different experts (n-gram models)."""
     def __init__(self, vsa: VectorSymbolicArchitecture, expert_names: List[str]):
         self.vsa = vsa
         self.expert_vectors = {name: self.vsa.add_to_codebook(f"EXPERT_{name.upper()}") for name in expert_names}
+        self._routing_cache = {}
+        self._cache_lock = threading.Lock()
 
     def route(self, context_vector: np.ndarray) -> Dict[str, float]:
-        """Calculate routing probabilities based on context similarity to each expert."""
+        context_key = tuple(np.round(context_vector, 4))
+        with self._cache_lock:
+            if context_key in self._routing_cache:
+                return self._routing_cache[context_key]
+        
         similarities = []
         expert_names = list(self.expert_vectors.keys())
         for name in expert_names:
             sim = self.vsa.similarity(context_vector, self.expert_vectors[name])
             similarities.append(sim)
             
-        
-        # Softmax to convert similarities to probabilities
         exp_sims = np.exp(np.array(similarities) - np.max(similarities))
         probabilities = exp_sims / np.sum(exp_sims)
+        result = dict(zip(expert_names, probabilities))
         
-        return dict(zip(expert_names, probabilities))
+        with self._cache_lock:
+            self._routing_cache[context_key] = result
+        return result
 
 # =====================================================================
-# TRANSITION ENCODER (ENHANCED FOR MOE)
+# TRANSITION ENCODER WITH LOCK-FREE PARALLELISM
 # =====================================================================
 class TransitionEncoder:
-    """Encode and learn token transitions, providing probabilistic candidates for MoE."""
     def __init__(self, vsa):
         self.vsa = vsa
         self.bigram_vectors = {}
         self.trigram_vectors = {}
         self.bigram_transitions = defaultdict(IntDefaultDict)
         self.trigram_transitions = defaultdict(IntDefaultDict)
-        self.lock = threading.Lock()
 
-    def encode_bigram(self, token1: str, token2: str):
-        with self.lock:
-            self.bigram_transitions[token1][token2] += 1
-            if (token1, token2) not in self.bigram_vectors:
-                vec1 = -self.vsa.add_to_codebook(token1)
-                vec2 = self.vsa.add_to_codebook(token2)
-                self.bigram_vectors[(token1, token2)] = self.vsa.bind(vec1, vec2)
+    def encode_bigram(self, token1: str, token2: str, local_bigram=None):
+        if local_bigram is not None:
+            local_bigram[token1][token2] += 1
+        else:
+            with threading.Lock():
+                self.bigram_transitions[token1][token2] += 1
+                if (token1, token2) not in self.bigram_vectors:
+                    vec1 = -self.vsa.add_to_codebook(token1)
+                    vec2 = self.vsa.add_to_codebook(token2)
+                    self.bigram_vectors[(token1, token2)] = self.vsa.bind(vec1, vec2)
 
-    def encode_trigram(self, token1: str, token2: str, token3: str):
-        with self.lock:
-            self.trigram_transitions[(token1, token2)][token3] += 1
-            if (token1, token2, token3) not in self.trigram_vectors:
-                vec1 = self.vsa.add_to_codebook(token1)
-                vec2 = self.vsa.add_to_codebook(token2)
-                vec3 = self.vsa.add_to_codebook(token3)
-                bound12 = self.vsa.bind(vec1, vec2)
-                self.trigram_vectors[(token1, token2, token3)] = self.vsa.bind(bound12, vec3)
+    def encode_trigram(self, token1: str, token2: str, token3: str, local_trigram=None):
+        if local_trigram is not None:
+            local_trigram[(token1, token2)][token3] += 1
+        else:
+            with threading.Lock():
+                self.trigram_transitions[(token1, token2)][token3] += 1
+                if (token1, token2, token3) not in self.trigram_vectors:
+                    vec1 = self.vsa.add_to_codebook(token1)
+                    vec2 = self.vsa.add_to_codebook(token2)
+                    vec3 = self.vsa.add_to_codebook(token3)
+                    bound12 = self.vsa.bind(vec1, vec2)
+                    self.trigram_vectors[(token1, token2, token3)] = self.vsa.bind(bound12, vec3)
 
-    def _process_sequence_batch(self, sequences: List[List[str]]) -> Tuple[int, int]:
+    def _process_sequence_batch(self, sequences: List[List[str]]) -> Tuple[dict, dict, int, int]:
+        local_bigram = defaultdict(IntDefaultDict)
+        local_trigram = defaultdict(IntDefaultDict)
         bigram_count, trigram_count = 0, 0
+        
         for sequence in sequences:
             for i in range(len(sequence) - 1):
-                self.encode_bigram(sequence[i], sequence[i+1])
+                local_bigram[sequence[i]][sequence[i+1]] += 1
                 bigram_count += 1
             for i in range(len(sequence) - 2):
-                self.encode_trigram(sequence[i], sequence[i+1], sequence[i+2])
+                local_trigram[(sequence[i], sequence[i+1])][sequence[i+2]] += 1
                 trigram_count += 1
-        return bigram_count, trigram_count
+        return local_bigram, local_trigram, bigram_count, trigram_count
 
     def learn_transitions(self, corpus: List[List[str]], max_workers: int = 8, batch_size: int = 100):
         print("Learning transitions from corpus...")
         batches = [corpus[i:i + batch_size] for i in range(0, len(corpus), batch_size)]
+        
+        all_local_bigrams = []
+        all_local_trigrams = []
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor, tqdm(total=len(batches), desc="Processing batches", ncols=80) as pbar:
-            for _ in executor.map(self._process_sequence_batch, batches):
+            for local_bigram, local_trigram, bg_count, tg_count in executor.map(self._process_sequence_batch, batches):
+                all_local_bigrams.append(local_bigram)
+                all_local_trigrams.append(local_trigram)
                 pbar.update(1)
-        print(f"  ✓ Learned {sum(len(v) for v in self.bigram_transitions.values())} unique bigram transitions.")
-        print(f"  ✓ Learned {sum(len(v) for v in self.trigram_transitions.values())} unique trigram transitions.")
+        
+        print("Merging transition counts...")
+        for local_bigram in tqdm(all_local_bigrams, desc="Merging bigrams", ncols=80):
+            for token1, transitions in local_bigram.items():
+                for token2, count in transitions.items():
+                    self.bigram_transitions[token1][token2] += count
+        
+        for local_trigram in tqdm(all_local_trigrams, desc="Merging trigrams", ncols=80):
+            for token_pair, transitions in local_trigram.items():
+                for token3, count in transitions.items():
+                    self.trigram_transitions[token_pair][token3] += count
+        
+        total_bigrams = sum(len(v) for v in self.bigram_transitions.values())
+        total_trigrams = sum(len(v) for v in self.trigram_transitions.values())
+        print(f"  ✓ Learned {total_bigrams} unique bigram transitions.")
+        print(f"  ✓ Learned {total_trigrams} unique trigram transitions.")
 
     def get_bigram_probabilities(self, last_token: str) -> Optional[Dict[str, float]]:
         if last_token not in self.bigram_transitions: return None
@@ -178,14 +226,28 @@ class TransitionEncoder:
         print(f"✓ Transition model loaded from {directory}")
 
 # =====================================================================
-# MIXTURE OF EXPERTS GENERATOR (NEW)
+# MIXTURE OF EXPERTS GENERATOR WITH INCREMENTAL BUNDLING
 # =====================================================================
 class MoEGenerator:
-    """Generates text using a Mixture of Experts model over VSA n-grams."""
     def __init__(self, vsa: VectorSymbolicArchitecture, transition_encoder: TransitionEncoder):
         self.vsa = vsa
         self.transition_encoder = transition_encoder
         self.router = MixtureOfExpertsRouter(vsa, expert_names=['bigram', 'trigram'])
+        self._context_cache = {}
+
+    def _get_context_vector(self, context: List[str], length: int) -> np.ndarray:
+        cache_key = tuple(context[-length:])
+        if cache_key in self._context_cache:
+            return self._context_cache[cache_key]
+        
+        vectors = [self.vsa.codebook[tok] for tok in cache_key if tok in self.vsa.codebook]
+        if not vectors:
+            vec = self.vsa.create_vector()
+        else:
+            vec = self.vsa.bundle(vectors)
+        
+        self._context_cache[cache_key] = vec
+        return vec
 
     def stream_generation(self, seed: List[str], max_tokens: int = 50, temperature: float = 1.0):
         context = seed.copy()
@@ -198,7 +260,7 @@ class MoEGenerator:
             trigram_probs = self.transition_encoder.get_trigram_probabilities(tuple(context[-2:])) if len(context) >= 2 else None
 
             if trigram_probs:
-                context_vec = self.vsa.bundle([self.vsa.codebook[tok] for tok in context[-2:] if tok in self.vsa.codebook])
+                context_vec = self._get_context_vector(context, 2)
                 routing_probs = self.router.route(context_vec)
             else:
                 routing_probs = {'bigram': 1.0, 'trigram': 0.0}
@@ -227,10 +289,10 @@ class MoEGenerator:
 # =====================================================================
 if __name__ == "__main__":
     print("="*80)
-    print("MIXTURE OF EXPERTS FOR TEXT GENERATION (VSA + MULTITHREADING + SAVE/LOAD)")
+    print("MIXTURE OF EXPERTS FOR TEXT GENERATION (VSA + SOBOL + MULTITHREADING)")
     print("="*80)
 
-    vsa = VectorSymbolicArchitecture(dimensions=64)
+    vsa = VectorSymbolicArchitecture(dimensions=256, scramble=True)
     trans_encoder = TransitionEncoder(vsa)
 
     choice = input("[N]ew model or [L]oad existing? ").strip().lower()
@@ -242,7 +304,8 @@ if __name__ == "__main__":
     else:
         filename = input("Filename: ")
         print("Loading corpus...")
-        with open(filename, encoding="utf-8") as f: raw_text = f.read()
+        with open(filename, encoding="utf-8") as f: 
+            raw_text = f.read()
         sentences = raw_text.split(".")[:KB_LEN]
         corpus = [sentence.split() for sentence in tqdm(sentences, desc="Tokenizing", ncols=80) if sentence.split()]
         print(f"Corpus loaded: {len(corpus)} sequences")
@@ -260,7 +323,7 @@ if __name__ == "__main__":
     print("\n[2] GENERATING TEXT WITH MIXTURE OF EXPERTS")
     print("-"*80)
     moe_gen = MoEGenerator(vsa, trans_encoder)
-    with open("questions.conf", encoding="utf-8") as f: questions = f.readlines()
+    
     while True:
         user_input = input("USER: ")
         if user_input.lower() in ['quit', 'exit', 'q']: break
