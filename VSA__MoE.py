@@ -3,7 +3,7 @@ Enhanced Transitioning for Streaming Text Generation
 Implements smooth token-to-token transitions with n-gram bindings
 NOW WITH A TRUE MIXTURE OF EXPERTS (MOE) MODEL, MULTITHREADING, PROGRESS BARS, AND SAVE/LOAD
 """
-KB_LEN = 9999
+KB_LEN = -1
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -271,5 +271,6 @@ if __name__ == "__main__":
         ):
             print(token, end=' ', flush=True)
         print("\n")
+
 
 
