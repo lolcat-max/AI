@@ -260,8 +260,9 @@ if __name__ == "__main__":
         print("AI: ", end='')
         for token in moe_gen.stream_generation(
             user_input.split(),
-            max_tokens=100,
+            max_tokens=800,
             temperature=0.9
         ):
             print(token, end=' ', flush=True)
         print("\n")
+
