@@ -259,18 +259,15 @@ if __name__ == "__main__":
     print("\n[2] GENERATING TEXT WITH MIXTURE OF EXPERTS")
     print("-"*80)
     moe_gen = MoEGenerator(vsa, trans_encoder)
-
+    with open("questions.conf", encoding="utf-8") as f: questions = f.readlines()
     while True:
         user_input = input("USER: ")
         if user_input.lower() in ['quit', 'exit', 'q']: break
         print("AI: ", end='')
         for token in moe_gen.stream_generation(
             user_input.split(),
-            max_tokens=800,
+            max_tokens=350,
             temperature=0.7
         ):
             print(token, end=' ', flush=True)
         print("\n")
-
-
-
