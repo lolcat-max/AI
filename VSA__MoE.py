@@ -13,7 +13,7 @@ import pickle
 import os
 from scipy.stats import qmc
 import math
-
+KB_LEN = 9999
 class IntDefaultDict(defaultdict):
     def __init__(self, *args, **kwargs):
         if args:
@@ -34,6 +34,7 @@ class VectorSymbolicArchitecture:
         self._sobol_counter = 0
         self._sobol_buffer = None
         self._buffer_size = 0
+        self.codebook: Dict[str, np.ndarray] = {}
 
     def _refill_sobol_buffer(self, n_points: int):
         power = max(1, math.ceil(math.log2(n_points)))
@@ -75,6 +76,12 @@ class VectorSymbolicArchitecture:
                 if token not in self.token_vectors:
                     self.token_vectors[token] = self.create_vector()
                 return self.token_vectors[token]
+    def add_to_codebook(self, symbol: str) -> np.ndarray:
+        with self.lock:
+            if symbol not in self.codebook:
+                self.codebook[symbol] = self.create_vector()
+            return self.codebook[symbol]
+
 
     def get_vector(self, token: str, is_operator: bool = False) -> Optional[np.ndarray]:
         if is_operator:
@@ -97,7 +104,7 @@ class VectorSymbolicArchitecture:
 # =====================================================================
 # HYBRID TRANSITION ENCODER (N-GRAM + SUPERVISED)
 # =====================================================================
-class HybridTransitionEncoder:
+class TransitionEncoder:
     def __init__(self, vsa: VectorSymbolicArchitecture):
         self.vsa = vsa
         
@@ -350,7 +357,7 @@ class HybridTransitionEncoder:
 # UNIFIED MoE GENERATOR (TEXT GENERATION + PROBLEM SOLVING)
 # =====================================================================
 class UnifiedMoEGenerator:
-    def __init__(self, vsa: VectorSymbolicArchitecture, encoder: HybridTransitionEncoder, mode: str = 'text'):
+    def __init__(self, vsa: VectorSymbolicArchitecture, encoder: TransitionEncoder, mode: str = 'text'):
         self.vsa = vsa
         self.encoder = encoder
         self.mode = mode  # 'text' or 'reasoning'
@@ -953,21 +960,319 @@ def run_example():
     for token in generator.stream_generate(input("USER: ").split(), max_tokens=700, temperature=0.7):
         print(token, end=' ')
     print()
+# =====================================================================
+# GRAPH NETWORK PREPROCESSING WITH VSA CONVOLUTION
+# =====================================================================
+class GraphNetworkPreprocessor:
+    """
+    Constructs a weighted transition graph from n-gram data and applies
+    VSA-based graph convolution to enrich token representations.
+    """
+    def __init__(self, vsa: VectorSymbolicArchitecture, transition_encoder: TransitionEncoder):
+        self.vsa = vsa
+        self.transition_encoder = transition_encoder
+        self.graph = defaultdict(dict)  # node -> {neighbor: weight}
+        self.node_degrees = defaultdict(float)
+        self.enriched_vectors = {}
+    
+    def build_graph_from_transitions(self, min_weight: float = 0.01):
+        """
+        Construct weighted directed graph from n-gram transitions.
+        Edges represent transition probabilities with optional thresholding.
+        """
+        print("Building graph from transition data...")
+        
+        # Add bigram edges with normalized weights
+        for token1, transitions in tqdm(
+            self.transition_encoder.bigram_transitions.items(), 
+            desc="Bigram edges", ncols=80
+        ):
+            total_count = sum(transitions.values())
+            for token2, count in transitions.items():
+                weight = count / total_count
+                if weight >= min_weight:  # Filter weak connections
+                    self.graph[token1][token2] = weight
+                    self.node_degrees[token1] += weight
+        
+        # Add trigram edges as higher-order connections
+        for (token1, token2), transitions in tqdm(
+            self.transition_encoder.trigram_transitions.items(), 
+            desc="Trigram edges", ncols=80
+        ):
+            total_count = sum(transitions.values())
+            for token3, count in transitions.items():
+                weight = (count / total_count) * 0.5  # Reduced weight for higher-order
+                if weight >= min_weight:
+                    pair_node = f"{token1}_{token2}"
+                    self.graph[pair_node][token3] = weight
+                    self.node_degrees[pair_node] += weight
+        
+        total_edges = sum(len(v) for v in self.graph.values())
+        print(f"  ✓ Graph built: {len(self.graph)} nodes, {total_edges} edges")
+    
+    def graph_convolution(self, iterations: int = 2, alpha: float = 0.85):
+        """
+        Apply VSA-based graph convolution using binding as the aggregation operator.
+        Each iteration propagates information through the graph using circular
+        convolution (binding) and bundling for combination.
+        """
+        print(f"Applying VSA graph convolution ({iterations} iterations)...")
+        
+        # Initialize with current codebook vectors
+        for token in tqdm(self.vsa.codebook.keys(), desc="Initializing nodes", ncols=80):
+            self.enriched_vectors[token] = self.vsa.codebook[token].copy()
+        
+        # Create pseudo-nodes for trigram pairs
+        for (token1, token2) in self.transition_encoder.trigram_transitions.keys():
+            pair_node = f"{token1}_{token2}"
+            if pair_node not in self.enriched_vectors:
+                vec1 = self.vsa.codebook.get(token1, self.vsa.create_vector())
+                vec2 = self.vsa.codebook.get(token2, self.vsa.create_vector())
+                self.enriched_vectors[pair_node] = self.vsa.bind(vec1, vec2)
+        
+        # Iterative graph convolution
+        for iteration in tqdm(range(iterations), desc="Convolution iterations", ncols=80):
+            new_vectors = {}
+            
+            for node, neighbors in self.graph.items():
+                if not neighbors:
+                    new_vectors[node] = self.enriched_vectors[node]
+                    continue
+                
+                # Aggregate neighbor vectors using binding (circular convolution)
+                neighbor_aggregates = []
+                total_weight = 0.0
+                
+                for neighbor, weight in neighbors.items():
+                    if neighbor in self.enriched_vectors:
+                        # Bind node vector with neighbor vector (graph convolution operation)
+                        bound = self.vsa.bind(self.enriched_vectors[node], self.enriched_vectors[neighbor])
+                        # Weight the bound vector
+                        weighted_bound = bound * weight
+                        neighbor_aggregates.append(weighted_bound)
+                        total_weight += weight
+                
+                if neighbor_aggregates:
+                    # Bundle all weighted bound vectors
+                    aggregated = np.sum(neighbor_aggregates, axis=0)
+                    if total_weight > 0:
+                        aggregated = aggregated / total_weight
+                    aggregated = aggregated / np.linalg.norm(aggregated)
+                    
+                    # Residual connection: combine with original vector
+                    self_vec = self.enriched_vectors[node]
+                    combined = self_vec * alpha + aggregated * (1 - alpha)
+                    new_vectors[node] = combined / np.linalg.norm(combined)
+                else:
+                    new_vectors[node] = self.enriched_vectors[node]
+            
+            self.enriched_vectors = new_vectors
+        
+        # Update main codebook with enriched vectors (skip pseudo-nodes)
+        updated_count = 0
+        for token, vec in self.enriched_vectors.items():
+            if "_" not in token:  # Skip pseudo-nodes like "token1_token2"
+                self.vsa.codebook[token] = vec
+                updated_count += 1
+        
+        print(f"  ✓ Enriched {updated_count} token vectors")
+        return self.enriched_vectors
+    
+    def get_enriched_vector(self, token: str) -> np.ndarray:
+        """Retrieve enriched vector for any token (including pseudo-nodes)"""
+        return self.enriched_vectors.get(token, self.vsa.codebook.get(token, self.vsa.create_vector()))
+    
+    def save_graph(self, directory: str):
+        """Persist graph structure and enriched vectors"""
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "graph.pkl"), 'wb') as f:
+            pickle.dump(dict(self.graph), f)
+        with open(os.path.join(directory, "node_degrees.pkl"), 'wb') as f:
+            pickle.dump(dict(self.node_degrees), f)
+        with open(os.path.join(directory, "enriched_vectors.pkl"), 'wb') as f:
+            # Convert numpy arrays to bytes for serialization
+            serializable = {k: v.tobytes() for k, v in self.enriched_vectors.items()}
+            pickle.dump(serializable, f)
+        print(f"✓ Graph data saved to {directory}")
+    
+    def load_graph(self, directory: str):
+        """Load graph structure and enriched vectors"""
+        with open(os.path.join(directory, "graph.pkl"), 'rb') as f:
+            self.graph = defaultdict(dict, pickle.load(f))
+        with open(os.path.join(directory, "node_degrees.pkl"), 'rb') as f:
+            self.node_degrees = defaultdict(float, pickle.load(f))
+        
+        # Load enriched vectors and reconstruct numpy arrays
+        with open(os.path.join(directory, "enriched_vectors.pkl"), 'rb') as f:
+            serializable = pickle.load(f)
+            self.enriched_vectors = {
+                k: np.frombuffer(v, dtype=np.float64).copy() 
+                for k, v in serializable.items()
+            }
+        
+        # Update VSA codebook with loaded enriched vectors
+        for token, vec in self.enriched_vectors.items():
+            if "_" not in token:
+                self.vsa.codebook[token] = vec
+        
+        print(f"✓ Graph data loaded from {directory}")
 
 # =====================================================================
-# MAIN ENTRYPOINT WITH EXAMPLES
+# MIXTURE OF EXPERTS GENERATOR WITH INCREMENTAL BUNDLING
+# =====================================================================
+class MoEGenerator:
+    def __init__(self, vsa: VectorSymbolicArchitecture, transition_encoder: TransitionEncoder):
+        self.vsa = vsa
+        self.transition_encoder = transition_encoder
+        self.router = MixtureOfExpertsRouter(vsa, expert_names=['bigram', 'trigram'])
+        self._context_cache = {}
+
+    def _get_context_vector(self, context: List[str], length: int) -> np.ndarray:
+        cache_key = tuple(context[-length:])
+        if cache_key in self._context_cache:
+            return self._context_cache[cache_key]
+        
+        vectors = [self.vsa.codebook[tok] for tok in cache_key if tok in self.vsa.codebook]
+        if not vectors:
+            vec = self.vsa.create_vector()
+        else:
+            vec = self.vsa.bundle(vectors)
+        
+        self._context_cache[cache_key] = vec
+        return vec
+
+    def stream_generation(self, seed: List[str], max_tokens: int = 50, temperature: float = 1.0):
+        context = seed.copy()
+        if not context:
+            print("Error: Seed context cannot be empty.")
+            return
+
+        for _ in range(max_tokens):
+            bigram_probs = self.transition_encoder.get_bigram_probabilities(context[-1]) if len(context) >= 1 else None
+            trigram_probs = self.transition_encoder.get_trigram_probabilities(tuple(context[-2:])) if len(context) >= 2 else None
+
+            if trigram_probs:
+                context_vec = self._get_context_vector(context, 2)
+                routing_probs = self.router.route(context_vec)
+            else:
+                routing_probs = {'bigram': 1.0, 'trigram': 0.0}
+
+            final_probs = defaultdict(float)
+            if bigram_probs:
+                for token, prob in bigram_probs.items(): final_probs[token] += routing_probs['bigram'] * prob
+            if trigram_probs:
+                for token, prob in trigram_probs.items(): final_probs[token] += routing_probs['trigram'] * prob
+
+            if not final_probs:
+                next_token = np.random.choice(list(self.vsa.codebook.keys()))
+            else:
+                tokens, probs = list(final_probs.keys()), np.array(list(final_probs.values()))
+                if temperature > 0:
+                    probs = np.log(probs + 1e-9) / temperature
+                    probs = np.exp(probs)
+                probs /= np.sum(probs)
+                next_token = np.random.choice(tokens, p=probs)
+            
+            yield next_token
+            context.append(next_token)
+
+# =====================================================================
+# MIXTURE OF EXPERTS ROUTER WITH CACHING
+# =====================================================================
+class MixtureOfExpertsRouter:
+    def __init__(self, vsa: VectorSymbolicArchitecture, expert_names: List[str]):
+        self.vsa = vsa
+        self.expert_vectors = {name: self.vsa.add_to_codebook(f"EXPERT_{name.upper()}") for name in expert_names}
+        self._routing_cache = {}
+        self._cache_lock = threading.Lock()
+
+    def route(self, context_vector: np.ndarray) -> Dict[str, float]:
+        context_key = tuple(np.round(context_vector, 4))
+        with self._cache_lock:
+            if context_key in self._routing_cache:
+                return self._routing_cache[context_key]
+        
+        similarities = []
+        expert_names = list(self.expert_vectors.keys())
+        for name in expert_names:
+            sim = self.vsa.similarity(context_vector, self.expert_vectors[name])
+            similarities.append(sim)
+            
+        exp_sims = np.exp(np.array(similarities) - np.max(similarities))
+        probabilities = exp_sims / np.sum(exp_sims)
+        result = dict(zip(expert_names, probabilities))
+        
+        with self._cache_lock:
+            self._routing_cache[context_key] = result
+        return result
+# =====================================================================
+# MODIFIED MAIN BLOCK WITH GRAPH PREPROCESSING
 # =====================================================================
 if __name__ == "__main__":
     print("="*80)
-    print("UNIFIED VSA-MoE ARCHITECTURE: TEXT GENERATION & NEURO-SYMBOLIC REASONING")
+    print("MIXTURE OF EXPERTS FOR TEXT GENERATION (VSA + SOBOL + GRAPH + MULTITHREADING)")
     print("="*80)
+
+    vsa = VectorSymbolicArchitecture(dimensions=256, scramble=True)
+    trans_encoder = TransitionEncoder(vsa)
+
+    choice = input("[N]ew model or [L]oad existing? ").strip().lower()
+    use_graph = input("Enable graph network preprocessing? [Y/n] ").strip().lower() != 'n'
+
+    if choice == "l":
+        directory = input("Model directory: ").strip()
+        vsa.load_codebook(os.path.join(directory, "codebook.pkl"))
+        trans_encoder.load_model(directory)
+        
+        if use_graph:
+            graph_preprocessor = GraphNetworkPreprocessor(vsa, trans_encoder)
+            graph_preprocessor.load_graph(directory)
+    else:
+        filename = input("Filename: ")
+        print("Loading corpus...")
+        with open(filename, encoding="utf-8") as f: 
+            raw_text = f.read()
+        sentences = raw_text.split(".")[:KB_LEN]
+        corpus = [sentence.split() for sentence in tqdm(sentences, desc="Tokenizing", ncols=80) if sentence.split()]
+        print(f"Corpus loaded: {len(corpus)} sequences")
+        
+        print("[1] Learning Transition Patterns (Multithreaded)")
+        print("-"*80)
+        trans_encoder.learn_transitions(corpus, max_workers=8, batch_size=50)
+        
+        print("Building vocabulary...")
+        for sentence in tqdm(corpus, desc="Vocabulary", ncols=80):
+            for token in sentence: 
+                vsa.add_to_codebook(token)
+        print(f"  ✓ Vocabulary size: {len(vsa.codebook)} unique tokens")
+        
+        if use_graph:
+            print("\n[1.5] Graph Network Preprocessing")
+            print("-"*80)
+            graph_preprocessor = GraphNetworkPreprocessor(vsa, trans_encoder)
+            graph_preprocessor.build_graph_from_transitions(min_weight=0.01)
+            graph_preprocessor.graph_convolution(iterations=2, alpha=0.85)
+        
+        directory = input("Save model to directory: ").strip()
+        os.makedirs(directory, exist_ok=True)
+        vsa.save_codebook(os.path.join(directory, "codebook.pkl"))
+        trans_encoder.save_model(directory)
+        if use_graph:
+            graph_preprocessor.save_graph(directory)
+
+    print("\n[2] GENERATING TEXT WITH MIXTURE OF EXPERTS")
+    print("-"*80)
+    moe_gen = MoEGenerator(vsa, trans_encoder)
     
-    # Create models directory
-    os.makedirs("models", exist_ok=True)
-    
-    # Example 5: Mixed Mode
-    try:
-        run_example()
-    except Exception as e:
-        print(f"Mixed mode example failed: {e}")
-    
+    while True:
+        user_input = input("USER: ")
+        if user_input.lower() in ['quit', 'exit', 'q']: 
+            break
+        print("AI: ", end='')
+        for token in moe_gen.stream_generation(
+            user_input.split(),
+            max_tokens=350,
+            temperature=0.7
+        ):
+            print(token, end=' ', flush=True)
+        print("\n")
