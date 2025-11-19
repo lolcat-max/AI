@@ -14,8 +14,14 @@ import pickle
 import os
 
 class IntDefaultDict(defaultdict):
-    def __init__(self):
-        super().__init__(int)
+    def __init__(self, *args, **kwargs):
+        # Case 1: user explicitly passed a default factory
+        if args:
+            default = args[0]
+            super().__init__(default)
+        else:
+            # Case 2: no default factory passed → use int
+            super().__init__(int)
         
 # =====================================================================
 # VECTOR SYMBOLIC ARCHITECTURE
@@ -265,4 +271,3 @@ if __name__ == "__main__":
         ):
             print(token, end=' ', flush=True)
         print("\n")
-
