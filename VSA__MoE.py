@@ -247,7 +247,7 @@ if __name__ == "__main__":
         print(f"Corpus loaded: {len(corpus)} sequences")
         print("[1] Learning Transition Patterns (Multithreaded)")
         print("-"*80)
-        trans_encoder.learn_transitions(corpus, max_workers=8, batch_size=50)
+        trans_encoder.learn_transitions(corpus, max_workers=8, batch_size=500)
         print("Building vocabulary...")
         for sentence in tqdm(corpus, desc="Vocabulary", ncols=80):
             for token in sentence: vsa.add_to_codebook(token)
