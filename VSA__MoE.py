@@ -3,7 +3,7 @@ Enhanced Transitioning for Streaming Text Generation
 Implements smooth token-to-token transitions with n-gram bindings
 NOW WITH A TRUE MIXTURE OF EXPERTS (MOE) MODEL, MULTITHREADING, PROGRESS BARS, AND SAVE/LOAD
 """
-KB_LEN = 999
+KB_LEN = 9999
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -13,6 +13,10 @@ import threading
 import pickle
 import os
 
+class IntDefaultDict(defaultdict):
+    def __init__(self):
+        super().__init__(int)
+        
 # =====================================================================
 # VECTOR SYMBOLIC ARCHITECTURE
 # =====================================================================
@@ -89,8 +93,8 @@ class TransitionEncoder:
         self.vsa = vsa
         self.bigram_vectors = {}
         self.trigram_vectors = {}
-        self.bigram_transitions = defaultdict(lambda: defaultdict(int))
-        self.trigram_transitions = defaultdict(lambda: defaultdict(int))
+        self.bigram_transitions = defaultdict(IntDefaultDict)
+        self.trigram_transitions = defaultdict(IntDefaultDict)
         self.lock = threading.Lock()
 
     def encode_bigram(self, token1: str, token2: str):
@@ -145,13 +149,25 @@ class TransitionEncoder:
 
     def save_model(self, directory: str):
         os.makedirs(directory, exist_ok=True)
-        with open(os.path.join(directory, "bigram_transitions.pkl"), 'wb') as f: pickle.dump(self.bigram_transitions, f)
-        with open(os.path.join(directory, "trigram_transitions.pkl"), 'wb') as f: pickle.dump(self.trigram_transitions, f)
+        with open(os.path.join(directory, "bigram_transitions.pkl"), 'wb') as f:
+            pickle.dump(self.bigram_transitions, f)
+        with open(os.path.join(directory, "trigram_transitions.pkl"), 'wb') as f:
+            pickle.dump(self.trigram_transitions, f)
+        with open(os.path.join(directory, "bigram_vectors.pkl"), 'wb') as f:
+            pickle.dump(self.bigram_vectors, f)
+        with open(os.path.join(directory, "trigram_vectors.pkl"), 'wb') as f:
+            pickle.dump(self.trigram_vectors, f)
         print(f"✓ Transition model saved in {directory}")
 
     def load_model(self, directory: str):
-        with open(os.path.join(directory, "bigram_transitions.pkl"), 'rb') as f: self.bigram_transitions = pickle.load(f)
-        with open(os.path.join(directory, "trigram_transitions.pkl"), 'rb') as f: self.trigram_transitions = pickle.load(f)
+        with open(os.path.join(directory, "bigram_transitions.pkl"), 'rb') as f:
+            self.bigram_transitions = pickle.load(f)
+        with open(os.path.join(directory, "trigram_transitions.pkl"), 'rb') as f:
+            self.trigram_transitions = pickle.load(f)
+        with open(os.path.join(directory, "bigram_vectors.pkl"), 'rb') as f:
+            self.bigram_vectors = pickle.load(f)
+        with open(os.path.join(directory, "trigram_vectors.pkl"), 'rb') as f:
+            self.trigram_vectors = pickle.load(f)
         print(f"✓ Transition model loaded from {directory}")
 
 # =====================================================================
