@@ -949,7 +949,7 @@ def run_example():
     # Text generation mode
     generator.set_mode('text')
     print("\nText Generation Mode:")
-    print("Output: ", end='')
+    print("", end='')
     for token in generator.stream_generate(input("USER: ").split(), max_tokens=700, temperature=0.7):
         print(token, end=' ')
     print()
