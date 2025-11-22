@@ -234,14 +234,15 @@ def run_integrated_system():
     # 3. PREPARE PHYSICS INPUTS
     freq_map = defaultdict(list)
     all_freqs = []
+    i = 0
     for token, freq in encoder.token_frequencies.items():
         freq_map[freq].append(token)
-        all_freqs.append(freq)
+        all_freqs.append(i)
+        i+=1
     random.shuffle(all_freqs)
     
     # 4. GENERATE TARGET & SOLVE
-    sample_subset = random.sample(all_freqs, k=min(25, len(all_freqs)))
-    target_sum = sum(sample_subset)
+    target_sum = 1200
     
     physics_solver = AstroPhysicsSolver()
     solver_input = all_freqs[:12000]
@@ -255,9 +256,11 @@ def run_integrated_system():
         
         print(f"\n[Vocab Filter] Selecting tokens matching {len(selected_freqs)} frequencies...")
         for f in selected_freqs:
-                token = temp_map[f].pop()
+            try:
+                token = temp_map[f-1].pop()
                 allowed_vocab.add(token)
-
+            except:
+                False
 
         print(f"  > Active Vocabulary Size: {len(allowed_vocab)} words")
         
