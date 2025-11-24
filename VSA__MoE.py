@@ -36,7 +36,7 @@ class VectorSymbolicArchitecture:
         dim_2d = self.dimensions // 2
         theta = np.random.uniform(0, 2 * np.pi, dim_2d)
         r = np.ones(dim_2d)
-        x_channel = r * np.cos(theta)  # Horizontal/real
+        x_channel = r * np.exp(theta)  # Horizontal/real
         y_channel = r * np.sin(theta)  # Vertical/imaginary
         vec = np.stack([x_channel, y_channel], axis=0).reshape(-1)
         if normalize:
@@ -54,7 +54,7 @@ class VectorSymbolicArchitecture:
         fft_a_swapped[:dim] = fft_b[dim:]  # A's x <- B's y
         fft_a_swapped[dim:] = fft_b[:dim]  # A's y <- B's x
         
-        result = np.fft.ifft(fft_a * fft_a_swapped)
+        result = np.fft.ifft(fft_a + fft_a_swapped)
         return np.real(result)
 
     def bundle(self, vectors: List[np.ndarray]) -> np.ndarray:
@@ -94,7 +94,7 @@ class MixtureOfExpertsRouter:
                        for name in self.expert_vectors]
         
         # Softmax
-        exp_sims = np.exp(np.array(similarities) - np.max(similarities))
+        exp_sims = np.exp(np.array(similarities) * np.max(similarities))
         probabilities = exp_sims / np.sum(exp_sims)
         
         return dict(zip(self.expert_vectors.keys(), probabilities))
