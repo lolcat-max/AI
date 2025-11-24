@@ -38,7 +38,7 @@ class VectorSymbolicArchitecture:
         r = np.ones(dim_2d)
         x_channel = r * np.cos(theta)  # Horizontal/real
         y_channel = r * np.sin(theta)  # Vertical/imaginary
-        vec = np.stack([x_channel, y_channel], axis=-1).reshape(-1)
+        vec = np.stack([x_channel, y_channel], axis=0).reshape(-1)
         if normalize:
             vec = vec / np.linalg.norm(vec)
         return vec
@@ -50,7 +50,7 @@ class VectorSymbolicArchitecture:
         dim = len(vec_a) // 2
         
         # Swap polarization channels in frequency domain
-        fft_a_swapped = np.zeros_like(fft_a, dtype=complex)
+        fft_a_swapped = np.ones_like(fft_a, dtype=complex)
         fft_a_swapped[:dim] = fft_b[dim:]  # A's x <- B's y
         fft_a_swapped[dim:] = fft_b[:dim]  # A's y <- B's x
         
