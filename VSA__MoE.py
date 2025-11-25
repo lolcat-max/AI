@@ -47,7 +47,7 @@ class VectorSymbolicArchitecture:
         """Polarization-aware binding with 2D channel swapping."""
         fft_a = np.fft.fft(vec_a)
         fft_b = np.fft.fft(vec_b)
-        dim = len(vec_a) // 2
+        dim = vec_a// 2
         
         # Swap polarization channels in frequency domain
         fft_a_swapped = np.ones_like(fft_a, dtype=complex)
@@ -195,8 +195,9 @@ class MoEGenerator:
         if not context:
             print("Error: Seed context cannot be empty.")
             return
-
+        
         for _ in range(max_tokens):
+            # Get probabilities from both models
             bigram_probs = self.transition_encoder.get_bigram_probabilities(context[-1]) if len(context) >= 1 else None
             trigram_probs = self.transition_encoder.get_trigram_probabilities(tuple(context[-2:])) if len(context) >= 2 else None
 
@@ -207,22 +208,43 @@ class MoEGenerator:
             else:
                 routing_probs = {'bigram': 1.0, 'trigram': 0.0}
 
+            # Combine expert outputs with routing weights
             final_probs = defaultdict(float)
+            
+            # Add bigram contributions
             if bigram_probs:
                 for token, prob in bigram_probs.items(): 
                     final_probs[token] += routing_probs['bigram'] * prob
+            
+            # Add trigram contributions
             if trigram_probs:
                 for token, prob in trigram_probs.items(): 
                     final_probs[token] += routing_probs['trigram'] * prob
 
+            # Sample next token
             if not final_probs:
+                # Fallback: random selection from codebook
                 next_token = np.random.choice(list(self.vsa.codebook.keys()))
             else:
-                tokens, probs = list(final_probs.keys()), np.array(list(final_probs.values()))
+                tokens = list(final_probs.keys())
+                probs = np.array(list(final_probs.values()))
+                
+                # Apply temperature scaling to logits
                 if temperature > 0:
-                    probs = np.log(probs + 1e-9) / temperature
-                    probs = np.exp(probs)
-                probs /= np.sum(probs)
+                    # Convert probabilities to logits, apply temperature, convert back
+                    logits = np.log(probs + 1e-9)  # Add epsilon for numerical stability
+                    logits = logits / temperature
+                    
+                    # Apply softmax to get temperature-scaled probabilities
+                    logits = logits - np.max(logits)  # Numerical stability
+                    probs = np.exp(logits)
+                    probs = probs / np.sum(probs)
+                else:
+                    # Temperature = 0 means greedy (argmax)
+                    probs = np.zeros_like(probs)
+                    probs[np.argmax(probs)] = 1.0
+                
+                # Sample from the distribution
                 next_token = np.random.choice(tokens, p=probs)
             
             yield next_token
