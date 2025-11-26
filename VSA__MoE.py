@@ -5,7 +5,7 @@ GRANGER CAUSALITY FOR NATURAL TEXT + MULTITHREADING + PROGRESS BARS + SAVE/LOAD
 MONOTONIC BACKOFF SMOOTHING
 """
 
-KB_LEN = 9999
+KB_LEN = -1
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict, Counter
@@ -142,7 +142,7 @@ class GrangerCausalityEngine:
                                 break
                 
                 # Compute normalized causality score [web:41]
-                if total_target > 10:  # Minimum threshold
+                if total_target > 3:  # Minimum threshold
                     self.causality_matrix[source_idx, target_idx] = causal_count / total_target
         
         # Normalize matrix [web:42]
@@ -277,7 +277,8 @@ class TransitionEncoder:
                     if ctx_token in self.granger.token_to_idx:
                         source_idx = self.granger.token_to_idx[ctx_token]
                         causal_boost += self.granger.causality_matrix[source_idx, target_idx]
-                
+                    else:
+                        source_idx = target_idx
                 # Apply boost [web:41]
                 enhanced_probs[token] *= (1.0 + causal_boost)
         
@@ -367,7 +368,7 @@ if __name__ == "__main__":
     print("="*80)
 
     vsa = VectorSymbolicArchitecture(dimensions=64)
-    granger_engine = GrangerCausalityEngine(max_vocab=500, n_lags=3)
+    granger_engine = GrangerCausalityEngine(max_vocab=100, n_lags=3)
     trans_encoder = TransitionEncoder(vsa, granger_engine)
 
     choice = input("[N]ew model or [L]oad existing? ").strip().lower()
@@ -416,7 +417,7 @@ if __name__ == "__main__":
         print("-"*80)
         sample_tokens = list(granger_engine.token_to_idx.keys())[:5]
         for token in sample_tokens:
-            preds = granger_engine.get_causal_predecessors(token, threshold=0.15)
+            preds = granger_engine.get_causal_predecessors(token, threshold=0.5)
             if preds:
                 print(f"\n'{token}' is Granger-caused by:")
                 for pred_tok, weight in preds[:5]:
