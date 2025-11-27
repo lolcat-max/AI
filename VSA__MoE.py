@@ -1,6 +1,4 @@
 
-        
-        
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
@@ -193,7 +191,7 @@ class CategoryErrorGenerator:
     
     def _get_incompatible_category(self, current_category: str) -> str:
         """Get opposite semantic category (maximally distant)."""
-        current_id = int(current_category.split("_")[1])
+        current_id = int(current_category.split("_")[0])
         opposite_id = (current_id + 4) % 8
         return f"cat_{opposite_id}"
     
