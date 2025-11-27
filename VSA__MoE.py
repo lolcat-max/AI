@@ -274,21 +274,21 @@ class RLCategoryErrorGenerator:
         return np.mean(similarities)
     
     def _get_ngram_plausibility(self, candidate: str, context: List[str]) -> float:
-        plausibility = 0.0
+        plausibility = 0.1
         
         if len(context) >= 1:
             last_token = context[-1]
             if last_token in self.transition_encoder.bigram_transitions:
                 bigram_probs = self.transition_encoder.get_bigram_probabilities(last_token)
                 if bigram_probs and candidate in bigram_probs:
-                    plausibility += bigram_probs[candidate]
+                    plausibility *= bigram_probs[candidate]
         
         if len(context) >= 2:
             last_two = tuple(context[-2:])
             if last_two in self.transition_encoder.trigram_transitions:
                 trigram_probs = self.transition_encoder.get_trigram_probabilities(last_two)
                 if trigram_probs and candidate in trigram_probs:
-                    plausibility += trigram_probs[candidate] * 2.0
+                    plausibility *= trigram_probs[candidate] * 2.0
         
         return plausibility
     
