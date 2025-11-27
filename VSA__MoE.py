@@ -1,12 +1,12 @@
-
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import pickle
 import threading
 import os
+import re
 
 class IntDefaultDict(defaultdict):
     def __init__(self, *args, **kwargs):
@@ -168,14 +168,68 @@ class TransitionEncoder:
         print(f"✓ Polarized transition model loaded from {directory}")
 
 # =====================================================================
-# SEMANTICALLY PLAUSIBLE CATEGORY ERROR GENERATOR
+# ONLINE REINFORCEMENT LEARNING FEEDBACK BUFFER
 # =====================================================================
-class CategoryErrorGenerator:
-    """Purposely violate semantic categories while maintaining plausibility."""
+class FeedbackBuffer:
+    """Real-time human feedback for online RL [web:51][web:55][web:59]."""
+    def __init__(self, vsa: VectorSymbolicArchitecture, buffer_size: int = 50):
+        self.vsa = vsa
+        self.buffer_size = buffer_size
+        self.positive_tokens = deque(maxlen=buffer_size)  # "I like that"
+        self.negative_tokens = deque(maxlen=buffer_size)  # "bad", "no"
+        self.token_rewards = defaultdict(float)  # Running reward per token
+        self.lock = threading.Lock()
+    
+    def add_positive_feedback(self, tokens: List[str], reward: float = 1.0):
+        """Add positive feedback for recently generated tokens [web:55][web:59]."""
+        with self.lock:
+            for token in tokens:
+                self.positive_tokens.append(token)
+                self.token_rewards[token] += reward
+                print(f"  [✓] Rewarded: {token} (+{reward:.2f})")
+    
+    def add_negative_feedback(self, tokens: List[str], penalty: float = -0.5):
+        """Add negative feedback for recently generated tokens [web:55][web:59]."""
+        with self.lock:
+            for token in tokens:
+                self.negative_tokens.append(token)
+                self.token_rewards[token] += penalty
+                print(f"  [✗] Penalized: {token} ({penalty:.2f})")
+    
+    def get_token_reward(self, token: str) -> float:
+        """Get accumulated reward for a token [web:51][web:55]."""
+        return self.token_rewards.get(token, 0.0)
+    
+    def get_similar_token_reward(self, token: str, top_k: int = 5) -> float:
+        """Get reward from semantically similar tokens [web:55][web:59]."""
+        if token not in self.vsa.codebook:
+            return 0.0
+        
+        token_vec = self.vsa.codebook[token]
+        similar_rewards = []
+        
+        # Find similar rewarded/penalized tokens
+        for rewarded_token, reward in self.token_rewards.items():
+            if rewarded_token in self.vsa.codebook:
+                sim = self.vsa.similarity(token_vec, self.vsa.codebook[rewarded_token])
+                if sim > 0.5:  # Similarity threshold
+                    similar_rewards.append(reward * sim)
+        
+        if similar_rewards:
+            return np.mean(sorted(similar_rewards, reverse=True)[:top_k])
+        return 0.0
+
+# =====================================================================
+# RL-ENHANCED CATEGORY ERROR GENERATOR WITH FEEDBACK
+# =====================================================================
+class RLCategoryErrorGenerator:
+    """Real-time RL with human feedback during generation [web:51][web:55][web:59]."""
     def __init__(self, vsa: VectorSymbolicArchitecture, transition_encoder: TransitionEncoder):
         self.vsa = vsa
         self.transition_encoder = transition_encoder
         self.semantic_categories = self._build_semantic_categories()
+        self.feedback_buffer = FeedbackBuffer(vsa, buffer_size=100)
+        self.generation_buffer = deque(maxlen=20)  # Track recent generations
     
     def _build_semantic_categories(self) -> Dict[str, List[str]]:
         print("Building semantic category clusters...")
@@ -190,8 +244,7 @@ class CategoryErrorGenerator:
         return dict(categories)
     
     def _get_incompatible_category(self, current_category: str) -> str:
-        """Get opposite semantic category (maximally distant)."""
-        current_id = int(current_category.split("_")[0])
+        current_id = int(current_category.split("_")[1])
         opposite_id = (current_id + 4) % 8
         return f"cat_{opposite_id}"
     
@@ -203,13 +256,10 @@ class CategoryErrorGenerator:
     
     def _compute_semantic_plausibility(self, candidate: str, context: List[str], 
                                       context_window: int = 3) -> float:
-        """Compute semantic plausibility using VSA similarity with context [web:41][web:44][web:46]."""
         if candidate not in self.vsa.codebook:
             return 0.0
         
         candidate_vec = self.vsa.codebook[candidate]
-        
-        # Compute average similarity to recent context tokens [web:48][web:50]
         recent_context = context[-context_window:]
         similarities = []
         
@@ -221,15 +271,11 @@ class CategoryErrorGenerator:
         
         if not similarities:
             return 0.0
-        
-        # Return mean similarity as plausibility score [web:41][web:46]
         return np.mean(similarities)
     
     def _get_ngram_plausibility(self, candidate: str, context: List[str]) -> float:
-        """Use n-gram statistics as additional plausibility signal [web:42][web:48]."""
         plausibility = 0.0
         
-        # Check bigram plausibility with last token
         if len(context) >= 1:
             last_token = context[-1]
             if last_token in self.transition_encoder.bigram_transitions:
@@ -237,25 +283,45 @@ class CategoryErrorGenerator:
                 if bigram_probs and candidate in bigram_probs:
                     plausibility += bigram_probs[candidate]
         
-        # Check trigram plausibility with last two tokens
         if len(context) >= 2:
             last_two = tuple(context[-2:])
             if last_two in self.transition_encoder.trigram_transitions:
                 trigram_probs = self.transition_encoder.get_trigram_probabilities(last_two)
                 if trigram_probs and candidate in trigram_probs:
-                    plausibility += trigram_probs[candidate] * 2.0  # Weight trigrams higher
+                    plausibility += trigram_probs[candidate] * 2.0
         
         return plausibility
     
+    def apply_feedback_to_probs(self, probs: Dict[str, float], rl_weight: float = 2.0) -> Dict[str, float]:
+        """Apply RL feedback to probability distribution [web:51][web:55]."""
+        adjusted_probs = {}
+        
+        for token, prob in probs.items():
+            # Direct reward
+            direct_reward = self.feedback_buffer.get_token_reward(token)
+            
+            # Similar token reward (semantic generalization) [web:55]
+            similar_reward = self.feedback_buffer.get_similar_token_reward(token)
+            
+            # Combined RL adjustment [web:51]
+            total_reward = direct_reward + (similar_reward * 0.5)
+            rl_boost = np.exp(total_reward * rl_weight)
+            
+            adjusted_probs[token] = prob * rl_boost
+        
+        # Renormalize
+        total = sum(adjusted_probs.values())
+        if total > 0:
+            adjusted_probs = {k: v/total for k, v in adjusted_probs.items()}
+        
+        return adjusted_probs
+    
     def stream_generation(self, seed: List[str], max_tokens: int = 50, 
                          temperature: float = 1.0, 
-                         error_rate: float = 0.7,
-                         plausibility_weight: float = 0.8):
-        """Generate with semantically plausible category errors [web:41][web:44][web:48].
-        
-        Args:
-            plausibility_weight: Balance between plausibility (1.0) and randomness (0.0)
-        """
+                         error_rate: float = 0.0001,
+                         plausibility_weight: float = 0.9,
+                         rl_weight: float = 2.0):
+        """Generate with real-time RL feedback [web:51][web:55][web:59]."""
         context = seed.copy()
         if not context:
             print("Error: Seed context cannot be empty.")
@@ -273,33 +339,26 @@ class CategoryErrorGenerator:
                     candidate_tokens = self.semantic_categories.get(error_category, [])
                     
                     if candidate_tokens:
-                        # Compute plausibility scores for all candidates [web:41][web:46]
                         plausibility_scores = {}
                         
                         for token in candidate_tokens:
-                            # Combine VSA similarity and n-gram plausibility [web:42][web:48]
                             vsa_plausibility = self._compute_semantic_plausibility(token, context)
                             ngram_plausibility = self._get_ngram_plausibility(token, context)
-                            
-                            # Weighted combination [web:44][web:50]
                             combined = (vsa_plausibility + ngram_plausibility) / 2.0
                             plausibility_scores[token] = combined
                         
-                        # Build probability distribution [web:41][web:42]
                         probs = {}
                         total_counts = sum(self.transition_encoder.unigram_counts.values())
                         
                         for token in candidate_tokens:
-                            # Base probability from unigram frequency
                             base_prob = self.transition_encoder.unigram_counts.get(token, 1) / total_counts
-                            
-                            # Modulate by plausibility [web:46][web:48]
                             plausibility = plausibility_scores.get(token, 0.0)
                             plausibility_boost = 1.0 + (plausibility * plausibility_weight * 10.0)
-                            
                             probs[token] = base_prob * plausibility_boost
                         
-                        # Temperature sampling from plausibility-weighted distribution [web:41]
+                        # APPLY RL FEEDBACK [web:51][web:55]
+                        probs = self.apply_feedback_to_probs(probs, rl_weight=rl_weight)
+                        
                         tokens = list(probs.keys())
                         prob_vals = np.array(list(probs.values()))
                         
@@ -309,11 +368,12 @@ class CategoryErrorGenerator:
                         prob_vals /= np.sum(prob_vals)
                         
                         next_token = np.random.choice(tokens, p=prob_vals)
+                        self.generation_buffer.append(next_token)
                         yield next_token
                         context.append(next_token)
                         continue
             
-            # Fallback: normal n-gram prediction [web:11]
+            # Normal n-gram prediction with RL
             probs = None
             if len(context) >= 2:
                 probs = self.transition_encoder.get_trigram_probabilities(tuple(context[-2:]))
@@ -325,6 +385,9 @@ class CategoryErrorGenerator:
             if not probs:
                 next_token = np.random.choice(list(self.vsa.codebook.keys()))
             else:
+                # APPLY RL FEEDBACK [web:51][web:55]
+                probs = self.apply_feedback_to_probs(probs, rl_weight=rl_weight)
+                
                 tokens = list(probs.keys())
                 prob_vals = np.array(list(probs.values()))
                 if temperature > 0:
@@ -333,16 +396,16 @@ class CategoryErrorGenerator:
                 prob_vals /= np.sum(prob_vals)
                 next_token = np.random.choice(tokens, p=prob_vals)
             
+            self.generation_buffer.append(next_token)
             yield next_token
             context.append(next_token)
 
 # =====================================================================
-# MAIN ENTRYPOINT
+# MAIN ENTRYPOINT WITH INTERACTIVE FEEDBACK
 # =====================================================================
 if __name__ == "__main__":
     print("="*80)
-    print("2D POLARIZATION VSA + SEMANTICALLY PLAUSIBLE CATEGORY ERROR")
-    print("Category violations constrained by semantic plausibility")
+    print("2D POLARIZATION VSA + REAL-TIME RL FEEDBACK")
     print("="*80)
 
     vsa = VectorSymbolicArchitecture(dimensions=128)
@@ -373,26 +436,147 @@ if __name__ == "__main__":
         vsa.save_codebook(os.path.join(directory, "codebook.pkl"))
         trans_encoder.save_model(directory)
     
-    print("\n[2] SEMANTICALLY PLAUSIBLE CATEGORY ERROR GENERATION")
+    print("\n[2] REAL-TIME RL TEXT GENERATION WITH FEEDBACK")
     print("-"*80)
-    error_gen = CategoryErrorGenerator(vsa, trans_encoder)
+    print("Commands during generation:")
+    print("💬 FEEDBACK COMMANDS:")
+    print("  POSITIVE: excellent, perfect, good, yes, nice, helpful, correct, 👍")
+    print("  NEGATIVE: terrible, bad, wrong, no, poor, not helpful, 👎")
+    print("  SPECIFIC: 'that word' / 'exactly that' (rewards last 2 tokens)")
+    print("  DIRECT: 'more about fish' / 'avoid politics'")
+    print("  STYLE: 'be more formal' / 'sound more casual'")
+    print("  STATUS: 'show feedback' / 'reset'")
+    print("-"*80)
+
+    print("-"*80)
+    
+    rl_gen = RLCategoryErrorGenerator(vsa, trans_encoder)
     
     while True:
-        user_input = input("USER: ").strip()
+        user_input = input("\nUSER: ").strip()
         if user_input.lower() in ['quit', 'exit', 'q']:
             break
+        # Check for feedback commands [web:55][web:59][web:61][web:65]
         
-        # Ultra-low error rate for mostly coherent output
-        error_rate = 0.0001
+        # STRONG POSITIVE FEEDBACK (+1.5 reward) [web:61][web:66]
+        if re.search(r'\b(excellent|perfect|amazing|brilliant|outstanding|superb|fantastic|wonderful|love it|exactly right|spot on|nailed it)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_positive_feedback(recent_tokens, reward=1.5)
+            print("  💚 Strong positive feedback applied!")
+            continue
         
-        # High plausibility weight steers toward semantic coherence [web:41][web:48]
-        plausibility_weight = 0.9
+        # MODERATE POSITIVE FEEDBACK (+1.0 reward) [web:61][web:65]
+        if re.search(r'\b(i like that|good|yes|great|nice|helpful|useful|correct|right|better|improved|makes sense|that works|keep going|more like that)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_positive_feedback(recent_tokens, reward=1.0)
+            print("  ✓ Positive feedback applied!")
+            continue
         
+        # MILD POSITIVE FEEDBACK (+0.5 reward) [web:65][web:66]
+        if re.search(r'\b(okay|ok|fine|acceptable|decent|not bad|could work|sure|alright)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_positive_feedback(recent_tokens, reward=0.5)
+            print("  ✓ Mild positive feedback applied!")
+            continue
+        
+        # MILD NEGATIVE FEEDBACK (-0.5 penalty) [web:61][web:66]
+        if re.search(r'\b(not quite|not really|meh|could be better|needs work|try again|not sure about that|off topic|confusing)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_negative_feedback(recent_tokens, penalty=-0.5)
+            print("  ⚠ Mild negative feedback applied!")
+            continue
+        
+        # MODERATE NEGATIVE FEEDBACK (-1.0 penalty) [web:61][web:65]
+        if re.search(r'\b(bad|no|wrong|incorrect|poor|weak|not helpful|irrelevant|off|stop that|don\'t like|dislike)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_negative_feedback(recent_tokens, penalty=-1.0)
+            print("  ✗ Negative feedback applied!")
+            continue
+        
+        # STRONG NEGATIVE FEEDBACK (-1.5 penalty) [web:61][web:66]
+        if re.search(r'\b(terrible|awful|horrible|completely wrong|nonsense|garbage|useless|inappropriate|offensive|unacceptable|hate it)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_negative_feedback(recent_tokens, penalty=-1.5)
+            print("  ❌ Strong negative feedback applied!")
+            continue
+        
+        # SPECIFIC TOKEN PRAISE (reward last 1-2 tokens more heavily) [web:65]
+        if re.search(r'\b(that word|that phrase|exactly that|this|these words)\b', user_input.lower()):
+            recent_tokens = list(rl_gen.generation_buffer)[-2:]  # Just last 2 tokens
+            rl_gen.feedback_buffer.add_positive_feedback(recent_tokens, reward=2.0)
+            print(f"  ⭐ Specific token praise: {' '.join(recent_tokens)}")
+            continue
+        
+        # DIRECTION FEEDBACK (steer toward topic) [web:63][web:65]
+        if re.search(r'\b(more about|talk about|focus on|tell me about|elaborate on|explain)\b', user_input.lower()):
+            # Extract topic words after the command
+            match = re.search(r'(?:more about|talk about|focus on|tell me about|elaborate on|explain)\s+(\w+(?:\s+\w+){0,2})', user_input.lower())
+            if match:
+                topic = match.group(1)
+                topic_tokens = topic.split()
+                rl_gen.feedback_buffer.add_positive_feedback(topic_tokens, reward=1.5)
+                print(f"  🎯 Directing toward: {topic}")
+            continue
+        
+        # AVOID FEEDBACK (steer away from topic) [web:61][web:65]
+        if re.search(r'\b(stop talking about|don\'t mention|avoid|less about|not that|no more)\b', user_input.lower()):
+            # Extract topic words after the command
+            match = re.search(r'(?:stop talking about|don\'t mention|avoid|less about|no more)\s+(\w+(?:\s+\w+){0,2})', user_input.lower())
+            if match:
+                topic = match.group(1)
+                topic_tokens = topic.split()
+                rl_gen.feedback_buffer.add_negative_feedback(topic_tokens, penalty=-1.5)
+                print(f"  🚫 Avoiding topic: {topic}")
+            continue
+        
+        # STYLE FEEDBACK [web:63][web:65]
+        if re.search(r'\b(be more|use more|write more|sound more)\s+(formal|casual|simple|complex|creative|direct|polite|technical|poetic)\b', user_input.lower()):
+            match = re.search(r'(?:be more|use more|write more|sound more)\s+(\w+)', user_input.lower())
+            if match:
+                style = match.group(1)
+                print(f"  🎨 Style preference noted: {style}")
+                # Could be extended to track style preferences
+            continue
+        
+        # THUMBS UP/DOWN EMOJI FEEDBACK [web:65][web:68]
+        if '👍' in user_input or '👏' in user_input or '❤️' in user_input or '✅' in user_input:
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_positive_feedback(recent_tokens, reward=1.0)
+            print("  👍 Positive emoji feedback!")
+            continue
+        
+        if '👎' in user_input or '❌' in user_input or '⛔' in user_input or '🚫' in user_input:
+            recent_tokens = list(rl_gen.generation_buffer)[-5:]
+            rl_gen.feedback_buffer.add_negative_feedback(recent_tokens, penalty=-1.0)
+            print("  👎 Negative emoji feedback!")
+            continue
+        
+        # RESET/CLEAR FEEDBACK [web:61]
+        if re.search(r'\b(reset|clear feedback|start over|forget that)\b', user_input.lower()):
+            rl_gen.feedback_buffer = FeedbackBuffer(vsa, buffer_size=100)
+            print("  🔄 Feedback buffer reset!")
+            continue
+        
+        # SHOW FEEDBACK STATUS [web:65]
+        if re.search(r'\b(show feedback|what have you learned|feedback status)\b', user_input.lower()):
+            print("\n  📊 Current Feedback Status:")
+            top_rewarded = sorted(rl_gen.feedback_buffer.token_rewards.items(), 
+                                 key=lambda x: x[1], reverse=True)[:10]
+            print("    Top rewarded tokens:")
+            for token, reward in top_rewarded:
+                if reward > 0:
+                    print(f"      {token}: +{reward:.2f}")
+            print()
+            continue
+
+        
+        # Normal generation
         print("AI: ", end='', flush=True)
-        for token in error_gen.stream_generation(user_input.split(), 
-                                                max_tokens=350, 
-                                                temperature=0.7,
-                                                error_rate=error_rate,
-                                                plausibility_weight=plausibility_weight):
+        for token in rl_gen.stream_generation(user_input.split(), 
+                                             max_tokens=350, 
+                                             temperature=0.7,
+                                             error_rate=0.0001,
+                                             plausibility_weight=0.9,
+                                             rl_weight=2.0):
             print(token, end=' ', flush=True)
-        print("\n")
+        print()
