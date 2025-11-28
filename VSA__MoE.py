@@ -690,7 +690,7 @@ if __name__ == "__main__":
     while True:
         # Generate with feedback
         print("Generating text...")
-        for token in api.stream(input("USER: "), max_tokens=7500, temperature=0.8):
+        for token in api.stream(input("USER: "), max_tokens=750, temperature=0.8):
             print(token, end=" ", flush=True)
         print()
         
