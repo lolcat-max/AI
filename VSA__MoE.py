@@ -8,7 +8,7 @@ import threading
 import os
 import re
 from dataclasses import dataclass
-KB_LEN = 999
+KB_LEN = -1
 # =====================================================================
 # CORE DATA STRUCTURES
 # =====================================================================
