@@ -356,22 +356,22 @@ class RLCategoryErrorGenerator:
                             plausibility_boost = 1.0 + (plausibility * plausibility_weight * 10.0)
                             probs[token] = base_prob * plausibility_boost
                         
-                        # APPLY RL FEEDBACK [web:51][web:55]
-                        probs = self.apply_feedback_to_probs(probs, rl_weight=rl_weight)
-                        
-                        tokens = list(probs.keys())
-                        prob_vals = np.array(list(probs.values()))
-                        
-                        if temperature > 0:
-                            prob_vals = np.log(prob_vals + 1e-9) / temperature
-                            prob_vals = np.exp(prob_vals)
-                        prob_vals /= np.sum(prob_vals)
-                        
-                        next_token = np.random.choice(tokens, p=prob_vals)
-                        self.generation_buffer.append(next_token)
-                        yield next_token
-                        context.append(next_token)
-                        continue
+                            # APPLY RL FEEDBACK [web:51][web:55]
+                            probs = self.apply_feedback_to_probs(probs, rl_weight=rl_weight)
+                            
+                            tokens = list(probs.keys())
+                            prob_vals = np.array(list(probs.values()))
+                            
+                            if temperature > 0:
+                                prob_vals = np.log(prob_vals + 1e-9) / temperature
+                                prob_vals = np.exp(prob_vals)
+                            prob_vals /= np.sum(prob_vals)
+                            
+                            next_token = np.random.choice(tokens, p=prob_vals)
+                            self.generation_buffer.append(next_token)
+                            yield next_token
+                            context.append(next_token)
+                            continue
             
             # Normal n-gram prediction with RL
             probs = None
