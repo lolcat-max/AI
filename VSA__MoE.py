@@ -250,18 +250,18 @@ class FeedbackBuffer:
         if token not in self.vsa.codebook:
             return 0.0
         
-        token_vec = self.vsa.codebook[token]
-        similar_rewards = []
-        
-        # Find similar rewarded/penalized tokens
-        for rewarded_token, reward in self.token_rewards.items():
-            if rewarded_token in self.vsa.codebook:
-                sim = self.vsa.similarity(token_vec, self.vsa.codebook[rewarded_token])
-                if sim > 0.5:  # Similarity threshold
-                    similar_rewards.append(reward * sim)
-        
-        if similar_rewards:
-            return np.mean(sorted(similar_rewards, reverse=True)[:top_k])
+        #token_vec = self.vsa.codebook[token]
+        #similar_rewards = []
+        #
+        ## Find similar rewarded/penalized tokens
+        #for rewarded_token, reward in self.token_rewards.items():
+        #    if rewarded_token in self.vsa.codebook:
+        #        sim = self.vsa.similarity(token_vec, self.vsa.codebook[rewarded_token])
+        #        if sim > 0.5:  # Similarity threshold
+        #            similar_rewards.append(reward * sim)
+        #
+        #if similar_rewards:
+        #    return np.mean(sorted(similar_rewards, reverse=True)[:top_k])
         return 0.0
 
 # =====================================================================
@@ -289,7 +289,7 @@ class RLCategoryErrorGenerator:
         return dict(categories)
     
     def _get_incompatible_category(self, current_category: str) -> str:
-        current_id = int(current_category.split("_")[1])
+        current_id = int(current_category.split("_")[0])
         opposite_id = (current_id + 4) % 8
         return f"cat_{opposite_id}"
     
@@ -354,7 +354,7 @@ class RLCategoryErrorGenerator:
             
             adjusted_probs[token] = prob * rl_boost
         
-        # Renormalize
+        # Renormalize (MOVED OUTSIDE THE LOOP!)
         total = sum(adjusted_probs.values())
         if total > 0:
             adjusted_probs = {k: v/total for k, v in adjusted_probs.items()}
@@ -391,32 +391,32 @@ class RLCategoryErrorGenerator:
                             ngram_plausibility = self._get_ngram_plausibility(token, context)
                             combined = (vsa_plausibility + ngram_plausibility) / 2.0
                             plausibility_scores[token] = combined
-                        
-                        probs = {}
-                        total_counts = sum(self.transition_encoder.unigram_counts.values())
-                        
-                        for token in candidate_tokens:
-                            base_prob = self.transition_encoder.unigram_counts.get(token, 1) / total_counts
-                            plausibility = plausibility_scores.get(token, 0.0)
-                            plausibility_boost = 1.0 + (plausibility * plausibility_weight * 10.0)
-                            probs[token] = base_prob * plausibility_boost
-                        
-                            # APPLY RL FEEDBACK [web:51][web:55]
-                            probs = self.apply_feedback_to_probs(probs, rl_weight=rl_weight)
                             
-                            tokens = list(probs.keys())
-                            prob_vals = np.array(list(probs.values()))
+                            probs = {}
+                            total_counts = sum(self.transition_encoder.unigram_counts.values())
                             
-                            if temperature > 0:
-                                prob_vals = np.log(prob_vals + 1e-9) / temperature
-                                prob_vals = np.exp(prob_vals)
-                            prob_vals /= np.sum(prob_vals)
+                            for token in candidate_tokens:
+                                base_prob = self.transition_encoder.unigram_counts.get(token, 1) / total_counts
+                                plausibility = plausibility_scores.get(token, 0.0)
+                                plausibility_boost = 1.0 + (plausibility * plausibility_weight * 10.0)
+                                probs[token] = base_prob * plausibility_boost
                             
-                            next_token = np.random.choice(tokens, p=prob_vals)
-                            self.generation_buffer.append(next_token)
-                            yield next_token
-                            context.append(next_token)
-                            continue
+                                # APPLY RL FEEDBACK [web:51][web:55]
+                                probs = self.apply_feedback_to_probs(probs, rl_weight=rl_weight)
+                                
+                                tokens = list(probs.keys())
+                                prob_vals = np.array(list(probs.values()))
+                                
+                                if temperature > 0:
+                                    prob_vals = np.log(prob_vals + 1e-9) / temperature
+                                    prob_vals = np.exp(prob_vals)
+                                prob_vals /= np.sum(prob_vals)
+                                
+                                next_token = np.random.choice(tokens, p=prob_vals)
+                                self.generation_buffer.append(next_token)
+                                yield next_token
+                                context.append(next_token)
+                                continue
             
             # Normal n-gram prediction with RL
             probs = None
