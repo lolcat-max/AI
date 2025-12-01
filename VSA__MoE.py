@@ -1,7 +1,8 @@
 import numpy as np
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict, deque, Counter
+from concurrent.futures import ProcessPoolExecutor
+
 from tqdm import tqdm
 import pickle
 import threading
@@ -119,16 +120,60 @@ class TransitionEncoder:
             for i in range(len(sequence) - 2):
                 self.encode_trigram(sequence[i], sequence[i+1], sequence[i+2])
 
-    def learn_transitions(self, corpus: List[List[str]], max_workers: int = 8, batch_size: int = 100):
-        print("Learning polarized transitions from corpus...")
+    @staticmethod
+    def _process_batch_static(batch: List[List[str]]) -> Tuple[Counter, dict, dict]:
+        """
+        Static worker that processes a batch and returns partial results.
+        Does NOT access 'self'.
+        """
+        local_unigrams = Counter()
+        local_bigrams = defaultdict(Counter)
+        local_trigrams = defaultdict(Counter)
+
+        # Replicate your original _process_sequence_batch logic here
+        for sequence in batch:
+            # Example logic (replace with your actual counting logic)
+            for i, token in enumerate(sequence):
+                local_unigrams[token] += 1
+                
+                if i > 0:
+                    prev = sequence[i-1]
+                    local_bigrams[prev][token] += 1
+                
+                if i > 1:
+                    prev2 = sequence[i-2]
+                    prev1 = sequence[i-1]
+                    local_trigrams[(prev2, prev1)][token] += 1
+        
+        # Convert defaultdicts to regular dicts for safe pickling/returning
+        return local_unigrams, dict(local_bigrams), dict(local_trigrams)
+
+    def learn_transitions(self, corpus: List[List[str]], max_workers: int = 8, batch_size: int = 5000):
+        print("Learning polarized transitions from corpus (Multiprocessing)...")
+        
+        # Create batches
         batches = [corpus[i:i + batch_size] for i in range(0, len(corpus), batch_size)]
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            list(tqdm(executor.map(self._process_sequence_batch, batches), 
-                     total=len(batches), desc="Polarized batches", ncols=80))
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit tasks
+            results = list(tqdm(executor.map(self._process_batch_static, batches), 
+                               total=len(batches), desc="Polarized batches", ncols=80))
+
+        print("  Aggregating results from workers...")
+        
+        # Aggregate results from all processes into the main instance
+        for partial_uni, partial_bi, partial_tri in results:
+            self.unigram_counts.update(partial_uni)
+            
+            for prev, transitions in partial_bi.items():
+                self.bigram_transitions[prev].update(transitions)
+                
+            for prev_pair, transitions in partial_tri.items():
+                self.trigram_transitions[prev_pair].update(transitions)
+
         print(f"  ✓ Learned {len(self.unigram_counts)} unigram counts")
         print(f"  ✓ Learned {sum(len(v) for v in self.bigram_transitions.values())} bigram transitions")
         print(f"  ✓ Learned {sum(len(v) for v in self.trigram_transitions.values())} trigram transitions")
-
     def get_unigram_probabilities(self) -> Dict[str, float]:
         total = sum(self.unigram_counts.values())
         if total == 0:
