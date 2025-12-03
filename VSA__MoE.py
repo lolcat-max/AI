@@ -325,9 +325,11 @@ if __name__ == "__main__":
         if re.search(r'\b(good|great|yes|👍)\b', user_input.lower()):
             recent = list(gen.generation_buffer)[-5:]
             gen.feedback.add_positive_feedback(recent, 1.5)
+            continue
         elif re.search(r'\b(bad|no|wrong|👎)\b', user_input.lower()):
             recent = list(gen.generation_buffer)[-5:]
             gen.feedback.add_negative_feedback(recent, -1.5)
+            continue
         elif 'show' in user_input.lower():
             print("\n📊 LOW-PROB STATES:")
             active = {k:v for k,v in encoder.low_prob_state.items() if v['active'] or v['count']>0}
