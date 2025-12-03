@@ -300,7 +300,7 @@ if __name__ == "__main__":
             sentences = [s.split() for s in text.split('.') if s.strip()]
             encoder.learn_transitions(sentences)
             
-            for sentence in tqdm(sentences[:500], desc="Vocab"):
+            for sentence in tqdm(sentences, desc="Vocab"):
                 for token in sentence:
                     vsa.add_to_codebook(token)
             
