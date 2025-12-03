@@ -78,10 +78,10 @@ class TransitionEncoder:
         self.trigram_transitions = defaultdict(Counter)  # MP-safe
         
         # Dynamic low-prob activation tracking
-        self.low_prob_state = defaultdict(lambda: {'count': 0, 'max_cycles': 3, 'active': False})
-        self.low_prob_threshold = 0.05
-        self.activation_boost = 4.0
-        self.deactivation_penalty = 0.3
+        self.low_prob_state = defaultdict(lambda: {'count': 0, 'max_cycles': 300, 'active': False})
+        self.low_prob_threshold = 0.45
+        self.activation_boost = 14.0
+        self.deactivation_penalty = 0.13
 
     @staticmethod
     def _process_batch_static(batch: List[List[str]]) -> Tuple[Counter, dict, dict]:
