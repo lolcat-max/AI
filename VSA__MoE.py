@@ -4,10 +4,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter, deque
 import random
-import pickle
-import os
 from typing import List, Dict
-KB_LEN = 99999
+
 # =====================================================================
 # DATASET WITH PROPER CARDINAL SHUFFLE
 # =====================================================================
@@ -69,8 +67,6 @@ class CardinalRNNLanguageModel(nn.Module):
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.embed_dim = embed_dim
-        self.max_cardinal = max_cardinal
         
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.cardinal_embed = nn.Embedding(max_cardinal, 32)
@@ -128,80 +124,6 @@ def build_vocabulary(corpus: List[str], min_freq: int = 2, max_vocab: int = 1000
         vocab[w] = len(vocab)
     
     return vocab, word_counts
-
-# =====================================================================
-# SAVE / LOAD FUNCTIONS
-# =====================================================================
-
-def save_checkpoint(model, vocab, idx_to_word, epoch, train_loss, val_loss, filepath='checkpoint.pt'):
-    """Save complete checkpoint including model, vocab, and training state."""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'vocab': vocab,
-        'idx_to_word': idx_to_word,
-        'train_loss': train_loss,
-        'val_loss': val_loss,
-        'model_config': {
-            'vocab_size': model.vocab_size,
-            'embed_dim': model.embed_dim,
-            'hidden_dim': model.hidden_dim,
-            'num_layers': model.num_layers,
-            'max_cardinal': model.max_cardinal
-        }
-    }
-    torch.save(checkpoint, filepath)
-    print(f"✓ Checkpoint saved to {filepath}")
-
-def load_checkpoint(filepath='checkpoint.pt', device='cpu'):
-    """Load complete checkpoint and reconstruct model."""
-    if not os.path.exists(filepath):
-        print(f"✗ Checkpoint not found: {filepath}")
-        return None, None, None
-    
-    checkpoint = torch.load(filepath, map_location=device)
-    
-    # Reconstruct model
-    config = checkpoint['model_config']
-    model = CardinalRNNLanguageModel(
-        vocab_size=config['vocab_size'],
-        embed_dim=config['embed_dim'],
-        hidden_dim=config['hidden_dim'],
-        num_layers=config['num_layers'],
-        dropout=0.3,
-        max_cardinal=config['max_cardinal']
-    ).to(device)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    vocab = checkpoint['vocab']
-    idx_to_word = checkpoint['idx_to_word']
-    
-    print(f"✓ Checkpoint loaded from {filepath}")
-    print(f"  - Epoch: {checkpoint['epoch']}")
-    print(f"  - Train Loss: {checkpoint['train_loss']:.4f}")
-    print(f"  - Val Loss: {checkpoint['val_loss']:.4f}")
-    print(f"  - Vocab Size: {len(vocab)}")
-    
-    return model, vocab, idx_to_word
-
-def save_vocab(vocab, idx_to_word, filepath='vocab.pkl'):
-    """Save vocabulary separately."""
-    with open(filepath, 'wb') as f:
-        pickle.dump({'vocab': vocab, 'idx_to_word': idx_to_word}, f)
-    print(f"✓ Vocabulary saved to {filepath}")
-
-def load_vocab(filepath='vocab.pkl'):
-    """Load vocabulary."""
-    if not os.path.exists(filepath):
-        print(f"✗ Vocabulary not found: {filepath}")
-        return None, None
-    
-    with open(filepath, 'rb') as f:
-        data = pickle.load(f)
-    
-    print(f"✓ Vocabulary loaded from {filepath}")
-    return data['vocab'], data['idx_to_word']
 
 # =====================================================================
 # ADVANCED GENERATION WITH REPETITION PENALTY
@@ -325,124 +247,106 @@ if __name__ == "__main__":
     random.seed(42)
     
     print("="*80)
-    print("PYTORCH RNN - WITH SAVE/LOAD")
+    print("PYTORCH RNN - FIXED REPETITION ISSUE")
     print("="*80)
     
-    # Check for existing checkpoint
+    # Load corpus
+    filename = input("Corpus filename: ")
+    with open(filename, 'r', encoding='utf-8') as f:
+        corpus_text = f.read()[:99999]
+    
+    # Clean
+    corpus = [s.strip() for s in corpus_text.replace('\n', ' ').split(".") 
+              if s.strip() and len(s.split()) >= 3]
+    
+    print(f"\n✓ Sentences: {len(corpus)}")
+    
+    # Build vocab
+    vocab, word_counts = build_vocabulary(corpus, min_freq=1, max_vocab=5000)
+    idx_to_word = {i: w for w, i in vocab.items()}
+    
+    print(f"✓ Vocabulary: {len(vocab)} tokens")
+    print(f"✓ Top words: {[w for w, _ in word_counts.most_common(10)]}")
+    
+    # Dataset
+    dataset = CardinalShuffledTextDataset(corpus, vocab, seq_len=32, shuffle_seed=42)
+    
+    # Split
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], 
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+    
+    # Model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"✓ Device: {device}\n")
+    print(f"✓ Device: {device}")
     
-    mode = input("Mode? [train/load/generate]: ").lower().strip()
+    model = CardinalRNNLanguageModel(
+        vocab_size=len(vocab),
+        embed_dim=256,
+        hidden_dim=512,
+        num_layers=2,
+        dropout=0.3,
+        max_cardinal=len(dataset)
+    ).to(device)
     
-    if mode == 'load' or mode == 'generate':
-        # Load existing model
-        model, vocab, idx_to_word = load_checkpoint('checkpoint.pt', device)
-        if model is None:
-            print("No checkpoint found. Exiting.")
-            exit()
-    else:
-        # Train new model
-        filename = input("Corpus filename: ")
-        with open(filename, 'r', encoding='utf-8') as f:
-            corpus_text = f.read()[:KB_LEN]
+    print(f"✓ Parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+    
+    # Training
+    criterion = nn.CrossEntropyLoss(ignore_index=vocab['<pad>'])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
+    
+    print("="*80)
+    print("TRAINING")
+    print("="*80)
+    
+    best_val_loss = float('inf')
+    
+    for epoch in range(3):
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, clip_norm=0.5)
         
-        # Clean
-        corpus = [s.strip() for s in corpus_text.replace('\n', ' ').split(".") 
-                  if s.strip() and len(s.split()) >= 3]
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_tokens = 0
+        with torch.no_grad():
+            for input_seq, target_seq, cardinal_idx in val_loader:
+                input_seq = input_seq.to(device)
+                target_seq = target_seq.to(device)
+                cardinal_idx = cardinal_idx.to(device)
+                
+                logits, _ = model(input_seq, cardinal_idx)
+                logits = logits.view(-1, model.vocab_size)
+                target_flat = target_seq.view(-1)
+                
+                loss = criterion(logits, target_flat)
+                mask = target_flat != 0
+                val_loss += loss.item() * mask.sum().item()
+                val_tokens += mask.sum().item()
         
-        print(f"\n✓ Sentences: {len(corpus)}")
+        val_loss = val_loss / max(val_tokens, 1)
         
-        # Build vocab
-        vocab, word_counts = build_vocabulary(corpus, min_freq=1, max_vocab=5000)
-        idx_to_word = {i: w for w, i in vocab.items()}
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_model.pt')
         
-        print(f"✓ Vocabulary: {len(vocab)} tokens")
-        print(f"✓ Top words: {[w for w, _ in word_counts.most_common(10)]}")
+        print(f"Epoch {epoch+1:2d} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | Best: {best_val_loss:.4f}")
         
-        # Save vocab
-        save_vocab(vocab, idx_to_word, 'vocab.pkl')
-        
-        # Dataset
-        dataset = CardinalShuffledTextDataset(corpus, vocab, seq_len=32, shuffle_seed=42)
-        
-        # Split
-        train_size = int(0.9 * len(dataset))
-        val_size = len(dataset) - train_size
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            dataset, [train_size, val_size], 
-            generator=torch.Generator().manual_seed(42)
-        )
-        
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
-        
-        # Model
-        model = CardinalRNNLanguageModel(
-            vocab_size=len(vocab),
-            embed_dim=256,
-            hidden_dim=512,
-            num_layers=2,
-            dropout=0.3,
-            max_cardinal=len(dataset)
-        ).to(device)
-        
-        print(f"✓ Parameters: {sum(p.numel() for p in model.parameters()):,}\n")
-        
-        # Training
-        criterion = nn.CrossEntropyLoss(ignore_index=vocab['<pad>'])
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
-        
-        print("="*80)
-        print("TRAINING")
-        print("="*80)
-        
-        best_val_loss = float('inf')
-        num_epochs = int(input("Number of epochs: "))
-        
-        for epoch in range(num_epochs):
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, device, clip_norm=0.5)
-            
-            # Validation
-            model.eval()
-            val_loss = 0.0
-            val_tokens = 0
-            with torch.no_grad():
-                for input_seq, target_seq, cardinal_idx in val_loader:
-                    input_seq = input_seq.to(device)
-                    target_seq = target_seq.to(device)
-                    cardinal_idx = cardinal_idx.to(device)
-                    
-                    logits, _ = model(input_seq, cardinal_idx)
-                    logits = logits.view(-1, model.vocab_size)
-                    target_flat = target_seq.view(-1)
-                    
-                    loss = criterion(logits, target_flat)
-                    mask = target_flat != 0
-                    val_loss += loss.item() * mask.sum().item()
-                    val_tokens += mask.sum().item()
-            
-            val_loss = val_loss / max(val_tokens, 1)
-            
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                save_checkpoint(model, vocab, idx_to_word, epoch, train_loss, val_loss, 'best_model.pt')
-            
-            # Save checkpoint every epoch
-            save_checkpoint(model, vocab, idx_to_word, epoch, train_loss, val_loss, 'checkpoint.pt')
-            
-            print(f"Epoch {epoch+1:2d} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | Best: {best_val_loss:.4f}")
-            
-            scheduler.step()
-        
-        print("\n✓ Training complete!")
+        scheduler.step()
+    
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pt'))
     
     # Generate
     print("\n" + "="*80)
-    print("GENERATION")
+    print("GENERATION (with repetition penalty & nucleus sampling)")
     print("="*80)
-    
-    model.eval()
     
     while True:
         user_input = input("\nSeed (or 'quit'): ")
@@ -453,7 +357,7 @@ if __name__ == "__main__":
         
         generated = generate_text_advanced(
             model, vocab, idx_to_word, seed,
-            max_len=600, 
+            max_len=60, 
             temperature=0.9,
             top_p=0.92,
             repetition_penalty=1.3,
