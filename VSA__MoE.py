@@ -357,7 +357,7 @@ if __name__ == "__main__":
         
         generated = generate_text_advanced(
             model, vocab, idx_to_word, seed,
-            max_len=60, 
+            max_len=600, 
             temperature=0.9,
             top_p=0.92,
             repetition_penalty=1.3,
