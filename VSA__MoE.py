@@ -1,470 +1,463 @@
-# =====================================================================
-# COMPLETE INTEGRATED SYSTEM: VSA + TRANSITIONS + ACTIVE MEMORY
-# =====================================================================
-
-import numpy as np
-from typing import List, Dict, Tuple, Optional, Set
-from collections import defaultdict, deque, Counter
-from dataclasses import dataclass, field
-from enum import Enum
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing as mp
-from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter, deque
+import random
 import pickle
 import os
-import re
+from typing import List, Dict
+KB_LEN = 99999
+# =====================================================================
+# DATASET WITH PROPER CARDINAL SHUFFLE
+# =====================================================================
+
+class CardinalShuffledTextDataset(Dataset):
+    def __init__(self, corpus: List[str], vocab: Dict[str, int], 
+                 seq_len: int = 32, shuffle_seed: int = 42):
+        self.vocab = vocab
+        self.seq_len = seq_len
+        self.idx_to_word = {v: k for k, v in vocab.items()}
+        
+        # Tokenize sentences
+        self.sentences = []
+        for sent in corpus:
+            tokens = [w.lower() for w in sent.split() if w.strip()]
+            if len(tokens) >= 3:
+                self.sentences.append(tokens)
+        
+        # Cardinal shuffle
+        self.cardinal_indices = list(range(len(self.sentences)))
+        random.seed(shuffle_seed)
+        random.shuffle(self.cardinal_indices)
+        self.shuffled_sentences = [self.sentences[i] for i in self.cardinal_indices]
+        
+        print(f"Dataset: {len(self.sentences)} sentences (shuffled)")
+    
+    def __len__(self):
+        return len(self.shuffled_sentences)
+    
+    def __getitem__(self, idx):
+        sentence = self.shuffled_sentences[idx]
+        cardinal_idx = self.cardinal_indices[idx]
+        
+        token_ids = [self.vocab[w] for w in sentence if w in self.vocab]
+        
+        if len(token_ids) < 2:
+            token_ids = [self.vocab['<pad>']] * (self.seq_len + 1)
+        
+        if len(token_ids) < self.seq_len + 1:
+            token_ids += [self.vocab['<pad>']] * (self.seq_len + 1 - len(token_ids))
+        else:
+            token_ids = token_ids[:self.seq_len + 1]
+        
+        input_seq = torch.tensor(token_ids[:-1], dtype=torch.long)
+        target_seq = torch.tensor(token_ids[1:], dtype=torch.long)
+        
+        return input_seq, target_seq, cardinal_idx
 
 # =====================================================================
-# MEMORY SYSTEM (REASONED INFERENCE)
+# IMPROVED MODEL WITH LAYER NORM
 # =====================================================================
 
-class MemoryType(Enum):
-    DATAPOINT = "raw"
-    PATTERN = "pattern"
-    RULE = "rule"
-    ASSOCIATION = "link"
-    META_INSIGHT = "insight"
-
-@dataclass
-class MemoryNode:
-    """Single memory unit with reasoning trace."""
-    memory_id: str
-    memory_type: MemoryType
-    content: Dict
-    created_at: int = 0
-    activation_count: int = 0
-    confidence: float = 1.0
-    reasoning_trace: List[str] = field(default_factory=list)
-    associations: Set[str] = field(default_factory=set)
-    
-    def record_activation(self):
-        self.activation_count += 1
-    
-    def add_reasoning(self, reason: str):
-        self.reasoning_trace.append(reason)
-    
-    def link_to(self, node_id: str):
-        self.associations.add(node_id)
-
-class ActiveMemory:
-    """Inverts datapoints into patterns → rules → meta-insights."""
-    
-    def __init__(self, max_nodes: int = 5000):
-        self.nodes: Dict[str, MemoryNode] = {}
-        self.max_nodes = max_nodes
-        self.datapoint_registry = defaultdict(list)
-        self.pattern_index = defaultdict(set)
-        self.rule_index = defaultdict(set)
-        self.association_graph = defaultdict(set)
-        self.association_strength = defaultdict(float)
+class CardinalRNNLanguageModel(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int = 256, 
+                 hidden_dim: int = 512, num_layers: int = 2, 
+                 dropout: float = 0.3, max_cardinal: int = 10000):
+        super().__init__()
         
-        self.inversion_depth = 0
-        self.pattern_emergence_threshold = 3
+        self.vocab_size = vocab_size
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.embed_dim = embed_dim
+        self.max_cardinal = max_cardinal
         
-        self.datapoint_count = 0
-        self.pattern_count = 0
-        self.rule_count = 0
-        self.activations_log = deque(maxlen=100)
-    
-    def record_datapoint(self, context_key: Tuple, token: str, prob: float,
-                        cycle_state: Dict, timestamp: int) -> str:
-        """Record observation and invert to patterns/rules."""
-        node_id = f"dp_{self.datapoint_count}"
-        self.datapoint_count += 1
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.cardinal_embed = nn.Embedding(max_cardinal, 32)
         
-        node = MemoryNode(
-            memory_id=node_id,
-            memory_type=MemoryType.DATAPOINT,
-            content={
-                'context': context_key,
-                'token': token,
-                'probability': prob,
-                'cycle_state': cycle_state.copy(),
-                'is_low_prob': prob < 0.45,
-                'in_boost_phase': cycle_state.get('active', False),
-                'boost_cycle': cycle_state.get('count', 0)
-            },
-            created_at=timestamp
+        self.rnn = nn.LSTM(
+            embed_dim + 32,
+            hidden_dim,
+            num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True
         )
         
-        node.add_reasoning(f"Observed: {token} in {context_key} @ p={prob:.3f}")
-        self.nodes[node_id] = node
-        self._attempt_pattern_inversion(node_id, context_key, prob, cycle_state)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, vocab_size)
+        self.dropout = nn.Dropout(dropout)
         
-        return node_id
+        # Better initialization
+        nn.init.xavier_uniform_(self.embedding.weight)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+        
+    def forward(self, input_seq, cardinal_indices, hidden=None):
+        batch_size, seq_len = input_seq.size()
+        
+        token_emb = self.embedding(input_seq)
+        card_emb = self.cardinal_embed(cardinal_indices).unsqueeze(1).expand(-1, seq_len, -1)
+        
+        combined_emb = torch.cat([token_emb, card_emb], dim=-1)
+        combined_emb = self.dropout(combined_emb)
+        
+        rnn_out, hidden = self.rnn(combined_emb, hidden)
+        rnn_out = self.layer_norm(rnn_out)
+        rnn_out = self.dropout(rnn_out)
+        
+        logits = self.fc(rnn_out)
+        
+        return logits, hidden
+
+# =====================================================================
+# VOCABULARY BUILDER
+# =====================================================================
+
+def build_vocabulary(corpus: List[str], min_freq: int = 2, max_vocab: int = 10000):
+    word_counts = Counter()
     
-    def _attempt_pattern_inversion(self, node_id: str, context_key: Tuple,
-                                   prob: float, cycle_state: Dict):
-        """Invert datapoints into patterns."""
-        
-        # LOW-PROB TRIGGER PATTERN
-        if prob < 0.45 and not cycle_state['active']:
-            pattern_sig = ("low_prob_trigger", context_key)
-            self.pattern_index[pattern_sig].add(node_id)
-            self.datapoint_registry[context_key].append(node_id)
-            
-            if len(self.pattern_index[pattern_sig]) >= self.pattern_emergence_threshold:
-                self._generate_rule_from_pattern(pattern_sig, "LOW_PROB_ACTIVATION_RULE")
-        
-        # BOOST CYCLING PATTERN
-        if cycle_state['active'] and cycle_state['count'] > 0:
-            pattern_sig = ("boost_cycle", cycle_state['count'])
-            self.pattern_index[pattern_sig].add(node_id)
-            
-            if len(self.pattern_index[pattern_sig]) >= self.pattern_emergence_threshold:
-                self._generate_rule_from_pattern(pattern_sig, "BOOST_CYCLE_RULE")
-        
-        # TOKEN REPETITION IN CONTEXT
-        repeat_sig = ("token_repeat", context_key, self.nodes[node_id].content['token'])
-        self.pattern_index[repeat_sig].add(node_id)
-        
-        if len(self.pattern_index[repeat_sig]) >= self.pattern_emergence_threshold:
-            self._generate_rule_from_pattern(repeat_sig, "TOKEN_CONTEXT_AFFINITY_RULE")
+    for sent in corpus:
+        tokens = [w.lower() for w in sent.split() if w.strip()]
+        word_counts.update(tokens)
     
-    def _generate_rule_from_pattern(self, pattern_sig: Tuple, rule_name: str):
-        """Convert patterns into actionable rules."""
-        
-        rule_id = f"rule_{self.rule_count}_{rule_name}"
-        self.rule_count += 1
-        
-        pattern_nodes = self.pattern_index[pattern_sig]
-        evidences = [self.nodes[nid].content for nid in pattern_nodes]
-        
-        avg_prob = np.mean([e['probability'] for e in evidences])
-        boost_phases = sum(1 for e in evidences if e['in_boost_phase'])
-        low_prob_count = sum(1 for e in evidences if e['is_low_prob'])
-        
-        rule_node = MemoryNode(
-            memory_id=rule_id,
-            memory_type=MemoryType.RULE,
-            content={
-                'rule_name': rule_name,
-                'pattern_signature': str(pattern_sig),
-                'evidence_count': len(pattern_nodes),
-                'avg_probability': float(avg_prob),
-                'boost_phase_frequency': float(boost_phases / max(len(evidences), 1)),
-                'low_prob_frequency': float(low_prob_count / max(len(evidences), 1)),
-                'contexts_affected': list(set(e['context'] for e in evidences))
-            },
-            confidence=min(1.0, len(pattern_nodes) / 10.0)
-        )
-        
-        rule_node.add_reasoning(f"Induced from {len(pattern_nodes)} obs: {rule_name}")
-        
-        for nid in pattern_nodes:
-            rule_node.link_to(nid)
-            self.association_graph[rule_id].add(nid)
-            self.association_graph[nid].add(rule_id)
-        
-        self.nodes[rule_id] = rule_node
-        self.rule_index[rule_name].add(rule_id)
+    # Take most common words
+    vocab_words = [w for w, c in word_counts.most_common(max_vocab) if c >= min_freq]
     
-    def fire_reasoned_inference(self, context_key: Tuple, current_prob: float) -> Dict:
-        """Reasoned prediction using active memory."""
-        
-        matching_rules = []
-        reasoning_steps = []
-        
-        for rule_name, rule_ids in self.rule_index.items():
-            for rule_id in rule_ids:
-                rule = self.nodes[rule_id]
-                rule_contexts = rule.content.get('contexts_affected', [])
-                
-                if context_key in rule_contexts:
-                    matching_rules.append((rule_id, rule))
-                    reasoning_steps.append(f"Rule '{rule_name}' matches context")
-        
-        inference = {
-            'should_boost': False,
-            'confidence': 0.0,
-            'matched_rules': len(matching_rules),
-            'reasoning': reasoning_steps,
-            'activated_nodes': []
+    vocab = {'<pad>': 0, '<unk>': 1, '<eos>': 2}
+    for w in vocab_words:
+        vocab[w] = len(vocab)
+    
+    return vocab, word_counts
+
+# =====================================================================
+# SAVE / LOAD FUNCTIONS
+# =====================================================================
+
+def save_checkpoint(model, vocab, idx_to_word, epoch, train_loss, val_loss, filepath='checkpoint.pt'):
+    """Save complete checkpoint including model, vocab, and training state."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'vocab': vocab,
+        'idx_to_word': idx_to_word,
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'model_config': {
+            'vocab_size': model.vocab_size,
+            'embed_dim': model.embed_dim,
+            'hidden_dim': model.hidden_dim,
+            'num_layers': model.num_layers,
+            'max_cardinal': model.max_cardinal
         }
-        
-        if not matching_rules:
-            inference['reasoning'].append("No applicable rules")
-            return inference
-        
-        boost_votes = 0
-        total_confidence = 0.0
-        
-        for rule_id, rule_node in matching_rules:
-            rule_node.record_activation()
-            inference['activated_nodes'].append(rule_id)
-            
-            if "LOW_PROB_ACTIVATION" in rule_node.content['rule_name']:
-                if current_prob < 0.45:
-                    boost_votes += 1
-            elif "BOOST_CYCLE" in rule_node.content['rule_name']:
-                if rule_node.content['boost_phase_frequency'] > 0.7:
-                    boost_votes += 1
-            elif "TOKEN_CONTEXT_AFFINITY" in rule_node.content['rule_name']:
-                boost_votes += 0.5
-            
-            total_confidence += rule_node.confidence
-        
-        inference['confidence'] = min(1.0, total_confidence / max(len(matching_rules), 1))
-        inference['should_boost'] = boost_votes > len(matching_rules) / 2
-        
-        return inference
+    }
+    torch.save(checkpoint, filepath)
+    print(f"✓ Checkpoint saved to {filepath}")
+
+def load_checkpoint(filepath='checkpoint.pt', device='cpu'):
+    """Load complete checkpoint and reconstruct model."""
+    if not os.path.exists(filepath):
+        print(f"✗ Checkpoint not found: {filepath}")
+        return None, None, None
     
-    def summarize_reasoning_state(self) -> Dict:
-        return {
-            'total_nodes': len(self.nodes),
-            'datapoints': self.datapoint_count,
-            'rules': self.rule_count,
-            'active_rules': {name: len(ids) for name, ids in self.rule_index.items() if ids}
-        }
+    checkpoint = torch.load(filepath, map_location=device)
+    
+    # Reconstruct model
+    config = checkpoint['model_config']
+    model = CardinalRNNLanguageModel(
+        vocab_size=config['vocab_size'],
+        embed_dim=config['embed_dim'],
+        hidden_dim=config['hidden_dim'],
+        num_layers=config['num_layers'],
+        dropout=0.3,
+        max_cardinal=config['max_cardinal']
+    ).to(device)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    vocab = checkpoint['vocab']
+    idx_to_word = checkpoint['idx_to_word']
+    
+    print(f"✓ Checkpoint loaded from {filepath}")
+    print(f"  - Epoch: {checkpoint['epoch']}")
+    print(f"  - Train Loss: {checkpoint['train_loss']:.4f}")
+    print(f"  - Val Loss: {checkpoint['val_loss']:.4f}")
+    print(f"  - Vocab Size: {len(vocab)}")
+    
+    return model, vocab, idx_to_word
+
+def save_vocab(vocab, idx_to_word, filepath='vocab.pkl'):
+    """Save vocabulary separately."""
+    with open(filepath, 'wb') as f:
+        pickle.dump({'vocab': vocab, 'idx_to_word': idx_to_word}, f)
+    print(f"✓ Vocabulary saved to {filepath}")
+
+def load_vocab(filepath='vocab.pkl'):
+    """Load vocabulary."""
+    if not os.path.exists(filepath):
+        print(f"✗ Vocabulary not found: {filepath}")
+        return None, None
+    
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+    
+    print(f"✓ Vocabulary loaded from {filepath}")
+    return data['vocab'], data['idx_to_word']
 
 # =====================================================================
-# VSA (VECTOR SYMBOLIC ARCHITECTURE)
+# ADVANCED GENERATION WITH REPETITION PENALTY
 # =====================================================================
 
-class VectorSymbolicArchitecture:
-    def __init__(self, dimensions: int = 2048):
-        self.dimensions = dimensions
-        self.codebook: Dict[str, np.ndarray] = {}
-
-    def create_polarized_vector(self, normalize: bool = True) -> np.ndarray:
-        dim_2d = self.dimensions // 2
-        theta = np.random.uniform(0, 2 * np.pi, dim_2d)
-        r = np.ones(dim_2d)
-        x_channel = r * np.cos(theta)
-        y_channel = r * np.sin(theta)
-        vec = np.stack([x_channel, y_channel], axis=0).reshape(-1)
-        if normalize:
-            vec = vec / (np.linalg.norm(vec) + 1e-9)
-        return vec
-
-    def similarity(self, vec_a: np.ndarray, vec_b: np.ndarray) -> float:
-        return np.dot(vec_a, vec_b) / ((np.linalg.norm(vec_a) * np.linalg.norm(vec_b)) + 1e-9)
-
-    def add_to_codebook(self, symbol: str) -> np.ndarray:
-        if symbol not in self.codebook:
-            self.codebook[symbol] = self.create_polarized_vector()
-        return self.codebook[symbol]
-
-# =====================================================================
-# TRANSITION ENCODER
-# =====================================================================
-
-class TransitionEncoder:
-    def __init__(self, vsa: VectorSymbolicArchitecture):
-        self.vsa = vsa
-        self.unigram_counts = Counter()
-        self.bigram_transitions = defaultdict(Counter)
-        self.trigram_transitions = defaultdict(Counter)
-        self.low_prob_state = defaultdict(lambda: {'count': 0, 'max_cycles': 300, 'active': False})
-        self.low_prob_threshold = 0.45
-        self.activation_boost = 14.0
-        self.deactivation_penalty = 0.13
-
-    @staticmethod
-    def _process_batch_static(batch: List[List[str]]) -> Tuple[Counter, dict, dict]:
-        local_unigrams = Counter()
-        local_bigrams = defaultdict(Counter)
-        local_trigrams = defaultdict(Counter)
-
-        for sequence in batch:
-            for i, token in enumerate(sequence):
-                local_unigrams[token] += 1
-                if i > 0:
-                    prev = sequence[i-1]
-                    local_bigrams[prev][token] += 1
-                if i > 1:
-                    prev2 = sequence[i-2]
-                    prev1 = sequence[i-1]
-                    local_trigrams[(prev2, prev1)][token] += 1
-        
-        return (local_unigrams, dict(local_bigrams), dict(local_trigrams))
-
-    def learn_transitions(self, corpus: List[List[str]], max_workers: int = None):
-        if max_workers is None:
-            max_workers = min(4, mp.cpu_count())
-        
-        batches = [corpus[i:i+1000] for i in range(0, len(corpus), 1000)]
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(self._process_batch_static, batches))
-
-        for uni, bi, tri in results:
-            self.unigram_counts.update(uni)
-            for prev, trans in bi.items():
-                self.bigram_transitions[prev].update(trans)
-            for prev_pair, trans in tri.items():
-                self.trigram_transitions[prev_pair].update(trans)
-
-    def get_unigram_probabilities(self) -> Dict[str, float]:
-        total = sum(self.unigram_counts.values())
-        if total == 0: return {}
-        return {t: c/total for t, c in self.unigram_counts.items()}
-
-    def get_bigram_probabilities(self, last_token: str) -> Optional[Dict[str, float]]:
-        if last_token not in self.bigram_transitions: return None
-        trans = self.bigram_transitions[last_token]
-        total = sum(trans.values())
-        return {t: c/total for t, c in trans.items()}
-
-    def get_trigram_probabilities(self, last_two: Tuple[str, str]) -> Optional[Dict[str, float]]:
-        if last_two not in self.trigram_transitions: return None
-        trans = self.trigram_transitions[last_two]
-        total = sum(trans.values())
-        return {t: c/total for t, c in trans.items()}
-
-    def get_low_prob_bias(self, probs: Dict[str, float], context_key: Tuple[str, str],
-                         selected_token: str, selected_prob: float) -> Dict[str, float]:
-        state = self.low_prob_state[context_key]
-        
-        if selected_prob < self.low_prob_threshold and not state['active']:
-            state['count'] = 0
-            state['active'] = True
-        elif state['active'] and state['count'] < state['max_cycles']:
-            if selected_token in probs:
-                probs[selected_token] *= self.activation_boost
-                state['count'] += 1
-        elif state['active'] and state['count'] >= state['max_cycles']:
-            state['active'] = False
-            state['count'] = 0
-            if selected_token in probs:
-                probs[selected_token] *= self.deactivation_penalty
-        
-        total = sum(probs.values())
-        if total > 0:
-            return {k: v/total for k, v in probs.items()}
-        return probs
-
-# =====================================================================
-# INTEGRATED GENERATOR WITH MEMORY
-# =====================================================================
-
-class RLDynamicGeneratorWithMemory:
-    def __init__(self, vsa: VectorSymbolicArchitecture, encoder: TransitionEncoder,
-                 memory: ActiveMemory):
-        self.vsa = vsa
-        self.encoder = encoder
-        self.memory = memory
-        self.generation_buffer = deque(maxlen=20)
-        self.inference_trace = deque(maxlen=50)
-        
-        self.inference_count = 0
-        self.memory_guided_decisions = 0
-
-    def stream_generation(self, seed: List[str], max_tokens: int = 100,
-                         temperature: float = 0.8, rl_weight: float = 2.0,
-                         use_memory_reasoning: bool = True) -> List[str]:
-        
-        context = seed.copy()
-        generated = []
-        
-        if not self.vsa.codebook:
-            return ["[NO_VOCAB]"]
-        
-        for step in range(max_tokens):
-            ctx_key = tuple(context[-2:]) if len(context) >= 2 else ('<pad>', '<pad>')
+def generate_text_advanced(model, vocab, idx_to_word, seed: List[str], 
+                          max_len: int = 50, temperature: float = 0.9, 
+                          top_p: float = 0.9, repetition_penalty: float = 1.2,
+                          device='cpu'):
+    """Generate with nucleus sampling and repetition penalty."""
+    model.eval()
+    
+    # Convert seed
+    token_ids = [vocab.get(w.lower(), vocab['<unk>']) for w in seed]
+    generated = seed.copy()
+    
+    # Track recent tokens for repetition penalty
+    recent_tokens = deque(maxlen=20)
+    recent_tokens.extend(token_ids)
+    
+    cardinal_idx = torch.tensor([0], dtype=torch.long).to(device)
+    hidden = None
+    
+    with torch.no_grad():
+        for step in range(max_len):
+            # Prepare input
+            input_seq = torch.tensor([token_ids[-32:]], dtype=torch.long).to(device)
             
-            probs = (self.encoder.get_trigram_probabilities(ctx_key) or
-                    self.encoder.get_bigram_probabilities(context[-1] if context else '<pad>') or
-                    self.encoder.get_unigram_probabilities())
+            if input_seq.size(1) < 32:
+                pad_len = 32 - input_seq.size(1)
+                padding = torch.full((1, pad_len), vocab['<pad>'], dtype=torch.long).to(device)
+                input_seq = torch.cat([padding, input_seq], dim=1)
             
-            if not probs:
-                next_token = list(self.vsa.codebook.keys())[0]
-                generated.append(next_token)
-                context.append(next_token)
-                continue
+            # Forward
+            logits, hidden = model(input_seq, cardinal_idx, hidden)
+            next_logits = logits[0, -1, :].clone()
             
-            # MEMORY REASONING
-            memory_inference = None
-            if use_memory_reasoning:
-                memory_inference = self.memory.fire_reasoned_inference(ctx_key, min(probs.values()))
-                self.inference_count += 1
-                
-                if memory_inference['should_boost'] and memory_inference['confidence'] > 0.2:
-                    for token in probs:
-                        probs[token] *= 1.5
-                    self.memory_guided_decisions += 1
-                    trace_msg = f"Memory boost ({memory_inference['matched_rules']} rules)"
-                else:
-                    trace_msg = f"Memory inference (conf={memory_inference['confidence']:.2f})"
-                
-                self.inference_trace.append({
-                    'step': step,
-                    'context': ctx_key,
-                    'inference': trace_msg,
-                    'rules_fired': memory_inference['matched_rules']
-                })
+            # Apply repetition penalty
+            for token_id in set(recent_tokens):
+                if token_id < len(next_logits):
+                    next_logits[token_id] /= repetition_penalty
+            
+            # Temperature
+            next_logits = next_logits / temperature
+            
+            # Nucleus (top-p) sampling
+            sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            # Remove tokens outside nucleus
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+            sorted_indices_to_remove[0] = False
+            
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            next_logits[indices_to_remove] = -float('Inf')
             
             # Sample
-            tokens = list(probs.keys())
-            prob_vals = np.array(list(probs.values()))
-            prob_vals = np.log(prob_vals + 1e-8) / temperature
-            prob_vals = np.exp(prob_vals)
-            prob_vals /= prob_vals.sum()
+            probs = F.softmax(next_logits, dim=-1)
+            next_token_id = torch.multinomial(probs, 1).item()
             
-            next_token = np.random.choice(tokens, p=prob_vals)
-            selected_prob = probs.get(next_token, 0.5)
+            # Stop conditions
+            if next_token_id in [vocab['<pad>'], vocab['<eos>']]:
+                break
             
-            # Record in memory
-            cycle_state = self.encoder.low_prob_state[ctx_key]
-            self.memory.record_datapoint(ctx_key, next_token, selected_prob, cycle_state, step)
+            # Avoid immediate repetition
+            if len(token_ids) > 0 and next_token_id == token_ids[-1] and step > 0:
+                # Resample once
+                next_logits[next_token_id] = -float('Inf')
+                probs = F.softmax(next_logits, dim=-1)
+                next_token_id = torch.multinomial(probs, 1).item()
             
-            # Apply dynamic cycling
-            probs = self.encoder.get_low_prob_bias(probs, ctx_key, next_token, selected_prob)
+            token_ids.append(next_token_id)
+            recent_tokens.append(next_token_id)
             
-            self.generation_buffer.append(next_token)
-            generated.append(next_token)
-            context.append(next_token)
-        
-        return generated
+            word = idx_to_word.get(next_token_id, '<unk>')
+            if word not in ['<pad>', '<unk>', '<eos>']:
+                generated.append(word)
+    
+    return ' '.join(generated)
 
+# =====================================================================
+# TRAINING WITH GRADIENT CLIPPING
+# =====================================================================
+
+def train_epoch(model, dataloader, optimizer, criterion, device, clip_norm=0.5):
+    model.train()
+    total_loss = 0.0
+    total_tokens = 0
+    
+    for input_seq, target_seq, cardinal_idx in dataloader:
+        input_seq = input_seq.to(device)
+        target_seq = target_seq.to(device)
+        cardinal_idx = cardinal_idx.to(device)
+        
+        optimizer.zero_grad()
+        
+        logits, _ = model(input_seq, cardinal_idx)
+        
+        logits = logits.view(-1, model.vocab_size)
+        target_seq = target_seq.view(-1)
+        
+        loss = criterion(logits, target_seq)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+        optimizer.step()
+        
+        mask = target_seq != 0
+        total_loss += loss.item() * mask.sum().item()
+        total_tokens += mask.sum().item()
+    
+    return total_loss / max(total_tokens, 1)
 
 # =====================================================================
 # MAIN
 # =====================================================================
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)
+    torch.manual_seed(42)
+    random.seed(42)
     
     print("="*80)
-    print("INTEGRATED: VSA + TRANSITIONS + ACTIVE MEMORY REASONING")
+    print("PYTORCH RNN - WITH SAVE/LOAD")
     print("="*80)
     
-    vsa = VectorSymbolicArchitecture(dimensions=128)
-    encoder = TransitionEncoder(vsa)
-    memory = ActiveMemory()
+    # Check for existing checkpoint
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"✓ Device: {device}\n")
     
-    # Training corpus
-    print("\n📚 Training on synthetic corpus...")
-    with open(input("Filename: "), 'r', encoding='utf-8') as f:
-                corpus = f.read().split(".")
-    corpusB = []
-    for sentence in corpus:
-        corpusB.append(sentence.split())
-    encoder.learn_transitions(corpusB, max_workers=1)
+    mode = input("Mode? [train/load/generate]: ").lower().strip()
     
-    for sent in corpus:
-        for token in sent:
-            vsa.add_to_codebook(token)
-    
-    print(f"✓ Vocabulary: {len(vsa.codebook)} tokens")
-    print(f"✓ Transitions: {len(encoder.unigram_counts)} unigrams")
-    
-    # Generation with memory
-    gen = RLDynamicGeneratorWithMemory(vsa, encoder, memory)
-    
-    print("\n" + "="*80)
-    print("GENERATION WITH ACTIVE MEMORY GUIDANCE")
-    print("="*80)
-    while True:
-        seed = input("USER: ").split()
-        print(f"\n🌱 Seed: {seed}\n")
+    if mode == 'load' or mode == 'generate':
+        # Load existing model
+        model, vocab, idx_to_word = load_checkpoint('checkpoint.pt', device)
+        if model is None:
+            print("No checkpoint found. Exiting.")
+            exit()
+    else:
+        # Train new model
+        filename = input("Corpus filename: ")
+        with open(filename, 'r', encoding='utf-8') as f:
+            corpus_text = f.read()[:KB_LEN]
         
-        generated = gen.stream_generation(
-            seed,
-            max_tokens=800,
-            temperature=0.7,
-            use_memory_reasoning=True
+        # Clean
+        corpus = [s.strip() for s in corpus_text.replace('\n', ' ').split(".") 
+                  if s.strip() and len(s.split()) >= 3]
+        
+        print(f"\n✓ Sentences: {len(corpus)}")
+        
+        # Build vocab
+        vocab, word_counts = build_vocabulary(corpus, min_freq=1, max_vocab=5000)
+        idx_to_word = {i: w for w, i in vocab.items()}
+        
+        print(f"✓ Vocabulary: {len(vocab)} tokens")
+        print(f"✓ Top words: {[w for w, _ in word_counts.most_common(10)]}")
+        
+        # Save vocab
+        save_vocab(vocab, idx_to_word, 'vocab.pkl')
+        
+        # Dataset
+        dataset = CardinalShuffledTextDataset(corpus, vocab, seq_len=32, shuffle_seed=42)
+        
+        # Split
+        train_size = int(0.9 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [train_size, val_size], 
+            generator=torch.Generator().manual_seed(42)
         )
         
-        print(f"Generated: {' '.join(generated)}\n")
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
+        
+        # Model
+        model = CardinalRNNLanguageModel(
+            vocab_size=len(vocab),
+            embed_dim=256,
+            hidden_dim=512,
+            num_layers=2,
+            dropout=0.3,
+            max_cardinal=len(dataset)
+        ).to(device)
+        
+        print(f"✓ Parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+        
+        # Training
+        criterion = nn.CrossEntropyLoss(ignore_index=vocab['<pad>'])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30)
+        
+        print("="*80)
+        print("TRAINING")
+        print("="*80)
+        
+        best_val_loss = float('inf')
+        num_epochs = int(input("Number of epochs: "))
+        
+        for epoch in range(num_epochs):
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, device, clip_norm=0.5)
+            
+            # Validation
+            model.eval()
+            val_loss = 0.0
+            val_tokens = 0
+            with torch.no_grad():
+                for input_seq, target_seq, cardinal_idx in val_loader:
+                    input_seq = input_seq.to(device)
+                    target_seq = target_seq.to(device)
+                    cardinal_idx = cardinal_idx.to(device)
+                    
+                    logits, _ = model(input_seq, cardinal_idx)
+                    logits = logits.view(-1, model.vocab_size)
+                    target_flat = target_seq.view(-1)
+                    
+                    loss = criterion(logits, target_flat)
+                    mask = target_flat != 0
+                    val_loss += loss.item() * mask.sum().item()
+                    val_tokens += mask.sum().item()
+            
+            val_loss = val_loss / max(val_tokens, 1)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(model, vocab, idx_to_word, epoch, train_loss, val_loss, 'best_model.pt')
+            
+            # Save checkpoint every epoch
+            save_checkpoint(model, vocab, idx_to_word, epoch, train_loss, val_loss, 'checkpoint.pt')
+            
+            print(f"Epoch {epoch+1:2d} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | Best: {best_val_loss:.4f}")
+            
+            scheduler.step()
+        
+        print("\n✓ Training complete!")
     
+    # Generate
+    print("\n" + "="*80)
+    print("GENERATION")
+    print("="*80)
+    
+    model.eval()
+    
+    while True:
+        user_input = input("\nSeed (or 'quit'): ")
+        if user_input.lower() == 'quit':
+            break
+        
+        seed = user_input.strip().split() if user_input.strip() else ['the']
+        
+        generated = generate_text_advanced(
+            model, vocab, idx_to_word, seed,
+            max_len=600, 
+            temperature=0.9,
+            top_p=0.92,
+            repetition_penalty=1.3,
+            device=device
+        )
+        
+        print(f"\n✨ {generated}\n")
