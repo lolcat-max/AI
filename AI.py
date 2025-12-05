@@ -343,18 +343,17 @@ class ActiveMemory:
         self.nodes[nid] = MemoryNode(
             nid, MemoryType.DATAPOINT, {"ctx": ctx, "tok": tok, "p": p}
         )
-        if p < 0.45:
-            sig = ("low", ctx)
-            if sig not in self.nodes:
-                self.nodes[sig] = set()
-            self.nodes[sig].add(nid)
-            if len(self.nodes[sig]) >= 3:
-                rid = f"r{self.rule_count}_lowboost"
-                self.rule_count += 1
-                self.rules["lowboost"].add(rid)
-                self.nodes[rid] = MemoryNode(
-                    rid, MemoryType.RULE, {"sig": sig}
-                )
+        sig = ("low", ctx)
+        if sig not in self.nodes:
+            self.nodes[sig] = set()
+        self.nodes[sig].add(nid)
+        if len(self.nodes[sig]) >= 3:
+            rid = f"r{self.rule_count}_lowboost"
+            self.rule_count += 1
+            self.rules["lowboost"].add(rid)
+            self.nodes[rid] = MemoryNode(
+                rid, MemoryType.RULE, {"sig": sig}
+            )
 
     def infer_boost(self, ctx, minp):
         return len(self.rules["lowboost"]) > 0 and minp < 0.45
@@ -539,9 +538,9 @@ class ConcEnc:
 
         def one_pass(p):
             # random temperature in [0.7, 1.3]
-            temp = np.exp(np.random.uniform(np.log(0.7), np.log(1.3)))
+            temp = np.exp(np.random.uniform(np.log(10.7), np.log(100.3)))
             # random exponent in [0.7, 1.4]
-            alpha = np.random.uniform(0.7, 1.4)
+            alpha = np.random.uniform(0.1, 1.4)
 
             # Gumbel noise in log-space, scaled by perm_noise
             g = -np.log(-np.log(np.random.uniform(0.001, 0.999, size=p.shape)))
@@ -609,7 +608,7 @@ class ConcGen:
 
     def fit(self, file):
         with open(file, encoding="UTF-8") as f:
-            txt = f.read()[:KB_len]
+            txt = f.read().lower()[:KB_len]
         snts = [s.split() for s in txt.split(".") if s.strip()]
 
         # Pre-build VSA for vocab so clustering uses same vectors
@@ -646,17 +645,24 @@ class ConcGen:
             pv /= pv.sum()
 
             keys = list(ps.keys())
-            nt = np.random.choice(keys, p=pv)
-            sp = ps[nt]
 
-            # unknown-context observation
-            prev_tok_for_pair = ctx[-1] if ctx else None
-            if prev_tok_for_pair is not None:
-                known = self.enc.is_known_pair(prev_tok_for_pair, nt)
-                self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
+            for i in range(len(pv)):
+                nt = np.random.choice(keys, p=pv)
+                sp = ps[nt]
+                # unknown-context observation
+                prev_tok_for_pair = ctx[-1] if ctx else None
+                if prev_tok_for_pair is not None:
+                    known = self.enc.is_known_pair(prev_tok_for_pair, nt)
+                    self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
+                    ctx.append(known)
+                if self.mem.infer_boost(ckey, min(ps.values())):
+                    ps = {k: v * 1.3 for k, v in ps.items()}
+                    Zb = sum(ps.values())
+                    if Zb > 0:
+                        ps = {k: v / Zb for k, v in ps.items()}
 
-            self.enc.sco.record_attribution(ckey, nt, sp)
-            self.mem.record(ckey, nt, sp, self.enc.lpstate[ckey], self.steps)
+            self.enc.sco.record_attribution(ckey, nt, ps.items())
+            self.mem.record(ckey, nt, ps.items(), self.enc.lpstate[ckey], self.steps)
             ps = self.enc.lp_bias(ps, ckey, nt, sp)
 
             res.append(nt)
