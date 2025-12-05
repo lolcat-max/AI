@@ -294,7 +294,7 @@ class StochasticCardinalOrder:
             self.cardinal_memory[tok] = self.cardinal_memory.get(tok, 0) + ranks[tok]["cardinal"]
 
         Z = sum(final_scores.values())
-        if Z <= 0:
+        if Z <= 0.1:
             return probs
         return {k: v / Z for k, v in final_scores.items()}
 
@@ -302,7 +302,7 @@ class StochasticCardinalOrder:
         if not self.attribution_history:
             return 0.5
         matches = sum(1 for h in self.attribution_history if h.get("ctx") == ctx)
-        return 1 - np.exp(-matches / 10.0)
+        return 1 - np.exp(-matches / 10000.0)
 
     def record_attribution(self, ctx: tuple, chosen_tok: str, final_prob: float):
         self.attribution_history.append(
