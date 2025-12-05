@@ -757,8 +757,21 @@ class ConcGen:
         iterator = range(n)
 
         for step in iterator:
-            ckey = tuple(ctx[-1:]) if len(ctx) >= 2 else tuple(ctx)
+            # XOR control on context
+            control = step % 256
+            ctx_int = [hash(tok) % 256 for tok in ctx]
+            control = step % 256
+            # XOR each token's integer representation with control
+            ctx_xor = [tok_int ^ control for tok_int in ctx_int]
+
+            ckey = tuple(ctx_xor[-1:]) if len(ctx_xor) >= 2 else tuple(ctx_xor)
             ps = self.enc.probs(ctx)
+
+            # XOR control on probability scores
+            keys = list(ps.keys())
+            values = [int(round(p * 1000)) for p in ps.values()]  # Convert probs to int for XOR
+            values = [v ^ control for v in values]
+            ps = {k: v / 1000 for k, v in zip(keys, values)}
             if not ps:
                 print(f"\n[!] Stopped at step {step}: no continuations")
                 break
