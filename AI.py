@@ -1,6 +1,6 @@
 # =====================================================================
 # COUNTER-INTUITIVE STOCHASTIC CARDINAL ORDERING ON ATTRIBUTION
-# WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS
+# WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS + UNKNOWN CTX
 # =====================================================================
 KB_len = 99999
 
@@ -98,6 +98,84 @@ class KnowledgeSubsets:
             if cid in active_clusters:
                 bonus = cluster_bonus.get(cid, 0.0)
                 factor = 1.0 + boost_strength * bonus
+                boosted[tok] = p * factor
+
+        Z = sum(boosted.values())
+        if Z <= 0:
+            return probs
+        return {k: v / Z for k, v in boosted.items()}
+
+
+# ---------------------------------------------------------------------
+# UNKNOWN CONTEXT PAIR CLUSTERER (user-defined)
+# ---------------------------------------------------------------------
+class UnknownContextClusterer:
+    """
+    Tracks rare/unknown bigrams and allows user-defined clustering of them.
+    During generation, boosts continuations that belong to active unknown clusters.
+    """
+    def __init__(self, min_count=3):
+        self.min_count = min_count
+        self.pair_counts = Counter()          # (prev_tok, tok) -> count
+        self.user_clusters = {}               # cluster_id -> set((prev_tok, tok))
+        self.pair_to_cluster = {}             # (prev_tok, tok) -> cluster_id
+        self.next_cluster_id = 0
+
+    def observe_pair(self, prev_tok, tok, known: bool):
+        if not known and prev_tok is not None and tok is not None:
+            self.pair_counts[(prev_tok, tok)] += 1
+
+    def get_unknown_pairs(self, threshold=None):
+        if threshold is None:
+            threshold = self.min_count
+        return [
+            pair for pair, c in self.pair_counts.items()
+            if c >= threshold and pair not in self.pair_to_cluster
+        ]
+
+    def create_cluster(self, pairs):
+        cid = self.next_cluster_id
+        self.next_cluster_id += 1
+        self.user_clusters[cid] = set(pairs)
+        for p in pairs:
+            self.pair_to_cluster[p] = cid
+        return cid
+
+    def active_cluster_boost(self, probs: dict, ctx) -> dict:
+        if not probs or len(ctx) < 1:
+            return probs
+
+        prev_tok = ctx[-1]
+        boosted = dict(probs)
+        active_cids = set()
+        for tok in probs.keys():
+            pair = (prev_tok, tok)
+            cid = self.pair_to_cluster.get(pair)
+            if cid is not None:
+                active_cids.add(cid)
+
+        if not active_cids:
+            return probs
+
+        cluster_activation = {cid: 0.0 for cid in active_cids}
+        for pair, cid in self.pair_to_cluster.items():
+            if cid not in active_cids:
+                continue
+            ptok, ntok = pair
+            if ptok == prev_tok and ntok in probs:
+                cluster_activation[cid] += probs[ntok]
+
+        max_act = max(cluster_activation.values()) if cluster_activation else 0.0
+        if max_act <= 0:
+            return probs
+
+        base_strength = 0.3
+        for tok, p in probs.items():
+            pair = (prev_tok, tok)
+            cid = self.pair_to_cluster.get(pair)
+            if cid in active_cids:
+                act = cluster_activation.get(cid, 0.0) / max_act
+                factor = 1.0 + base_strength * act
                 boosted[tok] = p * factor
 
         Z = sum(boosted.values())
@@ -322,6 +400,7 @@ class ConcEnc:
         self.ctx_index = {}
         self.ctx_index_norm = {}
         self.knowledge = KnowledgeSubsets(n_clusters=8, cluster_size=50)
+        self.unknown_ctx = UnknownContextClusterer(min_count=3)
 
     def train(self, corp, vsa):
         # Phase 1: rings
@@ -360,6 +439,12 @@ class ConcEnc:
         # Phase 3: knowledge subsets
         vocab = list(self.uni.keys())
         self.knowledge.build_clusters(vocab, vsa)
+
+    def is_known_pair(self, prev_tok, next_tok):
+        for ring in self.rings:
+            if prev_tok in ring and next_tok in ring[prev_tok]:
+                return True
+        return False
 
     def current_context_signature(self, ctx, window=32):
         if not ctx:
@@ -434,9 +519,10 @@ class ConcEnc:
             spiral_probs, active_clusters, boost_strength=0.4
         )
         sc_probs = self.self_context_boost(knowledge_probs, ctx)
+        uctx_probs = self.unknown_ctx.active_cluster_boost(sc_probs, ctx)
         ctx_tuple = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
         attr = self.sco.get_context_attribution(ctx_tuple)
-        return self.sco.attribution_transform(sc_probs, attr)
+        return self.sco.attribution_transform(uctx_probs, attr)
 
     def lp_bias(self, pr, ctx, st, sp):
         stt = self.lpstate[ctx]
@@ -469,17 +555,21 @@ class ConcGen:
         # Pre-build VSA for vocab so clustering uses same vectors
         for s in snts:
             for t in s:
-                self.vsa.vec(t)
-
+                if len(t) % 4 ==0:
+                    continue
+                else:
+                    self.vsa.vec(t)
         self.enc.train(snts, self.vsa)
-        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge Subsets)")
+        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx)")
 
-    def gen(self, seed, n=600, t=0.95, show_progress=True):
+    def gen(self, seed, n=600, t=0.95, show_progress=False, stream=True):
         ctx = list(seed)
         res = []
-        
-        for step in range(n):
-            ckey = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
+
+        iterator = range(n)
+
+        for step in iterator:
+            ckey = tuple(ctx[-1:]) if len(ctx) >= 2 else tuple(ctx)
             ps = self.enc.probs(ctx)
             if not ps:
                 print(f"\n[!] Stopped at step {step}: no continuations")
@@ -499,18 +589,24 @@ class ConcGen:
             nt = np.random.choice(keys, p=pv)
             sp = ps[nt]
 
+            # unknown-context observation
+            prev_tok_for_pair = ctx[-1] if ctx else None
+            if prev_tok_for_pair is not None:
+                known = self.enc.is_known_pair(prev_tok_for_pair, nt)
+                self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
+
             self.enc.sco.record_attribution(ckey, nt, sp)
             self.mem.record(ckey, nt, sp, self.enc.lpstate[ckey], self.steps)
             ps = self.enc.lp_bias(ps, ckey, nt, sp)
 
             res.append(nt)
-            print(nt, end=" ", flush=True)
+            if stream:
+                print(nt, end=" ", flush=True)
             ctx.append(nt)
             self.steps += 1
 
-            
-        if show_progress:
-            print(f"\n[✓] Generated {len(res)} tokens")
+        if stream:
+            print()
         return res
 
 
@@ -520,9 +616,11 @@ if __name__ == "__main__":
     fn = input("Corpus file: ")
     g.fit(fn)
     while True:
-        sd = input("Seed: ").split()
-        out = g.gen(sd)
+        cmd = input("USER: ").strip()
        
+        # treat command as seed string
+        sd = cmd.split()
+        out = g.gen(sd, stream=True)
         print(f"STATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
         print(
             f"SCO: {len(g.enc.sco.cardinal_memory)} tokens, "
@@ -534,3 +632,4 @@ if __name__ == "__main__":
         )
         print(f"CTX: {len(g.enc.ctx_index_norm)} tokens indexed")
         print(f"KNOWLEDGE: {len(g.enc.knowledge.clusters)} clusters")
+        print(f"UNKNOWN CTX CLUSTERS: {len(g.enc.unknown_ctx.user_clusters)}")
