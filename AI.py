@@ -1,225 +1,698 @@
-Is happiness just chemicals flowing through your brain or something more?
-Can we really know everything?
-What is the meaning of a good life?
-Is there a God?
-What in life is truly objective and not subjective?
-What is consciousness?
-Is there inherent order in nature or is it all chaos and chance?
-Is there an alternative to capitalism?
-Is it more important to be respected or liked?
-Are we in the Matrix?
-Have we become less happy in this age of technology?
-What is mathematics?
-Are humans obligated to better themselves?
-Is there a meaning of life?
-Is having a big ego a negative or positive trait?
-Is there absolute mortality?
-Is the most important purpose in life to find happiness?
-Do we have free will?
-Does life require a purpose and a goal?
-Would you kill  people to save ?
-What is happiness?
-How can people believe in truths without evidence?
-Is it easier to love or to be loved?
-What is time?
-Do acts of kindness have a motive?
-Is mind or matter more real?
-Is love simply physical desire or something more?
-Where do thoughts come from?
-Does evil come from within, and if so why?
-What is beauty?
-Are people in this current generation less or more sensitive than people from past generations?
-Where were people before they were born?
-What is true friendship?
-How does gravity work?
-Can achieving nothing make a person happy?
-Does the Law of Attraction exist?
-Have gadgets and apps taken away emotions?
-Does observation alter an event?
-If everyone spoke their mind would this world be a better place?
-Where does the universe end?
-Is there a perfect life?
-What is infinity?
-Why do we strive for perfection if it is not attainable?
-Does sound happen if nothing is present to hear it?
-Does utilizing time properly make our lives meaningful and happy?
-Is it more important to be liked or respected?
-Can life be meaningful without friends?
-Where does the soul live?
-How do you know if you love someone enough to marry them?
-Is there a reason for life?
-Do numbers in a bank account make people happy?
-What will happen at the end of the world?
-Is living life to the fullest possible?
-What will happen at the end of the world?
-Can spirituality make you a happy person?
-What is education?
-Are highly intelligent people less happy than individuals with average intelligence?
-Is there a supreme power?
-Is there an absolute way to attain a happy state of mind?
-How did the universe begin?
-Does living your life for others make your life have meaning?
-Can we have happiness without sadness?
-Do knowledge and understanding make you content and happy as a person?
-What are numbers?
-Does fate exist?
-When does consciousness begin?
-Does an ideal government exist?
-Is life all a dream?
-Does life have a reason?
-If everything evolved from amoebas, how does the world still have amoebas?
-Are there limitations on free speech?
-The structure of DNA appears to be intelligently designed, what are the implications?
-Do aliens exist?
-Are we a minuscule part of intelligent life in the universe?
-Is trust more important than love?
-Why do we do things we do not like to do?
-If lying is wrong, are white lies okay?
-Do atheists make their own gods?
-How should people live their lives?
-Can artificial intelligence be creative?
-If judgment is for God, why do we pass judgment?
-What is intelligence?
-Can religious beliefs affect scientific thinking?
-What is intelligence?
-Will a world without reliance on modern technology make any progress?
-Do we have a soul?
-Is human potential capable of anything?
-What do people strive for after enlightenment?
-Is death a new beginning?
-What defines you?
-Why does God not intervene when evil takes root in people?
-What happens after we die?
-Does belief make God exist?
-Isn’t one person’s terrorist another person’s freedom fighter?
-Will robots take over the world in the future?
-How much control do you have over your life?
-Does the path to salvation lie within us?
-How do you know your perceptions are real?
-Are we the biggest threat to humanity?
-If money cannot buy happiness, can you ever be truly happy with no money?
-Do parallel universes exist?
-What role does honor play in today’s society?
-How does one find purpose in life?
-Is a family still relevant in the modern world?
-If aliens attack, what will we do?
-What is true love?
-Do guns protect people or kill people?
-What is true strength?
-Will racism cease to exist?
-How do you know that your experience of consciousness is the same as other people’s experience of consciousness?
-Why is beauty associated with morality?
-Who decides what morality is?
-Why do we respect the dead more than the living?
-Is a “wrong” act okay if nobody ever knows about it?
-Does God have supreme power?
-What is the difference between living and being alive?
-Will the world be a better place if caste and religion cease to exist?
-Who defines good and evil?
-What’s more important doing the right thing or doing things right?
-Why do people fear losing things that they do not even have yet?
-Do we love ourselves more in the virtual world and less in the real world?
-What makes a good friend?
-Is humanity doomed to head in a destructive direction?
-Do you make your own decisions, or let others make them for you?
-Should full access to the internet be a fundamental right?
-What is reality?
-Is peace the only way to stop a war?
-What is the truth?
-Can memories be erased?
-What makes you, you?
-Is religion conceptualized by one’s own belief system?
-What things hold you back from doing the things that you really want to?
-Will the world come to an end by human hands?
-What is true happiness?
-Intelligence or wisdom, what’s more important for a better world?
-Where is the line between insanity and creativity?
-Is true beauty subjective or objective?
-What one piece of advice would you offer to a newborn infant?
-What is the extent of freedom human beings should have?
-Does nature shape our personalities more than nurture?
-What is the meaning of rich and poor in the modern world?
-To what extent do you shape your own destiny, and how much is down to fate?
-Do we control technology or is technology controlling us?
-If you could choose just one thing to change about the world, what would it be?
-Is it worse to fail at something or never attempt it in the first place?
-What exactly is self-esteem and where does it come from?
-Will a curb on buying guns and arms reduce the number of shooting sprees in the world?
-Is the way we compensate people for their jobs ideal or should we have some way of making sure people are paid appropriately?
-Do we change when we have power?
-Can a person be “educated” without a formal education?
-Will technological advances wipe out humanity?
-What are dreams and why do we have them?
-Does understanding philosophy lead to progress?
-Will it ever be possible to travel through time? Space?
-Is there a species more advanced than humans in the universe?
-Is defining people according to race a social construct or a biological category?
-If all the currencies in the world did not have monetary value, would our world be a much better place?
-Is there a difference between fair trade and free trade? What is it and which is of greater importance?
-Is it possible time is being altered right now?
-Is preservation of a country’s culture a good reason for limiting immigration?
-Why do we throw away food when we know people are dying of hunger?
-Does the English language make us feel superior to other countries?
-Which is more important, justice or mercy?
-Will artificial intelligence help increase human lifespan in the future?
-Is it always good to have choices?
-Does awareness of consciousness have benefits?
-Is torture ever justified?
-Do thoughts have a pattern?
-When you are driving and see one shoe on the side of the road, what do you think happened to the other shoe?
-Will stricter laws make a better world?
-Should we limit the amount of money people can earn and save to avoid an unequal distribution of wealth?
-Are we losing our right to privacy?
-Since the birth rate is down in the United States, should people be required to have at least one child?
-Is limiting immigration to developed countries right?
-Does democracy work for every country?
-Does faith make belief stronger?
-Should people have the right to live and travel anywhere they wish with no state or country boundaries?
-Why can’t every person be a genius?
-Should people be allowed to sell their organs and should organ donors be financially compensated?
-Is there freedom in creativity and art in the modern age?
-Should the government make organ donation compulsory?
-Do the simple things become complexities when we try to attain perfection?
-Should governments have penalties for those who live unhealthy lifestyles?
-Will concepts and theories in regard to religion becoming obsolete come true?
-Is love different from sexual desire? Passion? How?
-Is blind belief prevalent more among holy, spiritual, and pious people?
-Is there a cause for every event?
-Can dreams be associated with the unforeseen future?
-Do wars ever solve the problems of countries and governments?
-If we live in a civilized world why do we see so many distinctions between rich and poor?
-Can some things exist that aren’t in time?
-Do computers have the ability to be creative?
-Does luck exist?
-What rights, if any, do animals have?
-Are clowns funny or scary?
-Are there universal human rights? What are they?
-If time travel is possible, would we have met time travelers already?
-Are emotions rational or irrational?
-Does an afterlife exist?
-Do you think anyone has actually met their true soulmate?
-Can we know about happiness without knowing about sadness?
-Does time have a beginning or an end?
-Are people born evil? Or do they end up doing evil things as a result of early childhood experiences or other external factors?
-Is beauty truly in the eye of the beholder?
-Are we morally obligated to help others?
-Is world peace achievable?
-Are people natural-born leaders, or do they develop the traits over time?
-What harsh truths do you prefer to ignore?
-Is suffering a necessary part of the human condition?
-What would you genetically change about humans to make them a better species?
-How much does language affect our thinking?
-If you could press a button and receive a million dollars, but one stranger would die, would you press the button?
-Has social media been a net positive or a net negative for our society? Why?
-Is existence necessary?
-Do the cosmos have a purpose?
-If humanity was put on trial by an advanced race of aliens, how would you defend humanity and argue for its continued existence?
-What’s the difference between justice and revenge?
-If babies are considered innocent, when do people cease to be innocent?
-Where does your self-worth come from?
-Why are drugs banned but not harmful food additives and alcohol?
-Is it ever okay to share a secret?
-How long will you be remembered after you die?
-How likely do you think it will be that humans will last another , years without killing ourselves off?
-Would you want to know you are going to die beforehand or die suddenly without warning?
-Does the study of philosophy ever lead to answers or simply more questions?
+# =====================================================================
+# COUNTER-INTUITIVE STOCHASTIC CARDINAL ORDERING ON ATTRIBUTION
+# WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS + UNKNOWN CTX
+# + PERMUTATION ACTIVATIONS
+# =====================================================================
+KB_len = 99999
+
+import numpy as np
+import random
+from collections import defaultdict, Counter, deque
+from dataclasses import dataclass
+from enum import Enum
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+from tqdm import tqdm
+
+
+# ---------------------------------------------------------------------
+# KNOWLEDGE SUBSET CLUSTERING
+# ---------------------------------------------------------------------
+class KnowledgeSubsets:
+    """
+    Clusters tokens into coarse 'knowledge subsets' using VSA cosine similarity.
+    Used to softly boost tokens from clusters that are active in the current context.
+    """
+    def __init__(self, n_clusters=8, cluster_size=50):
+        self.n_clusters = n_clusters
+        self.cluster_size = cluster_size
+        self.clusters = {}           # cluster_id -> set(tokens)
+        self.token_to_cluster = {}   # tok -> cluster_id
+        self.cluster_centers = {}    # cluster_id -> representative token
+
+    def build_clusters(self, vocab, vsa):
+        if not vocab:
+            return
+
+        vecs = {tok: vsa.vec(tok) for tok in vocab}
+        clusters = defaultdict(list)
+        centers = list(vocab)[:self.n_clusters]
+        self.cluster_centers = {i: tok for i, tok in enumerate(centers)}
+
+        for _ in range(3):
+            clusters.clear()
+            self.token_to_cluster.clear()
+
+            for tok in vocab:
+                best_cid, best_sim = 0, -1.0
+                v = vecs[tok]
+                for cid in range(self.n_clusters):
+                    c_tok = self.cluster_centers[cid]
+                    sim = float(np.dot(v, vecs[c_tok]))
+                    if sim > best_sim:
+                        best_sim, best_cid = sim, cid
+                clusters[best_cid].append(tok)
+                self.token_to_cluster[tok] = best_cid
+
+            for cid in range(self.n_clusters):
+                toks = clusters[cid]
+                if not toks:
+                    continue
+                best_center, best_avg = toks[0], -1.0
+                for cand in toks:
+                    cv = vecs[cand]
+                    sims = [float(np.dot(cv, vecs[o])) for o in toks if o != cand]
+                    avg_sim = np.mean(sims) if sims else -1.0
+                    if avg_sim > best_avg:
+                        best_avg, best_center = avg_sim, cand
+                self.cluster_centers[cid] = best_center
+
+        self.clusters = {cid: set(toks[:self.cluster_size]) for cid, toks in clusters.items() if toks}
+        print(f"✓ Built {len(self.clusters)} knowledge clusters")
+
+
+    def get_context_clusters(self, ctx):
+        if not ctx:
+            return set()
+        active = set()
+        for tok in ctx[-80:]:
+            cid = self.token_to_cluster.get(tok)
+            if cid is not None:
+                active.add(cid)
+        return active
+
+    def boost_cluster_neighbors(self, probs: dict, active_clusters: set, boost_strength=0.4) -> dict:
+        if not active_clusters or not probs:
+            return probs
+
+        boosted = dict(probs)
+        cluster_bonus = {}
+
+        for cid in active_clusters:
+            cluster_toks = self.clusters.get(cid, set())
+            if not cluster_toks:
+                cluster_bonus[cid] = 0.0
+                continue
+            bonus = sum(probs.get(tok, 0.0) for tok in cluster_toks)
+            cluster_bonus[cid] = bonus / len(cluster_toks)
+
+        for tok, p in probs.items():
+            cid = self.token_to_cluster.get(tok)
+            if cid in active_clusters:
+                bonus = cluster_bonus.get(cid, 0.0)
+                factor = 1.0 + boost_strength * bonus
+                boosted[tok] = p * factor
+
+        Z = sum(boosted.values())
+        if Z <= 0:
+            return probs
+        return {k: v / Z for k, v in boosted.items()}
+
+
+# ---------------------------------------------------------------------
+# UNKNOWN CONTEXT PAIR CLUSTERER (user-defined)
+# ---------------------------------------------------------------------
+class UnknownContextClusterer:
+    """
+    Tracks rare/unknown bigrams and allows user-defined clustering of them.
+    During generation, boosts continuations that belong to active unknown clusters.
+    """
+    def __init__(self, min_count=3):
+        self.min_count = min_count
+        self.pair_counts = Counter()          # (prev_tok, tok) -> count
+        self.user_clusters = {}               # cluster_id -> set((prev_tok, tok))
+        self.pair_to_cluster = {}             # (prev_tok, tok) -> cluster_id
+        self.next_cluster_id = 0
+
+    def observe_pair(self, prev_tok, tok, known: bool):
+        if not known and prev_tok is not None and tok is not None:
+            self.pair_counts[(prev_tok, tok)] += 1
+
+    def get_unknown_pairs(self, threshold=None):
+        if threshold is None:
+            threshold = self.min_count
+        return [
+            pair for pair, c in self.pair_counts.items()
+            if c >= threshold and pair not in self.pair_to_cluster
+        ]
+
+    def create_cluster(self, pairs):
+        cid = self.next_cluster_id
+        self.next_cluster_id += 1
+        self.user_clusters[cid] = set(pairs)
+        for p in pairs:
+            self.pair_to_cluster[p] = cid
+        return cid
+
+    def active_cluster_boost(self, probs: dict, ctx) -> dict:
+        if not probs or len(ctx) < 1:
+            return probs
+
+        prev_tok = ctx[-1]
+        boosted = dict(probs)
+        active_cids = set()
+        for tok in probs.keys():
+            pair = (prev_tok, tok)
+            cid = self.pair_to_cluster.get(pair)
+            if cid is not None:
+                active_cids.add(cid)
+
+        if not active_cids:
+            return probs
+
+        cluster_activation = {cid: 0.0 for cid in active_cids}
+        for pair, cid in self.pair_to_cluster.items():
+            if cid not in active_cids:
+                continue
+            ptok, ntok = pair
+            if ptok == prev_tok and ntok in probs:
+                cluster_activation[cid] += probs[ntok]
+
+        max_act = max(cluster_activation.values()) if cluster_activation else 0.0
+        if max_act <= 0:
+            return probs
+
+        base_strength = 0.3
+        for tok, p in probs.items():
+            pair = (prev_tok, tok)
+            cid = self.pair_to_cluster.get(pair)
+            if cid in active_cids:
+                act = cluster_activation.get(cid, 0.0) / max_act
+                factor = 1.0 + base_strength * act
+                boosted[tok] = p * factor
+
+        Z = sum(boosted.values())
+        if Z <= 0:
+            return probs
+        return {k: v / Z for k, v in boosted.items()}
+
+
+# ---------------------------------------------------------------------
+# DOME SPIRAL PROBABILITY MODULATION
+# ---------------------------------------------------------------------
+class DomeSpiral:
+    """
+    Dome + spiral geometry that imposes rotating interference structure over the probability simplex.
+    """
+    def __init__(self, n_spirals=70, dome_height=2.0, decay=0.15):
+        self.n_spirals = n_spirals
+        self.dome_height = dome_height
+        self.decay = decay
+        self.token_angles = {}
+        self.spiral_phase = 0.0
+
+    def assign_angle(self, tok: str) -> float:
+        if tok not in self.token_angles:
+            h = (hash(tok) & 0xFFFFFFFF) / 0xFFFFFFFF
+            self.token_angles[tok] = h * 2 * np.pi
+        return self.token_angles[tok]
+
+    def dome_z(self, r: float) -> float:
+        return self.dome_height * (1 - r**2)
+
+    def spiral_weight(self, theta: float, r: float, spiral_idx: int) -> float:
+        spiral_base = 2 * np.pi * spiral_idx / self.n_spirals
+        spiral_theta = spiral_base + 3.0 * r + self.spiral_phase
+        delta = np.arctan2(np.sin(theta - spiral_theta), np.cos(theta - spiral_theta))
+        sigma2 = 0.32
+        weight = np.exp(-delta**2 / sigma2)
+        weight *= (0.5 + 0.5 * self.dome_z(r) / self.dome_height)
+        return weight
+
+    def compute_spiral_weights(self, probs: dict, ctx_len: int) -> dict:
+        if not probs:
+            return {}
+        self.spiral_phase = (ctx_len * 0.8) % (2 * np.pi)
+        sorted_toks = sorted(probs.items(), key=lambda x: -x[1])
+        n = len(sorted_toks)
+        weights = {}
+        for rank, (tok, p) in enumerate(sorted_toks):
+            r = (rank + 1) / (n + 1)
+            theta = self.assign_angle(tok)
+            spiral_sum = 0.0
+            for si in range(self.n_spirals):
+                spiral_sum += self.spiral_weight(theta, r, si)
+            weights[tok] = (spiral_sum / self.n_spirals) * (self.decay ** r)
+        return weights
+
+    def modulate_probs(self, probs: dict, ctx_len: int, blend: float = 0.3) -> dict:
+        if not probs:
+            return {}
+        spiral_w = self.compute_spiral_weights(probs, ctx_len)
+        sw_total = sum(spiral_w.values())
+        if sw_total > 0:
+            spiral_w = {k: v / sw_total for k, v in spiral_w.items()}
+        result = {tok: (1 - blend) * p + blend * spiral_w.get(tok, 0.0)
+                  for tok, p in probs.items()}
+        Z = sum(result.values())
+        if Z <= 0:
+            return probs
+        return {k: v / Z for k, v in result.items()}
+
+
+# ---------------------------------------------------------------------
+# STOCHASTIC CARDINAL ORDERING (SCO)
+# ---------------------------------------------------------------------
+class StochasticCardinalOrder:
+    def __init__(self, inversion_strength=1.7, noise_scale=0.05):
+        self.inv_str = inversion_strength
+        self.noise_scale = noise_scale
+        self.attribution_history = deque(maxlen=500)
+        self.cardinal_memory = {}
+
+    def cardinal_rank(self, probs: dict) -> dict:
+        sorted_items = sorted(probs.items(), key=lambda x: -x[1])
+        return {
+            tok: {
+                "original_prob": p,
+                "cardinal": i + 1,
+                "inverted_weight": (i + 1) ** self.inv_str,
+            }
+            for i, (tok, p) in enumerate(sorted_items)
+        }
+
+    def stochastic_perturb(self, ranks: dict) -> dict:
+        perturbed = {}
+        for tok, data in ranks.items():
+            g = -np.log(-np.log(np.random.uniform(0.001, 0.999)))
+            perturbed[tok] = data["inverted_weight"] * (1 + self.noise_scale * g)
+        return perturbed
+
+    def attribution_transform(self, probs: dict, ctx_attribution: float = 0.5) -> dict:
+        if not probs:
+            return {}
+        ranks = self.cardinal_rank(probs)
+        perturbed = self.stochastic_perturb(ranks)
+        inv_factor = 0.3 + 0.7 * ctx_attribution
+        pert_sum = sum(perturbed.values()) or 1.0
+
+        final_scores = {}
+        for tok, pert_weight in perturbed.items():
+            orig_p = ranks[tok]["original_prob"]
+            blended = (1 - inv_factor) * orig_p + inv_factor * (pert_weight / pert_sum)
+            final_scores[tok] = blended
+            self.cardinal_memory[tok] = self.cardinal_memory.get(tok, 0) + ranks[tok]["cardinal"]
+
+        Z = sum(final_scores.values())
+        if Z <= 0:
+            return probs
+        return {k: v / Z for k, v in final_scores.items()}
+
+    def get_context_attribution(self, ctx: tuple) -> float:
+        if not self.attribution_history:
+            return 0.5
+        matches = sum(1 for h in self.attribution_history if h.get("ctx") == ctx)
+        return 1 - np.exp(-matches / 10.0)
+
+    def record_attribution(self, ctx: tuple, chosen_tok: str, final_prob: float):
+        self.attribution_history.append(
+            {
+                "ctx": ctx,
+                "tok": chosen_tok,
+                "prob": final_prob,
+                "cardinal": self.cardinal_memory.get(chosen_tok, 0),
+            }
+        )
+
+
+# ---------------------------------------------------------------------
+# ACTIVE MEMORY
+# ---------------------------------------------------------------------
+class MemoryType(Enum):
+    DATAPOINT = "raw"
+    RULE = "rule"
+
+
+@dataclass
+class MemoryNode:
+    id: str
+    type: MemoryType
+    content: dict
+
+
+class ActiveMemory:
+    def __init__(self):
+        self.nodes = {}
+        self.dp_count = 0
+        self.rule_count = 0
+        self.rules = defaultdict(set)
+
+    def record(self, ctx, tok, p, state, step):
+        nid = f"dp{self.dp_count}"
+        self.dp_count += 1
+        self.nodes[nid] = MemoryNode(
+            nid, MemoryType.DATAPOINT, {"ctx": ctx, "tok": tok, "p": p}
+        )
+        if p < 0.45:
+            sig = ("low", ctx)
+            if sig not in self.nodes:
+                self.nodes[sig] = set()
+            self.nodes[sig].add(nid)
+            if len(self.nodes[sig]) >= 3:
+                rid = f"r{self.rule_count}_lowboost"
+                self.rule_count += 1
+                self.rules["lowboost"].add(rid)
+                self.nodes[rid] = MemoryNode(
+                    rid, MemoryType.RULE, {"sig": sig}
+                )
+
+    def infer_boost(self, ctx, minp):
+        return len(self.rules["lowboost"]) > 0 and minp < 0.45
+
+
+# ---------------------------------------------------------------------
+# VSA
+# ---------------------------------------------------------------------
+class VSA:
+    def __init__(self, d=512):
+        self.d = d
+        self.book = {}
+
+    def vec(self, sym):
+        if sym not in self.book:
+            th = np.random.uniform(0, 2 * np.pi, self.d // 2)
+            v = np.hstack([np.cos(th), np.sin(th)])
+            self.book[sym] = v / (np.linalg.norm(v) + 1e-8)
+        return self.book[sym]
+
+
+# ---------------------------------------------------------------------
+# CONCENTRIC ENCODER (full pipeline)
+# ---------------------------------------------------------------------
+def batch_proc(batch):
+    uni = Counter()
+    rings = [defaultdict(Counter) for _ in range(5)]
+    for seq in batch:
+        for i, t in enumerate(seq):
+            uni[t] += 1
+            if i > 0:
+                pr = seq[i - 1]
+                pa = (i % 360) * np.pi / 3000.0
+                for r in range(5):
+                    rings[r][pr][t] += 1 + 0.4 * np.cos(2 * np.pi * r / 5 - pa)
+    return uni, rings
+
+
+class ConcEnc:
+    def __init__(self):
+        self.rings = [defaultdict(Counter) for _ in range(5)]
+        self.uni = Counter()
+        self.lpstate = defaultdict(lambda: {"act": False, "cnt": 0})
+        self.sco = StochasticCardinalOrder(inversion_strength=10.65, noise_scale=0.12)
+        self.dome = DomeSpiral(n_spirals=70, dome_height=12.0, decay=0.15)
+        self.ctx_index = {}
+        self.ctx_index_norm = {}
+        self.knowledge = KnowledgeSubsets(n_clusters=81, cluster_size=50000)
+        self.unknown_ctx = UnknownContextClusterer(min_count=3)
+
+        # permutation activation hyperparams
+        self.perm_K = 5
+        self.perm_noise = 0.12
+
+    def train(self, corp, vsa):
+        # Phase 1: rings
+        batches = [corp[i : i + 4000] for i in range(0, len(corp), 4000)]
+        with ProcessPoolExecutor(2) as ex:
+            res = list(
+                tqdm(
+                    ex.map(batch_proc, batches),
+                    total=len(batches),
+                    desc="Training rings",
+                )
+            )
+        for u, rs in res:
+            self.uni.update(u)
+            for ri, rdata in enumerate(rs):
+                for pr, ts in rdata.items():
+                    self.rings[ri][pr].update(ts)
+
+        # Phase 2: self-context index
+        print("Building self-context index...")
+        ctx_idx = defaultdict(Counter)
+        for seq in tqdm(corp, desc="Context indexing"):
+            L = len(seq)
+            for i, tok in enumerate(seq):
+                for j in range(max(0, i - 8), min(L, i + 9)):
+                    if j == i:
+                        continue
+                    ctx_idx[tok][seq[j]] += 1
+        self.ctx_index = dict(ctx_idx)
+        self.ctx_index_norm = {}
+        for tok, ctr in ctx_idx.items():
+            tot = sum(ctr.values())
+            self.ctx_index_norm[tok] = {k: v / tot for k, v in ctr.items()} if tot > 0 else {}
+        print(f"✓ Indexed {len(self.ctx_index_norm)} tokens' contexts")
+
+        # Phase 3: knowledge subsets
+        vocab = list(self.uni.keys())
+        self.knowledge.build_clusters(vocab, vsa)
+
+    def is_known_pair(self, prev_tok, next_tok):
+        for ring in self.rings:
+            if prev_tok in ring and next_tok in ring[prev_tok]:
+                return True
+        return False
+
+    def current_context_signature(self, ctx, window=32):
+        if not ctx:
+            return Counter()
+        sig = Counter(ctx[-window:])
+        tot = sum(sig.values())
+        if tot > 0:
+            for k in sig:
+                sig[k] /= tot
+        return sig
+
+    def self_context_boost(self, base_probs: dict, ctx):
+        if not base_probs:
+            return base_probs
+        cur_sig_ctr = self.current_context_signature(ctx)
+        if not cur_sig_ctr:
+            return base_probs
+        cur_sig = dict(cur_sig_ctr)
+
+        scores = {}
+        for tok, p in base_probs.items():
+            neigh = self.ctx_index_norm.get(tok)
+            if not neigh:
+                scores[tok] = 0.0
+                continue
+            s = 0.0
+            for w, nw in neigh.items():
+                cw = cur_sig.get(w)
+                if cw is not None:
+                    s += cw * nw
+            scores[tok] = s
+
+        max_s = max(scores.values()) if scores else 0.0
+        if max_s <= 0:
+            return base_probs
+
+        boosted = {}
+        for tok, p in base_probs.items():
+            factor = 1.0 + 0.6 * (scores[tok] / max_s)
+            boosted[tok] = p * factor
+
+        Z = sum(boosted.values())
+        if Z <= 0:
+            return base_probs
+        return {k: v / Z for k, v in boosted.items()}
+
+    def probs_raw(self, ctx):
+        if not ctx:
+            t = sum(self.uni.values())
+            return {w: c / t for w, c in self.uni.items()} if t else {}
+        last = ctx[-1]
+        ag = Counter()
+        for ri, ring in enumerate(self.rings):
+            if last in ring:
+                row = ring[last]
+                tt = sum(row.values())
+                if tt <= 0:
+                    continue
+                for nt, c in row.items():
+                    ag[nt] += (c / tt) * (1 + ri / 5.0)
+        tt = sum(ag.values())
+        return {k: v / tt for k, v in ag.items()} if tt else self.probs_raw([])
+
+    # -----------------------------------------------------------------
+    # PERMUTATION ACTIVATION GENERATION
+    # -----------------------------------------------------------------
+     # -----------------------------------------------------------------
+    # PERMUTATION ACTIVATION GENERATION (FREQ-BASED)
+    # -----------------------------------------------------------------
+    def perm_activation(self, probs: dict) -> dict:
+        """
+        Frequency-based permutation activations:
+        - treat probs as a freq vector
+        - apply K random monotone transforms in prob-space (no index shuffle)
+        - each transform acts like a 'permutation' over the simplex geometry
+        - average them and renormalize
+        """
+        if not probs:
+            return probs
+
+        tokens = list(probs.keys())
+        base = np.array([probs[t] for t in tokens], dtype=np.float64)
+        base = np.maximum(base, 1e-12)
+        base /= base.sum()
+
+        def one_pass(p):
+            # random temperature in [0.7, 1.3]
+            temp = np.exp(np.random.uniform(np.log(0.7), np.log(1.3)))
+            # random exponent in [0.7, 1.4]
+            alpha = np.random.uniform(0.7, 1.4)
+
+            # Gumbel noise in log-space, scaled by perm_noise
+            g = -np.log(-np.log(np.random.uniform(0.001, 0.999, size=p.shape)))
+            logp = np.log(p) / temp + self.perm_noise * g
+
+            # monotone power transform in prob-space
+            p_tilde = np.exp(logp - logp.max())
+            p_tilde = p_tilde ** alpha
+
+            Z = p_tilde.sum()
+            if Z <= 0:
+                return p
+            return p_tilde / Z
+
+        acc = np.zeros_like(base)
+        for _ in range(self.perm_K):
+            acc += one_pass(base)
+
+        acc /= max(1, self.perm_K)
+        Z = acc.sum()
+        if Z <= 0:
+            return probs
+        acc /= Z
+        return {tok: float(p) for tok, p in zip(tokens, acc)}
+
+    def probs(self, ctx):
+        raw = self.probs_raw(ctx)
+        if not raw:
+            return raw
+
+        perm_probs = self.perm_activation(raw)
+        spiral_probs = self.dome.modulate_probs(perm_probs, len(ctx), blend=0.25)
+        active_clusters = self.knowledge.get_context_clusters(ctx)
+        knowledge_probs = self.knowledge.boost_cluster_neighbors(
+            spiral_probs, active_clusters, boost_strength=0.4
+        )
+        sc_probs = self.self_context_boost(knowledge_probs, ctx)
+        uctx_probs = self.unknown_ctx.active_cluster_boost(sc_probs, ctx)
+        ctx_tuple = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
+        attr = self.sco.get_context_attribution(ctx_tuple)
+        return self.sco.attribution_transform(uctx_probs, attr)
+
+    def lp_bias(self, pr, ctx, st, sp):
+        stt = self.lpstate[ctx]
+        if sp < 0.42 and not stt["act"]:
+            stt["act"], stt["cnt"] = True, 0
+        elif stt["act"] and stt["cnt"] < 150:
+            pr[st] = pr.get(st, 0.0) * 10
+            stt["cnt"] += 1
+        elif stt["cnt"] >= 150:
+            stt["act"] = False
+        tt = sum(pr.values())
+        return {k: v / tt for k, v in pr.items()} if tt else pr
+
+
+# ---------------------------------------------------------------------
+# GENERATOR
+# ---------------------------------------------------------------------
+class ConcGen:
+    def __init__(self):
+        self.vsa = VSA()
+        self.enc = ConcEnc()
+        self.mem = ActiveMemory()
+        self.steps = 0
+
+    def fit(self, file):
+        with open(file, encoding="UTF-8") as f:
+            txt = f.read()[:KB_len]
+        snts = [s.split() for s in txt.split(".") if s.strip()]
+
+        # Pre-build VSA for vocab so clustering uses same vectors
+        for s in snts:
+            for t in s:
+                if len(t) % 4 == 0:
+                    continue
+                else:
+                    self.vsa.vec(t)
+        self.enc.train(snts, self.vsa)
+        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx + PermActs)")
+
+    def gen(self, seed, n=600, t=0.95, show_progress=False, stream=True):
+        ctx = list(seed)
+        res = []
+
+        iterator = range(n)
+
+        for step in iterator:
+            ckey = tuple(ctx[-1:]) if len(ctx) >= 2 else tuple(ctx)
+            ps = self.enc.probs(ctx)
+            if not ps:
+                print(f"\n[!] Stopped at step {step}: no continuations")
+                break
+
+            if self.mem.infer_boost(ckey, min(ps.values())):
+                ps = {k: v * 1.3 for k, v in ps.items()}
+                Zb = sum(ps.values())
+                if Zb > 0:
+                    ps = {k: v / Zb for k, v in ps.items()}
+
+            pv = np.log(np.array(list(ps.values())) + 1e-10) / t
+            pv = np.exp(pv - np.max(pv))
+            pv /= pv.sum()
+
+            keys = list(ps.keys())
+            nt = np.random.choice(keys, p=pv)
+            sp = ps[nt]
+
+            # unknown-context observation
+            prev_tok_for_pair = ctx[-1] if ctx else None
+            if prev_tok_for_pair is not None:
+                known = self.enc.is_known_pair(prev_tok_for_pair, nt)
+                self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
+
+            self.enc.sco.record_attribution(ckey, nt, sp)
+            self.mem.record(ckey, nt, sp, self.enc.lpstate[ckey], self.steps)
+            ps = self.enc.lp_bias(ps, ckey, nt, sp)
+
+            res.append(nt)
+            if stream:
+                print(nt, end=" ", flush=True)
+            ctx.append(nt)
+            self.steps += 1
+
+        if stream:
+            print()
+        return res
+
+
+# ---------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    mp.set_start_method("spawn")
+    g = ConcGen()
+    fn = input("Corpus file: ")
+    g.fit(fn)
+    while True:
+        cmd = input("USER: ").strip()
+
+        # treat command as seed string
+        sd = cmd.split()
+        out = g.gen(sd, stream=True)
+        print(f"STATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
+        print(
+            f"SCO: {len(g.enc.sco.cardinal_memory)} tokens, "
+            f"{len(g.enc.sco.attribution_history)} attrs"
+        )
+        print(
+            f"DOME: {len(g.enc.dome.token_angles)} mapped, "
+            f"phase={g.enc.dome.spiral_phase:.3f}"
+        )
+        print(f"CTX: {len(g.enc.ctx_index_norm)} tokens indexed")
+        print(f"KNOWLEDGE: {len(g.enc.knowledge.clusters)} clusters")
+        print(f"UNKNOWN CTX CLUSTERS: {len(g.enc.unknown_ctx.user_clusters)}")
