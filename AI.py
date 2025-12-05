@@ -1,7 +1,7 @@
 # =====================================================================
 # COUNTER-INTUITIVE STOCHASTIC CARDINAL ORDERING ON ATTRIBUTION
 # =====================================================================
-
+KB_len = 99999
 import numpy as np
 from collections import defaultdict, Counter, deque
 from dataclasses import dataclass
@@ -273,7 +273,7 @@ class ConcGen:
 
     def fit(self, file):
         with open(file, encoding="UTF-8") as f:
-            txt = f.read()
+            txt = f.read()[:KB_len]
         snts = [s.split() for s in txt.split('.') if s.strip()]
         self.enc.train(snts)
         for s in snts:
@@ -381,3 +381,4 @@ if __name__ == "__main__":
         print(f"STATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
         print(f"SCO: {len(g.enc.sco.cardinal_memory)} tokens tracked, "
               f"{len(g.enc.sco.attribution_history)} attributions")
+
