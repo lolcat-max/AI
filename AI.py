@@ -477,28 +477,11 @@ class ConcGen:
     def gen(self, seed, n=600, t=0.95, show_progress=True):
         ctx = list(seed)
         res = []
-        iterator = (
-            tqdm(
-                range(n),
-                desc="Generating",
-                unit="tok",
-                ncols=100,
-                bar_format=(
-                    "{l_bar}{bar}| {n_fmt}/{total_fmt} tok "
-                    "[{elapsed}<{remaining}, {rate_fmt}]"
-                ),
-                dynamic_ncols=True,
-            )
-            if show_progress
-            else range(n)
-        )
-
-        for step in iterator:
+        
+        for step in range(n):
             ckey = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
             ps = self.enc.probs(ctx)
             if not ps:
-                if show_progress:
-                    iterator.close()
                 print(f"\n[!] Stopped at step {step}: no continuations")
                 break
 
@@ -521,17 +504,11 @@ class ConcGen:
             ps = self.enc.lp_bias(ps, ckey, nt, sp)
 
             res.append(nt)
+            print(nt, end=" ", flush=True)
             ctx.append(nt)
             self.steps += 1
 
-            if show_progress:
-                iterator.set_postfix(
-                    tok=nt[:10],
-                    p=f"{sp:.3f}",
-                    clusters=len(self.enc.knowledge.get_context_clusters(ctx)),
-                    attr=len(self.enc.sco.attribution_history),
-                )
-
+            
         if show_progress:
             print(f"\n[✓] Generated {len(res)} tokens")
         return res
@@ -545,7 +522,7 @@ if __name__ == "__main__":
     while True:
         sd = input("Seed: ").split()
         out = g.gen(sd)
-        print("OUT:", " ".join(out))
+       
         print(f"STATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
         print(
             f"SCO: {len(g.enc.sco.cardinal_memory)} tokens, "
