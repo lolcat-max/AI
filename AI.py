@@ -403,7 +403,7 @@ class ConcEnc:
         self.ctx_index_norm = {}
         self.knowledge = KnowledgeSubsets(n_clusters=81, cluster_size=50000)
         self.unknown_ctx = UnknownContextClusterer(min_count=3)
-        self.intent_alpha = 0.55   # how hard intent steers the probs
+        self.intent_alpha = 10.55   # how hard intent steers the probs
         self.intent_temp  = 1.0    # temperature on intent scores
         # permutation activation hyperparams
         self.perm_K = 5
