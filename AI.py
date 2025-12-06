@@ -1,11 +1,12 @@
 """
-fourd_muscle.py (FIXED)
+fourd_muscle_complete.py
 
-Convert the ConcGen pipeline into a '4D muscle' module:
-- internal embeddings / activations are 4D tensors (C, X, Y, Z)
-- algorithmic building blocks adapted to 4D
-- retains ZeroKernelProjector, DomeSpiral, KnowledgeSubsets, SCO, etc.
-- multiprocessing for fast dataset processing
+Complete 4D muscle with:
+- Dict-compatible diagram processing
+- Unified operation patterns (math + grammar)
+- Trivector association prelimination
+- Numeric Euclidean space
+- All pipeline components integrated
 """
 KB_len = 999
 LEN = 999
@@ -14,146 +15,10 @@ from collections import defaultdict, Counter, deque
 from dataclasses import dataclass
 from enum import Enum
 import random
-from multiprocessing import Pool, cpu_count
-from functools import partial
 
 # ------------------------
-# Multiprocessing helpers
+# Utilities
 # ------------------------
-def process_sequence_unigrams(seq):
-    """Process a single sequence for unigram counts"""
-    return Counter(seq)
-
-def process_sequence_rings(args):
-    """Process a single sequence for ring transitions"""
-    seq, n_rings = args
-    rings = [defaultdict(Counter) for _ in range(n_rings)]
-    for i in range(1, len(seq)):
-        prev = seq[i-1]
-        curr = seq[i]
-        for r in range(n_rings):
-            rings[r][prev][curr] += 1 + 0.2 * np.cos(2*np.pi*r/n_rings)
-    return rings
-
-def process_sequence_context(seq):
-    """Process a single sequence for context index"""
-    ctx_idx = defaultdict(Counter)
-    L = len(seq)
-    for i, t in enumerate(seq):
-        for j in range(max(0, i-6), min(L, i+7)):
-            if j == i:
-                continue
-            ctx_idx[t][seq[j]] += 1
-    return dict(ctx_idx)
-
-def merge_counters(counter_list):
-    """Merge a list of Counters into one"""
-    result = Counter()
-    for c in counter_list:
-        result.update(c)
-    return result
-
-def merge_ring_dicts(ring_list):
-    """Merge ring dictionaries from multiple processes"""
-    n_rings = len(ring_list[0])
-    merged = [defaultdict(Counter) for _ in range(n_rings)]
-    for rings in ring_list:
-        for r in range(n_rings):
-            for prev, counts in rings[r].items():
-                merged[r][prev].update(counts)
-    return merged
-
-def merge_context_dicts(ctx_list):
-    """Merge context index dictionaries"""
-    merged = defaultdict(Counter)
-    for ctx_dict in ctx_list:
-        for tok, counts in ctx_dict.items():
-            merged[tok].update(counts)
-    return dict(merged)
-
-def generate_single_sequence(args):
-    """
-    Generate a single sequence (for multiprocessing).
-    Returns the generated token sequence.
-    """
-    muscle_data, initial_ctx, max_len, temperature, seed = args
-    
-    # Set seed for this worker
-    np.random.seed(seed)
-    random.seed(seed)
-    
-    # Reconstruct muscle object (lightweight reconstruction)
-    muscle = FourDMuscle(vsa_shape=muscle_data['vsa_shape'])
-    muscle.uni = muscle_data['uni']
-    muscle.rings = muscle_data['rings']
-    muscle.ctx_index = muscle_data['ctx_index']
-    muscle.ctx_index_norm = muscle_data['ctx_index_norm']
-    muscle.vsa.book = muscle_data['vsa_book']
-    muscle.knowledge.clusters = muscle_data['knowledge_clusters']
-    muscle.knowledge.token_to_cluster = muscle_data['knowledge_token_to_cluster']
-    muscle.knowledge.cluster_centers = muscle_data['knowledge_cluster_centers']
-    muscle.kernel.mean = muscle_data['kernel_mean']
-    muscle.kernel.U_data = muscle_data['kernel_U_data']
-    muscle.kernel.U_kernel = muscle_data['kernel_U_kernel']
-    
-    # Generate sequence
-    ctx = list(initial_ctx)
-    out = []
-    for _ in range(max_len):
-        tok = muscle.sample(ctx, temperature=temperature)
-        if tok is None:
-            break
-        out.append(tok)
-        ctx.append(tok)
-    
-    return out
-
-def compute_token_similarities(args):
-    """
-    Compute similarities between a token and all vocabulary tokens.
-    Used for parallel clustering in KnowledgeSubsets.
-    """
-    tok, vocab, vecs = args
-    v = vecs[tok]
-    similarities = {}
-    for other_tok in vocab:
-        if tok != other_tok:
-            similarities[other_tok] = float(np.dot(v, vecs[other_tok]))
-    return tok, similarities
-
-def assign_tokens_to_clusters(args):
-    """
-    Assign a batch of tokens to their nearest cluster.
-    """
-    tokens, cluster_centers, vecs = args
-    assignments = {}
-    for tok in tokens:
-        v = vecs[tok]
-        best_cluster, best_sim = 0, -1.0
-        for cid, c_tok in cluster_centers.items():
-            sim = float(np.dot(v, vecs[c_tok]))
-            if sim > best_sim:
-                best_sim, best_cluster = sim, cid
-        assignments[tok] = best_cluster
-    return assignments
-
-def find_best_center_for_cluster(args):
-    """
-    Find the best center token for a cluster (token with highest avg similarity).
-    """
-    cluster_tokens, vecs = args
-    if not cluster_tokens:
-        return None
-    
-    best_center, best_avg = cluster_tokens[0], -1.0
-    for cand in cluster_tokens:
-        cv = vecs[cand]
-        sims = [float(np.dot(cv, vecs[other])) for other in cluster_tokens if other != cand]
-        avg = np.mean(sims) if sims else -1.0
-        if avg > best_avg:
-            best_avg, best_center = avg, cand
-    
-    return best_center
 def flatten4(t):
     """Flatten a 4D activation (C,X,Y,Z) to 1D vector"""
     return t.reshape(-1)
@@ -167,231 +32,254 @@ def l2norm(v, eps=1e-12):
     return v / max(n, eps)
 
 # ------------------------
-# Numeric Euclidean Space
+# TRIVECTOR ASSOCIATION PRELIMINATION
 # ------------------------
-class NumericEuclideanSpace:
+class TrivectorAssociation:
     """
-    Separate Euclidean space for processing numeric tokens with logic operations.
-    Numbers are embedded in a different geometric space than text tokens.
+    Preliminary association filter using trivector (3-way) binding.
+    Encodes complex relationships between token triples in VSA space.
     """
-    def __init__(self, dim=64):
-        self.dim = dim
-        self.numeric_cache = {}
-        self.logic_operators = {
-            'add': lambda x, y: x + y,
-            'sub': lambda x, y: x - y,
-            'mul': lambda x, y: x * y,
-            'div': lambda x, y: x / (y + 1e-12),
-            'mod': lambda x, y: x % (y + 1e-12),
-            'pow': lambda x, y: np.power(x, np.clip(y, -10, 10)),
-            'max': lambda x, y: np.maximum(x, y),
-            'min': lambda x, y: np.minimum(x, y),
+    
+    def __init__(self, vsa_dim=1024):
+        self.vsa_dim = vsa_dim
+        self.trivector_cache = {}
+        self.association_history = deque(maxlen=1000)
+        self.binding_strength = {}
+        
+        # Trivector binding operators
+        self.binding_ops = {
+            'circular': self._circular_bind,
+            'cascade': self._cascade_bind,
+            'holographic': self._holographic_bind,
+            'geometric': self._geometric_bind,
         }
-        # Map dataset words to operations
-        self.word_to_operation = {}
-        self.operation_patterns = {
-            'add': ['plus', 'add', 'sum', 'total', 'and', 'more', 'increase', 'combined'],
-            'sub': ['minus', 'subtract', 'less', 'decrease', 'remove', 'take', 'without'],
-            'mul': ['times', 'multiply', 'product', 'double', 'triple', 'each'],
-            'div': ['divide', 'split', 'per', 'each', 'ratio', 'half', 'quarter'],
-            'mod': ['remainder', 'modulo', 'mod', 'leftover', 'rest'],
-            'pow': ['power', 'squared', 'cubed', 'exponent', 'exponential'],
-            'max': ['maximum', 'max', 'largest', 'biggest', 'most', 'greater'],
-            'min': ['minimum', 'min', 'smallest', 'least', 'fewer', 'lower'],
-        }
+        
+    def _circular_bind(self, a, b, c):
+        """Circular convolution binding: (A ⊛ B) ⊛ C"""
+        ab = np.fft.ifft(np.fft.fft(a) * np.fft.fft(b)).real
+        abc = np.fft.ifft(np.fft.fft(ab) * np.fft.fft(c)).real
+        return l2norm(abc)
     
-    def assign_operations_to_vocab(self, vocab):
-        """
-        Assign operation functions to dataset words based on semantic patterns.
-        """
-        for word in vocab:
-            word_lower = word.lower()
-            # Check each operation pattern
-            for op, patterns in self.operation_patterns.items():
-                if any(pattern in word_lower for pattern in patterns):
-                    self.word_to_operation[word] = op
-                    break
-            
-            # If no pattern matched, assign based on word characteristics
-            if word not in self.word_to_operation:
-                # Hash-based assignment for diversity
-                h = hash(word) % len(self.logic_operators)
-                self.word_to_operation[word] = list(self.logic_operators.keys())[h]
+    def _cascade_bind(self, a, b, c):
+        """Cascade binding: A + (B ⊛ C)"""
+        bc = np.fft.ifft(np.fft.fft(b) * np.fft.fft(c)).real
+        abc = a + bc
+        return l2norm(abc)
     
-    def get_active_operation(self, context_words):
-        """
-        Determine which operation to activate based on dataset words in context.
-        """
-        # Count operation votes from context words
-        op_votes = defaultdict(float)
-        
-        for word in context_words:
-            if word in self.word_to_operation:
-                op = self.word_to_operation[word]
-                # Weight recent words more heavily
-                op_votes[op] += 1.0
-        
-        if not op_votes:
-            return 'add'  # Default operation
-        
-        # Return operation with most votes
-        return max(op_votes.items(), key=lambda x: x[1])[0]
+    def _holographic_bind(self, a, b, c):
+        """Holographic reduced representation"""
+        fa = np.fft.fft(a)
+        fb = np.fft.fft(b)
+        fc = np.fft.fft(c)
+        result = fa * fb * fc
+        abc = np.fft.ifft(result).real
+        return l2norm(abc)
     
-    def get_operation_activation_strength(self, context_words):
-        """
-        Calculate how strongly operations are activated by context words.
-        Returns dict of operation -> strength
-        """
-        activation = defaultdict(float)
-        
-        for i, word in enumerate(context_words):
-            if word in self.word_to_operation:
-                op = self.word_to_operation[word]
-                # Decay for older words
-                position_weight = np.exp(-0.1 * (len(context_words) - i - 1))
-                activation[op] += position_weight
-        
-        # Normalize
-        total = sum(activation.values())
-        if total > 0:
-            activation = {k: v/total for k, v in activation.items()}
-        
-        return dict(activation)
-    
-    def is_numeric(self, tok):
-        """Check if token represents a number"""
-        try:
-            float(tok)
-            return True
-        except (ValueError, TypeError):
-            return False
-    
-    def numeric_embedding(self, tok):
-        """
-        Embed a numeric token in Euclidean space using multiple geometric projections.
-        Creates a rich representation across different mathematical spaces.
-        """
-        if tok in self.numeric_cache:
-            return self.numeric_cache[tok]
-        
-        try:
-            val = float(tok)
-        except (ValueError, TypeError):
-            # Non-numeric fallback: hash-based embedding
-            h = hash(tok) & 0xFFFFFFFF
-            emb = np.array([np.sin(h * i * 0.01) for i in range(self.dim)])
-            emb = l2norm(emb)
-            self.numeric_cache[tok] = emb
-            return emb
-        
-        # Handle special values
-        if not np.isfinite(val):
-            # Infinity or NaN - use special embedding
-            h = hash(str(tok)) & 0xFFFFFFFF
-            emb = np.array([np.cos(h * i * 0.01) for i in range(self.dim)])
-            emb = l2norm(emb)
-            self.numeric_cache[tok] = emb
-            return emb
-        
-        # Clip extreme values to prevent overflow
-        val = np.clip(val, -1e10, 1e10)
-        
-        # Multi-space numeric embedding
-        emb = np.zeros(self.dim)
-        
-        # 1. Linear space (raw magnitude encoding)
-        emb[0:8] = np.tanh(val * np.linspace(0.01, 1.0, 8))
-        
-        # 2. Logarithmic space (scale-invariant)
-        log_val = np.log1p(np.abs(val)) * np.sign(val)
-        emb[8:16] = np.tanh(log_val * np.linspace(0.1, 2.0, 8))
-        
-        # 3. Trigonometric space (periodic features)
-        emb[16:24] = np.sin(val * np.linspace(0.1, 10.0, 8))
-        emb[24:32] = np.cos(val * np.linspace(0.1, 10.0, 8))
-        
-        # 4. Fractional space (decimal structure)
-        try:
-            int_val = int(val)
-            frac = val - int_val
-        except (OverflowError, ValueError):
-            frac = 0.0
-        emb[32:40] = np.sin(frac * 2 * np.pi * np.arange(1, 9))
-        
-        # 5. Modular arithmetic spaces
-        for i, mod in enumerate([2, 3, 5, 7, 11, 13, 17, 19]):
-            try:
-                emb[40 + i] = np.sin(2 * np.pi * (val % mod) / mod)
-            except (OverflowError, ValueError):
-                emb[40 + i] = 0.0
-        
-        # 6. Sign and magnitude decomposition
-        emb[48:56] = np.sign(val) * np.exp(-np.abs(val) * np.linspace(0.01, 1.0, 8))
-        
-        # 7. Polynomial basis (with clipping to prevent overflow)
-        safe_val = np.clip(np.abs(val), 0.0, 1000.0)
-        emb[56:64] = np.array([safe_val**p for p in np.linspace(0.5, 2.0, 8)])
-        # Clip polynomial results
-        emb[56:64] = np.clip(emb[56:64], -1e6, 1e6)
-        
-        # Normalize
-        emb = l2norm(emb)
-        self.numeric_cache[tok] = emb
-        return emb
-    
-    def apply_logic(self, num_embeddings, operator='add'):
-        """
-        Apply logical/arithmetic operations between numeric embeddings.
-        Operates in the numeric Euclidean space.
-        """
-        if len(num_embeddings) < 2:
-            return num_embeddings[0] if num_embeddings else np.zeros(self.dim)
-        
-        op_func = self.logic_operators.get(operator, self.logic_operators['add'])
-        
-        # Pairwise operation reduction
-        result = num_embeddings[0].copy()
-        for emb in num_embeddings[1:]:
-            result = op_func(result, emb)
-            # Clip to prevent overflow accumulation
-            result = np.clip(result, -1e6, 1e6)
-        
-        # Handle any NaN or inf values
-        result = np.nan_to_num(result, nan=0.0, posinf=1.0, neginf=-1.0)
-        
+    def _geometric_bind(self, a, b, c):
+        """Geometric algebra binding via rotations"""
+        theta_b = np.sum(b) * 2 * np.pi
+        theta_c = np.sum(c) * 2 * np.pi
+        result = a.copy()
+        result = result * np.cos(theta_b) + np.roll(result, 1) * np.sin(theta_b)
+        result = result * np.cos(theta_c) + np.roll(result, 2) * np.sin(theta_c)
         return l2norm(result)
     
-    def merge_with_text_space(self, numeric_emb, text_emb, blend=0.5):
-        """
-        Project numeric embedding into text embedding space using learned manifold.
-        Creates a bridge between numeric and text Euclidean spaces.
-        """
-        # Ensure compatible dimensions
-        if len(numeric_emb) < len(text_emb):
-            # Expand numeric embedding
-            numeric_expanded = np.zeros_like(text_emb)
-            # Repeat and blend
-            repeats = len(text_emb) // len(numeric_emb) + 1
-            numeric_repeated = np.tile(numeric_emb, repeats)[:len(text_emb)]
-            numeric_expanded = numeric_repeated
-        elif len(numeric_emb) > len(text_emb):
-            # Compress numeric embedding using average pooling
-            pool_size = len(numeric_emb) // len(text_emb)
-            numeric_expanded = np.zeros_like(text_emb)
-            for i in range(len(text_emb)):
-                start = i * pool_size
-                end = min(start + pool_size, len(numeric_emb))
-                numeric_expanded[i] = np.mean(numeric_emb[start:end])
+    def preliminate(self, token_triple, vsa4d, method='circular'):
+        """Preliminary association scoring for token triple."""
+        tok_a, tok_b, tok_c = token_triple
+        cache_key = (tok_a, tok_b, tok_c, method)
+        if cache_key in self.trivector_cache:
+            return self.trivector_cache[cache_key]
+        
+        vec_a = vsa4d.vec_flat(tok_a)
+        vec_b = vsa4d.vec_flat(tok_b)
+        vec_c = vsa4d.vec_flat(tok_c)
+        
+        bind_func = self.binding_ops.get(method, self._circular_bind)
+        trivector = bind_func(vec_a, vec_b, vec_c)
+        
+        strength_a = float(np.dot(trivector, vec_a))
+        strength_b = float(np.dot(trivector, vec_b))
+        strength_c = float(np.dot(trivector, vec_c))
+        
+        overall_strength = np.power(
+            np.abs(strength_a * strength_b * strength_c), 
+            1/3000
+        ) * np.sign(strength_a * strength_b * strength_c)
+        
+        result = {
+            'trivector': trivector,
+            'strength': overall_strength,
+            'components': (strength_a, strength_b, strength_c),
+        }
+        
+        self.trivector_cache[cache_key] = result
+        return result
+    
+    def extract_triples_from_context(self, ctx):
+        """Extract all possible token triples from context."""
+        triples = []
+        for i in range(len(ctx) - 2):
+            triples.append((ctx[i], ctx[i+1], ctx[i+2]))
+        
+        if len(ctx) >= 5:
+            for i in range(len(ctx) - 4):
+                triples.append((ctx[i], ctx[i+2], ctx[i+4]))
+        
+        return triples
+    
+    def preliminate_candidates(self, candidates, ctx, vsa4d, method='circular'):
+        """Preliminary filter candidates based on trivector associations."""
+        if not candidates or len(ctx) < 2:
+            return {tok: 1.0 for tok in candidates}
+        
+        triples = self.extract_triples_from_context(ctx[-8:])
+        if not triples:
+            return {tok: 1.0 for tok in candidates}
+        
+        scores = {}
+        for cand in candidates:
+            cand_score = 0.0
+            cand_vec = vsa4d.vec_flat(cand)
+            
+            for triple in triples:
+                prelim = self.preliminate(triple, vsa4d, method=method)
+                trivec = prelim['trivector']
+                sim = float(np.dot(cand_vec, trivec))
+                weighted_sim = sim * prelim['strength']
+                cand_score += weighted_sim
+            
+            scores[cand] = cand_score / max(len(triples), 1)
+        
+        if scores:
+            min_score = min(scores.values())
+            max_score = max(scores.values())
+            score_range = max_score - min_score
+            
+            if score_range > 1e-12:
+                scores = {k: (v - min_score) / score_range for k, v in scores.items()}
+            else:
+                scores = {k: 1.0 for k in scores}
+        
+        exp_scores = {k: np.exp(v * 2.0) for k, v in scores.items()}
+        Z = sum(exp_scores.values())
+        if Z > 1e-12:
+            scores = {k: v / Z for k, v in exp_scores.items()}
+        
+        return scores
+    
+    def apply_prelimination(self, probs_dict, ctx, vsa4d, alpha=0.3, method='circular'):
+        """Apply trivector prelimination filter to probability distribution."""
+        if not probs_dict or len(ctx) < 2:
+            return probs_dict
+        
+        candidates = list(probs_dict.keys())
+        prelim_scores = self.preliminate_candidates(candidates, ctx, vsa4d, method=method)
+        
+        blended = {}
+        for tok in candidates:
+            orig_p = probs_dict[tok]
+            prelim_p = prelim_scores.get(tok, 0.5)
+            blended[tok] = (1 - alpha) * orig_p + alpha * prelim_p
+        
+        Z = sum(blended.values())
+        if Z > 1e-12:
+            blended = {k: v / Z for k, v in blended.items()}
         else:
-            numeric_expanded = numeric_emb
+            return probs_dict
         
-        # Blend in joint manifold
-        merged = blend * numeric_expanded + (1 - blend) * text_emb
+        self.association_history.append({
+            'ctx': tuple(ctx[-3:]),
+            'top_token': max(blended.items(), key=lambda x: x[1])[0],
+            'method': method,
+        })
         
-        # Apply non-linear projection (simulates manifold curvature)
-        merged = np.tanh(merged * 2.0)
+        return blended
+
+# ------------------------
+# DIAGRAM PROCESSOR (Dict-compatible)
+# ------------------------
+class DiagramProcessor:
+    """
+    Applies the dual-path diagram logic to probability dictionaries.
+    Path A: tokens → axis0_group → exp → axis1_group → merge
+    Path B: tokens → axis1_group → axis0_group → merge
+    """
+    def __init__(self, n_axis0_groups=8, n_axis1_groups=8):
+        self.n_axis0_groups = n_axis0_groups
+        self.n_axis1_groups = n_axis1_groups
+        self.token_axis0_map = {}
+        self.token_axis1_map = {}
         
-        return l2norm(merged)
+    def assign_axes(self, token):
+        """Assign a token to axis0 and axis1 groups deterministically."""
+        if token not in self.token_axis0_map:
+            h = hash(token)
+            self.token_axis0_map[token] = (h & 0xFF) % self.n_axis0_groups
+            self.token_axis1_map[token] = ((h >> 8) & 0xFF) % self.n_axis1_groups
+        return self.token_axis0_map[token], self.token_axis1_map[token]
+    
+    def apply_diagram_dict(self, probs_dict, blend_weight=0.3):
+        """Apply diagram dual-path processing to probability dictionary."""
+        if not probs_dict:
+            return probs_dict
+        
+        tokens = list(probs_dict.keys())
+        
+        axis0_groups = defaultdict(list)
+        axis1_groups = defaultdict(list)
+        
+        for tok in tokens:
+            a0, a1 = self.assign_axes(tok)
+            p = probs_dict[tok]
+            axis0_groups[a0].append((tok, p))
+            axis1_groups[a1].append((tok, p))
+        
+        # PATH A: Axis0 → exp → Axis1
+        pathA_scores = {}
+        for a0_id, tok_probs in axis0_groups.items():
+            group_sum = sum(p for _, p in tok_probs)
+            exp_val = np.exp(group_sum)
+            
+            for tok, p in tok_probs:
+                _, a1 = self.assign_axes(tok)
+                if tok not in pathA_scores:
+                    pathA_scores[tok] = 0.0
+                pathA_scores[tok] += exp_val * (p / max(group_sum, 1e-12))
+        
+        # PATH B: Axis1 → Axis0
+        pathB_scores = {}
+        for a1_id, tok_probs in axis1_groups.items():
+            group_sum = sum(p for _, p in tok_probs)
+            
+            for tok, p in tok_probs:
+                a0, _ = self.assign_axes(tok)
+                if tok not in pathB_scores:
+                    pathB_scores[tok] = 0.0
+                pathB_scores[tok] += group_sum * (p / max(group_sum, 1e-12))
+        
+        # MERGE
+        merged_scores = {}
+        for tok in tokens:
+            scoreA = pathA_scores.get(tok, 0.0)
+            scoreB = pathB_scores.get(tok, 0.0)
+            merged_scores[tok] = scoreA + scoreB
+        
+        Z_merged = sum(merged_scores.values())
+        if Z_merged > 1e-12:
+            merged_scores = {k: v/Z_merged for k, v in merged_scores.items()}
+        
+        # Blend with original
+        blended = {}
+        for tok in tokens:
+            orig_p = probs_dict[tok]
+            diagram_p = merged_scores.get(tok, 0.0)
+            blended[tok] = (1 - blend_weight) * orig_p + blend_weight * diagram_p
+        
+        Z = sum(blended.values())
+        if Z <= 1e-12:
+            return probs_dict
+        return {k: v/Z for k, v in blended.items()}
 
 # ------------------------
 # 4D VSA (muscle embedding)
@@ -399,7 +287,6 @@ class NumericEuclideanSpace:
 class VSA4D:
     """Create random unit 4D embeddings for tokens (C,X,Y,Z)."""
     def __init__(self, shape=(4,8,8,4), seed=1234):
-        # shape = (channels, x, y, z)
         self.shape = shape
         self.dim = np.prod(shape)
         self.book = {}
@@ -419,8 +306,8 @@ class VSA4D:
 # ------------------------
 class ZeroKernelProjector4D:
     """
-    Works like your ZeroKernelProjector but maps contexts to flat vectors
-    built from 4D VSA embeddings. Projections use SVD on stacked context vectors.
+    Maps contexts to flat vectors built from 4D VSA embeddings.
+    Projections use SVD on stacked context vectors.
     """
     def __init__(self, vsa_shape, n_components=64, kernel_dim=128, alpha=0.6, max_contexts=4000):
         self.vsa_shape = vsa_shape
@@ -429,8 +316,6 @@ class ZeroKernelProjector4D:
         self.kernel_dim = kernel_dim
         self.alpha = alpha
         self.max_contexts = max_contexts
-
-        # learned
         self.mean = None
         self.U_data = None
         self.U_kernel = None
@@ -446,7 +331,6 @@ class ZeroKernelProjector4D:
                 if ctx_count >= self.max_contexts:
                     break
                 ctx = seq[max(0, i-8):i]
-                # create a superposition flat vector
                 vec = np.zeros((self.vsa_dim,), dtype=np.float64)
                 for tok in ctx:
                     vec += vsa4d.vec_flat(tok)
@@ -463,33 +347,29 @@ class ZeroKernelProjector4D:
         U, s, Vt = np.linalg.svd(Xc, full_matrices=False)
         self.sigma = s
         k = min(self.n_components, len(s))
-        self.U_data = Vt[:k].T  # (dim, k)
+        self.U_data = Vt[:k].T
         ks = min(self.kernel_dim, Vt.shape[0] - k)
         if ks > 0:
             self.U_kernel = Vt[k:k+ks].T
         else:
             self.U_kernel = None
+        print(f"✓ Kernel fitted: data_dims={k}, kernel_dims={ks}")
 
     def project_probs(self, token_probs, vsa4d):
-        """
-        token_probs: dict tok -> prob
-        Returns blended probs where we bias toward kernel (null-space) directions.
-        """
+        """Returns blended probs biased toward kernel (null-space) directions."""
         if not token_probs or self.U_data is None or self.mean is None:
             return token_probs
-        # build prob vector
         pvec = np.zeros((self.vsa_dim,), dtype=np.float64)
         for tok, p in token_probs.items():
             pvec += p * vsa4d.vec_flat(tok)
         pvec_c = pvec - self.mean
-        # data component
         data_comp = self.U_data @ (self.U_data.T @ pvec_c)
         kernel_comp = pvec_c - data_comp
         kn = np.linalg.norm(kernel_comp)
         if kn > 1e-10:
             kernel_comp /= kn
-        # score tokens by dot with kernel_comp (flat)
-        ks = {tok: max(0.0, float(np.dot(vsa4d.vec_flat(tok) - self.mean, kernel_comp))) for tok in token_probs}
+        ks = {tok: max(0.0, float(np.dot(vsa4d.vec_flat(tok) - self.mean, kernel_comp))) 
+              for tok in token_probs}
         Z = sum(ks.values())
         if Z <= 1e-12:
             return token_probs
@@ -503,7 +383,7 @@ class ZeroKernelProjector4D:
         return {k: v/Z2 for k,v in blended.items()}
 
 # ------------------------
-# DomeSpiral adapted (uses angles per token but can modulate 4D fields)
+# DomeSpiral adapted
 # ------------------------
 class DomeSpiral4D:
     def __init__(self, n_spirals=40, dome_height=2.0, decay=0.15):
@@ -548,7 +428,6 @@ class DomeSpiral4D:
         S = sum(weights.values())
         if S > 0:
             weights = {k: v/S for k,v in weights.items()}
-        # blend
         res = {tok: (1-blend)*p + blend*weights.get(tok, 0.0) for tok,p in probs.items()}
         Z = sum(res.values())
         if Z<=0:
@@ -556,7 +435,7 @@ class DomeSpiral4D:
         return {k: v/Z for k,v in res.items()}
 
 # ------------------------
-# Knowledge subsets (keeps tokens grouped, same logic)
+# Knowledge subsets
 # ------------------------
 class KnowledgeSubsets4D:
     def __init__(self, n_clusters=8, cluster_size=200):
@@ -566,62 +445,39 @@ class KnowledgeSubsets4D:
         self.token_to_cluster = {}
         self.cluster_centers = {}
 
-    def build(self, vocab, vsa4d, n_processes=None):
-        """
-        Build knowledge clusters with multiprocessing support.
-        
-        Args:
-            vocab: List of tokens
-            vsa4d: VSA4D object for embeddings
-            n_processes: Number of processes (None = auto)
-        """
+    def build(self, vocab, vsa4d):
         if not vocab:
             return
-        
-        if n_processes is None:
-            n_processes = max(1, cpu_count() - 1)
-        
-        # Precompute all vectors (shared across iterations)
         vecs = {tok: vsa4d.vec_flat(tok) for tok in vocab}
-        
-        # Initialize centers
         centers = list(vocab)[:self.n_clusters]
         self.cluster_centers = {i: centers[i] for i in range(len(centers))}
-        
-        # K-means iterations with parallel token assignment
-        for iteration in range(3):
-            clusters = defaultdict(list)
+        clusters = defaultdict(list)
+        for _ in range(3):
+            clusters.clear()
             self.token_to_cluster.clear()
-            
-            # Split vocabulary into chunks for parallel processing
-            chunk_size = max(1, len(vocab) // (n_processes * 2))
-            vocab_chunks = [vocab[i:i+chunk_size] for i in range(0, len(vocab), chunk_size)]
-            
-            # Parallel token assignment
-            args_list = [(chunk, self.cluster_centers, vecs) for chunk in vocab_chunks]
-            
-            with Pool(n_processes) as pool:
-                results = pool.map(assign_tokens_to_clusters, args_list)
-            
-            # Merge assignments
-            for assignments in results:
-                for tok, cid in assignments.items():
-                    clusters[cid].append(tok)
-                    self.token_to_cluster[tok] = cid
-            
-            # Recompute centers in parallel
-            cluster_args = [(clusters[cid], vecs) for cid in self.cluster_centers.keys()]
-            
-            with Pool(n_processes) as pool:
-                new_centers = pool.map(find_best_center_for_cluster, cluster_args)
-            
-            for cid, new_center in zip(self.cluster_centers.keys(), new_centers):
-                if new_center is not None:
-                    self.cluster_centers[cid] = new_center
-        
-        # Finalize clusters with size limit
-        self.clusters = {cid: set(toks[:self.cluster_size]) 
-                        for cid, toks in clusters.items() if toks}
+            for tok in vocab:
+                v = vecs[tok]
+                best, bsim = 0, -1.0
+                for cid in self.cluster_centers:
+                    c_tok = self.cluster_centers[cid]
+                    sim = float(np.dot(v, vecs[c_tok]))
+                    if sim > bsim:
+                        bsim, best = sim, cid
+                clusters[best].append(tok)
+                self.token_to_cluster[tok] = best
+            for cid, toks in clusters.items():
+                if not toks:
+                    continue
+                best_center, best_avg = toks[0], -1.0
+                for cand in toks:
+                    cv = vecs[cand]
+                    sims = [float(np.dot(cv, vecs[o])) for o in toks if o!=cand]
+                    avg = np.mean(sims) if sims else -1.0
+                    if avg > best_avg:
+                        best_avg, best_center = avg, cand
+                self.cluster_centers[cid] = best_center
+        self.clusters = {cid: set(toks[:self.cluster_size]) for cid,toks in clusters.items() if toks}
+        print(f"✓ Built {len(self.clusters)} knowledge clusters")
 
     def get_active(self, ctx):
         if not ctx:
@@ -699,69 +555,62 @@ class StochasticCardinalOrder4D:
         self.attribution_history.append({"ctx": tuple(ctx), "tok": tok, "prob": prob})
 
 # ------------------------
-# The 4D Muscle (wrapper combining everything)
+# The 4D Muscle (Complete)
 # ------------------------
 class FourDMuscle:
     def __init__(self, vsa_shape=(4,8,8,4)):
         self.vsa = VSA4D(shape=vsa_shape)
-        self.numeric_space = NumericEuclideanSpace(dim=64)
         self.kernel = ZeroKernelProjector4D(vsa_shape=vsa_shape, n_components=64, kernel_dim=128, alpha=0.6)
         self.dome = DomeSpiral4D(n_spirals=50, dome_height=3.0, decay=0.15)
         self.knowledge = KnowledgeSubsets4D(n_clusters=12, cluster_size=500)
         self.sco = StochasticCardinalOrder4D(inversion_strength=2.5, noise_scale=0.08)
+        self.diagram = DiagramProcessor(n_axis0_groups=8, n_axis1_groups=8)
+        self.trivector = TrivectorAssociation(vsa_dim=self.vsa.dim)
         self.uni = Counter()
         self.rings = [defaultdict(Counter) for _ in range(5)]
         self.ctx_index = {}
         self.ctx_index_norm = {}
 
-    def train(self, corp, n_processes=None):
-        """
-        Train the model on corpus using multiprocessing.
+    def train(self, corp):
+        print("="*70)
+        print("Training 4D Muscle...")
+        print("="*70)
         
-        Args:
-            corp: List of sequences (each sequence is a list of tokens)
-            n_processes: Number of processes to use (None = auto-detect)
-        """
-        if n_processes is None:
-            n_processes = max(1, cpu_count() - 1)
+        # Build unigram & rings
+        for seq in corp:
+            for i,t in enumerate(seq):
+                self.uni[t] += 1
+                if i>0:
+                    prev = seq[i-1]
+                    for r in range(len(self.rings)):
+                        self.rings[r][prev][t] += 1 + 0.2 * np.cos(2*np.pi*r/len(self.rings))
+        print(f"✓ Built unigram: {len(self.uni)} tokens")
         
-        print(f"Training with {n_processes} processes on {len(corp)} sequences...")
-        
-        # Multiprocessing for unigram counts
-        print("Building unigrams...")
-        with Pool(n_processes) as pool:
-            unigram_results = pool.map(process_sequence_unigrams, corp)
-        self.uni = merge_counters(unigram_results)
-        
-        # Multiprocessing for ring transitions
-        print("Building ring transitions...")
-        ring_args = [(seq, len(self.rings)) for seq in corp]
-        with Pool(n_processes) as pool:
-            ring_results = pool.map(process_sequence_rings, ring_args)
-        self.rings = merge_ring_dicts(ring_results)
-        
-        # Multiprocessing for context index
-        print("Building context index...")
-        with Pool(n_processes) as pool:
-            ctx_results = pool.map(process_sequence_context, corp)
-        self.ctx_index = merge_context_dicts(ctx_results)
-        
-        # Normalize context index
-        print("Normalizing context index...")
+        # Context index
+        ctx_idx = defaultdict(Counter)
+        for seq in corp:
+            L = len(seq)
+            for i,t in enumerate(seq):
+                for j in range(max(0, i-6), min(L, i+7)):
+                    if j==i: continue
+                    ctx_idx[t][seq[j]] += 1
+        self.ctx_index = dict(ctx_idx)
         for tok, ctr in self.ctx_index.items():
             tot = sum(ctr.values())
-            self.ctx_index_norm[tok] = {k: v/tot for k, v in ctr.items()} if tot > 0 else {}
+            self.ctx_index_norm[tok] = {k:v/tot for k,v in ctr.items()} if tot>0 else {}
+        print(f"✓ Built context index: {len(self.ctx_index_norm)} tokens")
         
-        # Knowledge subsets with multiprocessing
-        print("Building knowledge subsets (parallel k-means clustering)...")
+        # Knowledge subsets
         vocab = list(self.uni.keys())
-        self.knowledge.build(vocab, self.vsa, n_processes=n_processes)
+        self.knowledge.build(vocab, self.vsa)
         
-        # Kernel projector (single-threaded due to SVD)
-        print("Fitting kernel projector...")
+        # Kernel
         self.kernel.fit(corp, self.vsa)
         
-        print("Training complete!")
+        print("="*70)
+        print("✓ Training complete")
+        print("="*70)
+        print()
 
     def probs_raw(self, ctx):
         if not ctx:
@@ -787,20 +636,6 @@ class FourDMuscle:
         tokens = list(base_probs.keys())
         scores = {t:0.0 for t in tokens}
         
-        # Separate numeric context analysis
-        numeric_ctx = [tok for tok in ctx if self.numeric_space.is_numeric(tok)]
-        if numeric_ctx:
-            # Compute numeric logic pattern
-            numeric_embs = [self.numeric_space.numeric_embedding(tok) for tok in numeric_ctx]
-            numeric_pattern = self.numeric_space.apply_logic(numeric_embs, operator='add')
-            
-            # Boost tokens that align with numeric pattern
-            for t in tokens:
-                if self.numeric_space.is_numeric(t):
-                    t_emb = self.numeric_space.numeric_embedding(t)
-                    numeric_sim = np.dot(numeric_pattern, t_emb)
-                    scores[t] += 1.2 * np.tanh(numeric_sim)
-        
         if ctx:
             last = ctx[-1]
             for ri, ring in enumerate(self.rings):
@@ -812,8 +647,9 @@ class FourDMuscle:
                         for t in tokens:
                             c = row.get(t,0)
                             if c>0:
-                                scores[t] *= w_ring * (c/tt)
-        # self-context similarity
+                                scores[t] += w_ring * (c/tt)
+        
+        # Self-context similarity
         cur_sig = self.current_context_signature(ctx, window=32)
         if cur_sig:
             for t in tokens:
@@ -825,7 +661,8 @@ class FourDMuscle:
                     if cw is not None:
                         s += cw * nw
                 scores[t] += 0.9 * s
-        # cluster activation
+        
+        # Cluster activation
         active = self.knowledge.get_active(ctx)
         if active:
             for cid in active:
@@ -835,12 +672,14 @@ class FourDMuscle:
                 for t in tokens:
                     if self.knowledge.token_to_cluster.get(t)==cid:
                         scores[t] += 0.7*cluster_base
-        # unigram boost
+        
+        # Unigram boost
         totuni = sum(self.uni.values())
         if totuni>0:
             for t in tokens:
                 f = self.uni[t]/totuni
                 scores[t] += 0.15 * np.sqrt(f + 1e-12)
+        
         return scores
 
     def apply_intent(self, base_probs, intent_scores, intent_alpha=6.0, intent_temp=1.0):
@@ -870,173 +709,44 @@ class FourDMuscle:
             for k in sig: sig[k] /= tot
         return dict(sig)
 
-    def apply_diagram_flow(self, probs_matrix, user_input_indices, token_list, context):
-        """
-        Implements the diagram architecture with numeric logic merging:
-        - Takes probability matrix as input
-        - Uses gradient-based range selection
-        - Applies feed-forward control
-        - Activates operations based on dataset words in context
-        - Merges numeric embeddings from different Euclidean space
-        - Returns generation feedback adjusted probabilities
-        """
-        # Gradient where with range (from user input)
-        if len(user_input_indices) > 0:
-            grad_range = np.zeros_like(probs_matrix)
-            for idx in user_input_indices:
-                if idx < len(probs_matrix):
-                    grad_range[idx] = 1.0
-        else:
-            grad_range = np.ones_like(probs_matrix)
-        
-        # np.exp() application (exponential transform)
-        exp_transform = np.exp(probs_matrix * grad_range)
-        
-        # Feed forward control (normalize and scale)
-        feed_forward = exp_transform / (exp_transform.sum() + 1e-12)
-        
-        # DATASET WORD ACTIVATION: Determine which operation to use
-        active_operation = self.numeric_space.get_active_operation(context)
-        operation_strengths = self.numeric_space.get_operation_activation_strength(context)
-        
-        # NUMERIC LOGIC MERGING: Separate handling for numeric tokens
-        numeric_tokens = [tok for tok in token_list if self.numeric_space.is_numeric(tok)]
-        
-        if numeric_tokens and operation_strengths:
-            # Extract numeric embeddings in their own Euclidean space
-            numeric_embeddings = [self.numeric_space.numeric_embedding(tok) 
-                                 for tok in numeric_tokens]
-            
-            # Apply multiple operations weighted by activation strength
-            merged_results = {}
-            for op, strength in operation_strengths.items():
-                if strength > 0.1:  # Only use significantly activated operations
-                    merged_numeric = self.numeric_space.apply_logic(numeric_embeddings, operator=op)
-                    merged_results[op] = (merged_numeric, strength)
-            
-            # If no operations activated, use the active one
-            if not merged_results:
-                merged_numeric = self.numeric_space.apply_logic(numeric_embeddings, operator=active_operation)
-                merged_results[active_operation] = (merged_numeric, 1.0)
-            
-            # Boost probabilities for numeric tokens using merged representation
-            for i, tok in enumerate(token_list):
-                if self.numeric_space.is_numeric(tok):
-                    numeric_emb = self.numeric_space.numeric_embedding(tok)
-                    
-                    # Compute weighted similarity across all activated operations
-                    total_similarity = 0.0
-                    for op, (merged_numeric, strength) in merged_results.items():
-                        similarity = np.dot(merged_numeric, numeric_emb)
-                        total_similarity += strength * similarity
-                    
-                    # Apply boost based on operation-weighted similarity
-                    feed_forward[i] *= (1.0 + 0.5 * np.tanh(total_similarity))
-            
-            # Renormalize after numeric boost
-            feed_forward /= (feed_forward.sum() + 1e-12)
-        
-        # Generation feedback (modulate by dataset similarity using token space)
-        # Build a weighted embedding from current probabilities
-        prob_embedding = np.zeros((self.vsa.dim,), dtype=np.float64)
-        for i, tok in enumerate(token_list):
-            if self.numeric_space.is_numeric(tok):
-                # Merge numeric embedding into text space
-                num_emb = self.numeric_space.numeric_embedding(tok)
-                text_emb = self.vsa.vec_flat(tok)
-                merged = self.numeric_space.merge_with_text_space(num_emb, text_emb, blend=0.6)
-                prob_embedding += feed_forward[i] * merged
-            else:
-                prob_embedding += feed_forward[i] * self.vsa.vec_flat(tok)
-        
-        # Compare with dataset tokens to get feedback signal
-        # Prioritize words that activate operations
-        dataset_tokens = list(self.uni.keys())[:min(20, len(self.uni))]
-        # Add operation-activating words to the front
-        op_words = [w for w in context if w in self.numeric_space.word_to_operation][:5]
-        dataset_tokens = op_words + [t for t in dataset_tokens if t not in op_words][:20]
-        
-        similarities = []
-        for dtok in dataset_tokens:
-            if self.numeric_space.is_numeric(dtok):
-                num_emb = self.numeric_space.numeric_embedding(dtok)
-                text_emb = self.vsa.vec_flat(dtok)
-                merged = self.numeric_space.merge_with_text_space(num_emb, text_emb, blend=0.6)
-                sim = np.dot(prob_embedding, merged)
-            else:
-                sim = np.dot(prob_embedding, self.vsa.vec_flat(dtok))
-            
-            # Boost similarity for operation-activating words
-            if dtok in self.numeric_space.word_to_operation:
-                sim *= 1.3
-            
-            similarities.append(sim)
-        
-        if similarities:
-            dataset_influence = np.mean(similarities)
-            feedback_factor = 1.0 + 0.3 * np.tanh(dataset_influence)
-            feed_forward *= feedback_factor
-        
-        # Final normalization
-        output = feed_forward / (feed_forward.sum() + 1e-12)
-        return output
-
     def probs(self, ctx):
         raw = self.probs_raw(ctx)
         if not raw: return raw
-        # perm activation (light version)
+        
+        # 1) Permutation activation
         tokens = list(raw.keys())
         base = np.array([raw[t] for t in tokens], dtype=np.float64)
         base = np.maximum(base, 1e-12)
         base /= base.sum()
-        
-        # DIAGRAM INTEGRATION: User input indices from context
-        user_input_indices = []
-        if ctx:
-            # Map recent context tokens to indices
-            for tok in ctx[-3:]:
-                if tok in tokens:
-                    user_input_indices.append(tokens.index(tok))
-        
-        # DIAGRAM INTEGRATION: Apply the diagram flow (pass token list instead of embeddings)
-        probs_matrix = np.log(base + 1e-12)
-        # FIXED - includes context
-        diagram_output = self.apply_diagram_flow(probs_matrix, user_input_indices, tokens, ctx)        
-        # Convert back to dict and blend with original
-        diagram_probs = {tok: float(diagram_output[i]) for i, tok in enumerate(tokens)}
-        
-        # Blend diagram output with Gumbel perturbation
         g = -np.log(-np.log(np.random.uniform(1e-6,1-1e-6, size=base.shape)))
         logp = np.log(base) + 0.12 * g
         p_tilde = np.exp(logp - logp.max())
         p_tilde /= p_tilde.sum()
-        gumbel_probs = {tok:float(p_tilde[i]) for i,tok in enumerate(tokens)}
-        
-        # Merge diagram and gumbel (70% diagram, 30% gumbel)
-        perm_probs = {}
-        for tok in tokens:
-            perm_probs[tok] = 0.7 * diagram_probs[tok] + 0.3 * gumbel_probs[tok]
-        
-        # Normalize
-        Z = sum(perm_probs.values())
-        if Z > 0:
-            perm_probs = {k: v/Z for k, v in perm_probs.items()}
+        perm_probs = {tok:float(p_tilde[i]) for i,tok in enumerate(tokens)}
 
-        # intent
+        # 2) Intent scoring
         intent_scores = self.compute_intent_scores(ctx, perm_probs)
         intented = self.apply_intent(perm_probs, intent_scores)
 
-        # dome spiral
-        domeed = self.dome.modulate(intented, len(ctx), blend=0.25)
+        # 3) DIAGRAM PROCESSING (dual-path)
+        diagrammed = self.diagram.apply_diagram_dict(intented, blend_weight=0.3)
 
-        # knowledge clusters
+        # 4) TRIVECTOR PRELIMINATION
+        trivec_filtered = self.trivector.apply_prelimination(
+            diagrammed, ctx, self.vsa, alpha=0.25, method='holographic'
+        )
+
+        # 5) Dome spiral
+        domeed = self.dome.modulate(trivec_filtered, len(ctx), blend=0.25)
+
+        # 6) Knowledge clusters
         active = self.knowledge.get_active(ctx)
         kn = self.knowledge.boost(domeed, active, boost_strength=0.4)
 
-        # kernel projection -> blend to kernel
+        # 7) Kernel projection
         kerneled = self.kernel.project_probs(kn, self.vsa)
 
-        # SCO reorder
+        # 8) SCO reordering
         ctx_attr = 0.5
         final = self.sco.attribution_transform(kerneled, ctx_attr)
 
@@ -1051,7 +761,8 @@ class FourDMuscle:
         p = np.maximum(p, 0)
         if p.sum()<=0:
             return None
-        # temperature
+        
+        # Temperature
         if temperature!=1.0:
             logits = np.log(p + 1e-12)/temperature
             logits = np.exp(logits - logits.max())
@@ -1060,157 +771,43 @@ class FourDMuscle:
         p /= p.sum()
         idx = np.random.choice(len(toks), p=p)
         tok = toks[idx]
-        # record attribution
+        
+        # Record attribution
         self.sco.record_attribution(tuple(ctx[-2:]), tok, float(p[idx]))
         return tok
-    
-    def serialize_for_multiprocessing(self):
-        """
-        Serialize model data for multiprocessing.
-        Returns a dictionary with all necessary data.
-        """
-        return {
-            'vsa_shape': self.vsa.shape,
-            'vsa_book': self.vsa.book,
-            'uni': self.uni,
-            'rings': self.rings,
-            'ctx_index': self.ctx_index,
-            'ctx_index_norm': self.ctx_index_norm,
-            'knowledge_clusters': self.knowledge.clusters,
-            'knowledge_token_to_cluster': self.knowledge.token_to_cluster,
-            'knowledge_cluster_centers': self.knowledge.cluster_centers,
-            'kernel_mean': self.kernel.mean,
-            'kernel_U_data': self.kernel.U_data,
-            'kernel_U_kernel': self.kernel.U_kernel,
-        }
-    
-    def generate_parallel(self, initial_ctx, n_sequences=4, max_len=None, 
-                         temperature=0.9, n_processes=None):
-        """
-        Generate multiple sequences in parallel.
-        
-        Args:
-            initial_ctx: Starting context (list of tokens)
-            n_sequences: Number of sequences to generate
-            max_len: Maximum length per sequence (default: LEN)
-            temperature: Sampling temperature
-            n_processes: Number of processes (None = auto)
-        
-        Returns:
-            List of generated sequences (each is a list of tokens)
-        """
-        if max_len is None:
-            max_len = LEN
-        
-        if n_processes is None:
-            n_processes = min(n_sequences, max(1, cpu_count() - 1))
-        
-        print(f"Generating {n_sequences} sequences with {n_processes} processes...")
-        
-        # Serialize model data
-        muscle_data = self.serialize_for_multiprocessing()
-        
-        # Create arguments for each generation task
-        args_list = [
-            (muscle_data, initial_ctx, max_len, temperature, 
-             np.random.randint(0, 1000000))
-            for _ in range(n_sequences)
-        ]
-        
-        # Generate in parallel
-        with Pool(n_processes) as pool:
-            results = pool.map(generate_single_sequence, args_list)
-        
-        return results
 
 # ------------------------
 # Example usage
 # ------------------------
 def example_usage():
-    print("=== 4D Muscle Text Generator ===")
-    filename = input("Filename: ")
+    print("="*70)
+    print("4D MUSCLE - COMPLETE SYSTEM")
+    print("Diagram + Trivector")
+    print("="*70)
+    print()
     
-    print(f"\nLoading and preprocessing {filename}...")
-    with open(filename, encoding="UTF-8") as f:
-        text = f.read().lower().split(".")[:KB_len]
+    with open(input("Corpus filename: "), encoding="UTF-8") as f:
+        text = f.read().lower()
     
-    corpus = []
-    for sentence in text:
-        tokens = sentence.split()
-        if tokens:  # Skip empty sentences
-            corpus.append(tokens)
+    sentences = [s.strip() for s in text.split(".") if s.strip()][:KB_len]
+    corpus = [sent.split() for sent in sentences]
     
     print(f"Loaded {len(corpus)} sentences")
+    print()
     
-    # Initialize model
-    print("\nInitializing 4D Muscle model...")
-    muscle = FourDMuscle(vsa_shape=(1,8,8,2))
-    
-    # Train with multiprocessing
-    n_procs = input("Number of processes (press Enter for auto): ").strip()
-    n_procs = int(n_procs) if n_procs else None
-    
-    muscle.train(corpus, n_processes=n_procs)
-    
-    print("\n=== Generation Mode ===")
-    print("Commands:")
-    print("  - Enter context words for single generation")
-    print("  - Type 'parallel N' to generate N sequences in parallel")
-    print("  - Type 'batch' for batch parallel generation")
-    print("  - Type 'quit' to exit\n")
+    muscle = FourDMuscle(vsa_shape=(4,8,8,4))
+    muscle.train(corpus)
     
     while True:
-        user_input = input("USER: ").strip()
-        
+        user_input = input("\nUSER: ").strip()
+        if not user_input:
+            continue
         if user_input.lower() in ['quit', 'exit', 'q']:
             break
-        
-        # Check for parallel generation command
-        if user_input.lower().startswith('parallel'):
-            parts = user_input.split()
-            n_seq = int(parts[1]) if len(parts) > 1 else 4
             
-            ctx_input = input("Enter starting context: ").strip()
-            ctx = ctx_input.split() if ctx_input else []
-            
-            temp = input("Temperature (default 0.9): ").strip()
-            temp = float(temp) if temp else 0.9
-            
-            max_len = input("Max length per sequence (default 999): ").strip()
-            max_len = int(max_len) if max_len else LEN
-            
-            print()
-            results = muscle.generate_parallel(ctx, n_sequences=n_seq, 
-                                              max_len=max_len, temperature=temp)
-            
-            print("\n=== PARALLEL GENERATION RESULTS ===")
-            for i, seq in enumerate(results, 1):
-                print(f"\nSequence {i} ({len(seq)} tokens):")
-                print(' '.join(seq))
-            print()
-            continue
-        
-        # Check for batch mode
-        if user_input.lower() == 'batch':
-            n_seq = input("Number of sequences: ").strip()
-            n_seq = int(n_seq) if n_seq else 4
-            
-            ctx_input = input("Enter starting context: ").strip()
-            ctx = ctx_input.split() if ctx_input else []
-            
-            print()
-            results = muscle.generate_parallel(ctx, n_sequences=n_seq)
-            
-            print("\n=== BATCH GENERATION RESULTS ===")
-            for i, seq in enumerate(results, 1):
-                print(f"\n[{i}] " + ' '.join(seq))
-            print()
-            continue
-        
-        # Single generation
         ctx = user_input.split()
         print(f"Starting context: {ctx}")
-        print("Generating...\n")
+        print("Generated: ", end="", flush=True)
         
         out = []
         for i in range(LEN):
@@ -1218,10 +815,14 @@ def example_usage():
             if tok is None:
                 break
             out.append(tok)
+            print(tok, end=" ", flush=True)
             ctx.append(tok)
         
-        print("GENERATED:", ' '.join(out))
-        print()
+        print(f"\n\nGenerated {len(out)} tokens")
+        print(f"Pipeline stats:")
+        print(f"  - Trivector cache: {len(muscle.trivector.trivector_cache)} entries")
+        print(f"  - SCO memory: {len(muscle.sco.cardinal_memory)} tokens")
+        print(f"  - Diagram axis0 map: {len(muscle.diagram.token_axis0_map)} tokens")
 
 if __name__ == "__main__":
     example_usage()
