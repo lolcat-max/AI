@@ -1,5 +1,5 @@
 """
-fourd_muscle.py
+fourd_muscle.py (FIXED)
 
 Convert the ConcGen pipeline into a '4D muscle' module:
 - internal embeddings / activations are 4D tensors (C, X, Y, Z)
@@ -445,6 +445,51 @@ class FourDMuscle:
             for k in sig: sig[k] /= tot
         return dict(sig)
 
+    def apply_diagram_flow(self, probs_matrix, user_input_indices, token_list):
+        """
+        Implements the diagram architecture:
+        - Takes probability matrix as input
+        - Uses gradient-based range selection
+        - Applies feed-forward control
+        - Returns generation feedback adjusted probabilities
+        """
+        # Gradient where with range (from user input)
+        if len(user_input_indices) > 0:
+            grad_range = np.zeros_like(probs_matrix)
+            for idx in user_input_indices:
+                if idx < len(probs_matrix):
+                    grad_range[idx] = 1.0
+        else:
+            grad_range = np.ones_like(probs_matrix)
+        
+        # np.exp() application (exponential transform)
+        exp_transform = np.exp(probs_matrix * grad_range)
+        
+        # Feed forward control (normalize and scale)
+        feed_forward = exp_transform / (exp_transform.sum() + 1e-12)
+        
+        # Generation feedback (modulate by dataset similarity using token space)
+        # Build a weighted embedding from current probabilities
+        prob_embedding = np.zeros((self.vsa.dim,), dtype=np.float64)
+        for i, tok in enumerate(token_list):
+            prob_embedding += feed_forward[i] * self.vsa.vec_flat(tok)
+        
+        # Compare with dataset tokens to get feedback signal
+        dataset_tokens = list(self.uni.keys())[:min(20, len(self.uni))]
+        similarities = []
+        for dtok in dataset_tokens:
+            sim = np.dot(prob_embedding, self.vsa.vec_flat(dtok))
+            similarities.append(sim)
+        
+        if similarities:
+            dataset_influence = np.mean(similarities)
+            feedback_factor = 1.0 + 0.3 * np.tanh(dataset_influence)
+            feed_forward *= feedback_factor
+        
+        # Final normalization
+        output = feed_forward / (feed_forward.sum() + 1e-12)
+        return output
+
     def probs(self, ctx):
         raw = self.probs_raw(ctx)
         if not raw: return raw
@@ -453,12 +498,38 @@ class FourDMuscle:
         base = np.array([raw[t] for t in tokens], dtype=np.float64)
         base = np.maximum(base, 1e-12)
         base /= base.sum()
-        # one randomized perturb pass
+        
+        # DIAGRAM INTEGRATION: User input indices from context
+        user_input_indices = []
+        if ctx:
+            # Map recent context tokens to indices
+            for tok in ctx[-3:]:
+                if tok in tokens:
+                    user_input_indices.append(tokens.index(tok))
+        
+        # DIAGRAM INTEGRATION: Apply the diagram flow (pass token list instead of embeddings)
+        probs_matrix = np.log(base + 1e-12)
+        diagram_output = self.apply_diagram_flow(probs_matrix, user_input_indices, tokens)
+        
+        # Convert back to dict and blend with original
+        diagram_probs = {tok: float(diagram_output[i]) for i, tok in enumerate(tokens)}
+        
+        # Blend diagram output with Gumbel perturbation
         g = -np.log(-np.log(np.random.uniform(1e-6,1-1e-6, size=base.shape)))
         logp = np.log(base) + 0.12 * g
         p_tilde = np.exp(logp - logp.max())
         p_tilde /= p_tilde.sum()
-        perm_probs = {tok:float(p_tilde[i]) for i,tok in enumerate(tokens)}
+        gumbel_probs = {tok:float(p_tilde[i]) for i,tok in enumerate(tokens)}
+        
+        # Merge diagram and gumbel (70% diagram, 30% gumbel)
+        perm_probs = {}
+        for tok in tokens:
+            perm_probs[tok] = 0.7 * diagram_probs[tok] + 0.3 * gumbel_probs[tok]
+        
+        # Normalize
+        Z = sum(perm_probs.values())
+        if Z > 0:
+            perm_probs = {k: v/Z for k, v in perm_probs.items()}
 
         # intent
         intent_scores = self.compute_intent_scores(ctx, perm_probs)
@@ -477,6 +548,7 @@ class FourDMuscle:
         # SCO reorder
         ctx_attr = 0.5
         final = self.sco.attribution_transform(kerneled, ctx_attr)
+
         return final
 
     def sample(self, ctx, temperature=1.0):
@@ -510,10 +582,9 @@ def example_usage():
     corpus = []
     for sentence in text:
         corpus.append(sentence.split())
-    muscle = FourDMuscle(vsa_shape=(4,8,8,4))
+    muscle = FourDMuscle(vsa_shape=(1,8,8,2))
     muscle.train(corpus)
     while True:
-        
         ctx = input("USER: ").split()
         print("starting ctx:", ctx)
         out = []
