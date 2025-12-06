@@ -3,7 +3,7 @@
 # WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS + UNKNOWN CTX
 # + PERMUTATION ACTIVATIONS
 # =====================================================================
-KB_len = 99999
+KB_len = -1
 
 import numpy as np
 import random
