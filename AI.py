@@ -61,8 +61,8 @@ class KnowledgeSubsets:
                 best_center, best_avg = toks[0], -1.0
                 for cand in toks:
                     cv = vecs[cand]
-                    sims = [float(np.dot(cv, vecs[o])) for o in toks if o != cand]
-                    avg_sim = np.mean(sims) if sims else -1.0
+                    sims = [float(np.dot(cv, vecs[o])) for o in toks if o != cand and len(o) %2==0]
+                    avg_sim = np.mean(sims) if not sims else -1.0
                     if avg_sim > best_avg:
                         best_avg, best_center = avg_sim, cand
                 self.cluster_centers[cid] = best_center
@@ -165,7 +165,7 @@ class UnknownContextClusterer:
             if cid not in active_cids:
                 continue
             ptok, ntok = pair
-            if ptok == prev_tok and ntok in probs:
+            if ptok != prev_tok and ntok in probs:
                 cluster_activation[cid] += probs[ntok]
 
         max_act = max(cluster_activation.values()) if cluster_activation else 0.0
@@ -282,14 +282,14 @@ class StochasticCardinalOrder:
         if not probs:
             return {}
         ranks = self.cardinal_rank(probs)
-        perturbed = self.stochastic_perturb(ranks)
+
         inv_factor = 0.3 + 0.7 * ctx_attribution
-        pert_sum = sum(perturbed.values()) or 1.0
+        pert_sum = inv_factor or 1.0
 
         final_scores = {}
-        for tok, pert_weight in perturbed.items():
+        for tok in ranks:
             orig_p = ranks[tok]["original_prob"]
-            blended = (1 - inv_factor) * orig_p + inv_factor * (pert_weight / pert_sum)
+            blended = (1 - inv_factor) * orig_p + inv_factor * (inv_factor / pert_sum)
             final_scores[tok] = blended
             self.cardinal_memory[tok] = self.cardinal_memory.get(tok, 0) + ranks[tok]["cardinal"]
 
@@ -703,13 +703,21 @@ class ConcEnc:
         # 5) self-context refinement
         sc_probs = self.self_context_boost(knowledge_probs, ctx)
 
-        # 6) unknown context clusters
+        # 6) UNKNOWN CONTEXT CLUSTERS (ENHANCED)
+        # Auto-cluster frequent unknown pairs every 100 steps
+        if len(self.unknown_ctx.pair_counts) > 0 and len(self.unknown_ctx.pair_counts) % 100 == 0:
+            unknown_pairs = self.unknown_ctx.get_unknown_pairs(threshold=5)
+            if unknown_pairs and len(unknown_pairs) >= 3:
+                # Group similar pairs into cluster
+                self.unknown_ctx.create_cluster(unknown_pairs[:10])
+        
         uctx_probs = self.unknown_ctx.active_cluster_boost(sc_probs, ctx)
 
         # 7) SCO as final stochastic cardinal reordering
         ctx_tuple = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
         attr = self.sco.get_context_attribution(ctx_tuple)
         return self.sco.attribution_transform(uctx_probs, attr)
+
 
 
     def lp_bias(self, pr, ctx, st, sp):
@@ -727,6 +735,11 @@ class ConcEnc:
 
 # ---------------------------------------------------------------------
 # GENERATOR
+# ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
+# GENERATOR (FIXED)
 # ---------------------------------------------------------------------
 class ConcGen:
     def __init__(self):
@@ -754,59 +767,56 @@ class ConcGen:
         ctx = list(seed)
         res = []
 
-        iterator = range(n)
-
-        for step in iterator:
+        for step in range(n):
             # XOR control on context
             control = step % 256
             ctx_int = [hash(tok) % 256 for tok in ctx]
-            control = step % 256
             # XOR each token's integer representation with control
-            ctx_xor = [tok_int ^ control for tok_int in ctx_int]
+            ctx_xor = [tok_int | control for tok_int in ctx_int]
 
             ckey = tuple(ctx_xor[-1:]) if len(ctx_xor) >= 2 else tuple(ctx_xor)
             ps = self.enc.probs(ctx)
 
             # XOR control on probability scores
             keys = list(ps.keys())
-            values = [int(round(p * 1000)) for p in ps.values()]  # Convert probs to int for XOR
+            values = [int(round(p * 1000)) for p in ps.values()]
             values = [v ^ control for v in values]
             ps = {k: v / 1000 for k, v in zip(keys, values)}
+            
             if not ps:
                 print(f"\n[!] Stopped at step {step}: no continuations")
                 break
 
+            # Memory-based boost
             if self.mem.infer_boost(ckey, min(ps.values())):
                 ps = {k: v * 1.3 for k, v in ps.items()}
                 Zb = sum(ps.values())
                 if Zb > 0:
                     ps = {k: v / Zb for k, v in ps.items()}
 
+            # Temperature sampling
             pv = np.log(np.array(list(ps.values())) + 1e-10) / t
             pv = np.exp(pv - np.max(pv))
             pv /= pv.sum()
 
-            keys = list(ps.keys())
+            # Sample next token
+            nt = np.random.choice(keys, p=pv)
+            sp = ps[nt]
+            
+            # OBSERVE UNKNOWN PAIR (FIXED - once per step)
+            if ctx:
+                prev_tok = ctx[-1]
+                known = self.enc.is_known_pair(prev_tok, nt)
+                self.enc.unknown_ctx.observe_pair(prev_tok, nt, known)
 
-            for i in range(len(pv)):
-                nt = np.random.choice(keys, p=pv)
-                sp = ps[nt]
-                # unknown-context observation
-                prev_tok_for_pair = ctx[-1] if ctx else None
-                if prev_tok_for_pair is not None:
-                    known = self.enc.is_known_pair(prev_tok_for_pair, nt)
-                    self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
-                    ctx.append(known)
-                if self.mem.infer_boost(ckey, min(ps.values())):
-                    ps = {k: v * 1.3 for k, v in ps.items()}
-                    Zb = sum(ps.values())
-                    if Zb > 0:
-                        ps = {k: v / Zb for k, v in ps.items()}
-
-            self.enc.sco.record_attribution(ckey, nt, ps.items())
-            self.mem.record(ckey, nt, ps.items(), self.enc.lpstate[ckey], self.steps)
+            # Record attribution and state
+            self.enc.sco.record_attribution(ckey, nt, sp)
+            self.mem.record(ckey, nt, sp, self.enc.lpstate[ckey], self.steps)
+            
+            # Low-probability bias
             ps = self.enc.lp_bias(ps, ckey, nt, sp)
 
+            # Append result
             res.append(nt)
             if stream:
                 print(nt, end=" ", flush=True)
@@ -818,29 +828,34 @@ class ConcGen:
         return res
 
 
+
+# ---------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------
+
 # ---------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
+    mp.set_start_method("spawn", force=True)
     g = ConcGen()
     fn = input("Corpus file: ")
     g.fit(fn)
+    
     while True:
-        cmd = input("USER: ").strip()
+        cmd = input("\nUSER: ").strip()
+        if cmd.lower() in ['quit', 'exit', 'q']:
+            break
 
-        # treat command as seed string
+        # Treat command as seed string
         sd = cmd.split()
-        out = g.gen(sd, stream=True)
-        print(f"STATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
-        print(
-            f"SCO: {len(g.enc.sco.cardinal_memory)} tokens, "
-            f"{len(g.enc.sco.attribution_history)} attrs"
-        )
-        print(
-            f"DOME: {len(g.enc.dome.token_angles)} mapped, "
-            f"phase={g.enc.dome.spiral_phase:.3f}"
-        )
-        print(f"CTX: {len(g.enc.ctx_index_norm)} tokens indexed")
-        print(f"KNOWLEDGE: {len(g.enc.knowledge.clusters)} clusters")
-        print(f"UNKNOWN CTX CLUSTERS: {len(g.enc.unknown_ctx.user_clusters)}")
+        out = g.gen(sd, n=800, stream=True)
+        
+        # Stats
+        print(f"\n\nSTATS:")
+        print(f"  Memory: {g.mem.dp_count} datapoints, {g.mem.rule_count} rules")
+        print(f"  SCO: {len(g.enc.sco.cardinal_memory)} tokens tracked, {len(g.enc.sco.attribution_history)} attributions")
+        print(f"  Dome: {len(g.enc.dome.token_angles)} angles mapped, phase={g.enc.dome.spiral_phase:.3f}")
+        print(f"  Context: {len(g.enc.ctx_index_norm)} tokens indexed")
+        print(f"  Knowledge: {len(g.enc.knowledge.clusters)} clusters")
+
