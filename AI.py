@@ -187,6 +187,76 @@ class NumericEuclideanSpace:
             'max': lambda x, y: np.maximum(x, y),
             'min': lambda x, y: np.minimum(x, y),
         }
+        # Map dataset words to operations
+        self.word_to_operation = {}
+        self.operation_patterns = {
+            'add': ['plus', 'add', 'sum', 'total', 'and', 'more', 'increase', 'combined'],
+            'sub': ['minus', 'subtract', 'less', 'decrease', 'remove', 'take', 'without'],
+            'mul': ['times', 'multiply', 'product', 'double', 'triple', 'each'],
+            'div': ['divide', 'split', 'per', 'each', 'ratio', 'half', 'quarter'],
+            'mod': ['remainder', 'modulo', 'mod', 'leftover', 'rest'],
+            'pow': ['power', 'squared', 'cubed', 'exponent', 'exponential'],
+            'max': ['maximum', 'max', 'largest', 'biggest', 'most', 'greater'],
+            'min': ['minimum', 'min', 'smallest', 'least', 'fewer', 'lower'],
+        }
+    
+    def assign_operations_to_vocab(self, vocab):
+        """
+        Assign operation functions to dataset words based on semantic patterns.
+        """
+        for word in vocab:
+            word_lower = word.lower()
+            # Check each operation pattern
+            for op, patterns in self.operation_patterns.items():
+                if any(pattern in word_lower for pattern in patterns):
+                    self.word_to_operation[word] = op
+                    break
+            
+            # If no pattern matched, assign based on word characteristics
+            if word not in self.word_to_operation:
+                # Hash-based assignment for diversity
+                h = hash(word) % len(self.logic_operators)
+                self.word_to_operation[word] = list(self.logic_operators.keys())[h]
+    
+    def get_active_operation(self, context_words):
+        """
+        Determine which operation to activate based on dataset words in context.
+        """
+        # Count operation votes from context words
+        op_votes = defaultdict(float)
+        
+        for word in context_words:
+            if word in self.word_to_operation:
+                op = self.word_to_operation[word]
+                # Weight recent words more heavily
+                op_votes[op] += 1.0
+        
+        if not op_votes:
+            return 'add'  # Default operation
+        
+        # Return operation with most votes
+        return max(op_votes.items(), key=lambda x: x[1])[0]
+    
+    def get_operation_activation_strength(self, context_words):
+        """
+        Calculate how strongly operations are activated by context words.
+        Returns dict of operation -> strength
+        """
+        activation = defaultdict(float)
+        
+        for i, word in enumerate(context_words):
+            if word in self.word_to_operation:
+                op = self.word_to_operation[word]
+                # Decay for older words
+                position_weight = np.exp(-0.1 * (len(context_words) - i - 1))
+                activation[op] += position_weight
+        
+        # Normalize
+        total = sum(activation.values())
+        if total > 0:
+            activation = {k: v/total for k, v in activation.items()}
+        
+        return dict(activation)
     
     def is_numeric(self, tok):
         """Check if token represents a number"""
@@ -742,7 +812,7 @@ class FourDMuscle:
                         for t in tokens:
                             c = row.get(t,0)
                             if c>0:
-                                scores[t] += w_ring * (c/tt)
+                                scores[t] *= w_ring * (c/tt)
         # self-context similarity
         cur_sig = self.current_context_signature(ctx, window=32)
         if cur_sig:
@@ -800,12 +870,13 @@ class FourDMuscle:
             for k in sig: sig[k] /= tot
         return dict(sig)
 
-    def apply_diagram_flow(self, probs_matrix, user_input_indices, token_list):
+    def apply_diagram_flow(self, probs_matrix, user_input_indices, token_list, context):
         """
         Implements the diagram architecture with numeric logic merging:
         - Takes probability matrix as input
         - Uses gradient-based range selection
         - Applies feed-forward control
+        - Activates operations based on dataset words in context
         - Merges numeric embeddings from different Euclidean space
         - Returns generation feedback adjusted probabilities
         """
@@ -824,25 +895,43 @@ class FourDMuscle:
         # Feed forward control (normalize and scale)
         feed_forward = exp_transform / (exp_transform.sum() + 1e-12)
         
+        # DATASET WORD ACTIVATION: Determine which operation to use
+        active_operation = self.numeric_space.get_active_operation(context)
+        operation_strengths = self.numeric_space.get_operation_activation_strength(context)
+        
         # NUMERIC LOGIC MERGING: Separate handling for numeric tokens
         numeric_tokens = [tok for tok in token_list if self.numeric_space.is_numeric(tok)]
         
-        if numeric_tokens:
+        if numeric_tokens and operation_strengths:
             # Extract numeric embeddings in their own Euclidean space
             numeric_embeddings = [self.numeric_space.numeric_embedding(tok) 
                                  for tok in numeric_tokens]
             
-            # Apply logic operations (addition in this case, but could be any operator)
-            merged_numeric = self.numeric_space.apply_logic(numeric_embeddings, operator='add')
+            # Apply multiple operations weighted by activation strength
+            merged_results = {}
+            for op, strength in operation_strengths.items():
+                if strength > 0.1:  # Only use significantly activated operations
+                    merged_numeric = self.numeric_space.apply_logic(numeric_embeddings, operator=op)
+                    merged_results[op] = (merged_numeric, strength)
+            
+            # If no operations activated, use the active one
+            if not merged_results:
+                merged_numeric = self.numeric_space.apply_logic(numeric_embeddings, operator=active_operation)
+                merged_results[active_operation] = (merged_numeric, 1.0)
             
             # Boost probabilities for numeric tokens using merged representation
             for i, tok in enumerate(token_list):
                 if self.numeric_space.is_numeric(tok):
                     numeric_emb = self.numeric_space.numeric_embedding(tok)
-                    # Similarity in numeric space
-                    similarity = np.dot(merged_numeric, numeric_emb)
-                    # Apply boost
-                    feed_forward[i] *= (1.0 + 0.4 * np.tanh(similarity))
+                    
+                    # Compute weighted similarity across all activated operations
+                    total_similarity = 0.0
+                    for op, (merged_numeric, strength) in merged_results.items():
+                        similarity = np.dot(merged_numeric, numeric_emb)
+                        total_similarity += strength * similarity
+                    
+                    # Apply boost based on operation-weighted similarity
+                    feed_forward[i] *= (1.0 + 0.5 * np.tanh(total_similarity))
             
             # Renormalize after numeric boost
             feed_forward /= (feed_forward.sum() + 1e-12)
@@ -861,7 +950,12 @@ class FourDMuscle:
                 prob_embedding += feed_forward[i] * self.vsa.vec_flat(tok)
         
         # Compare with dataset tokens to get feedback signal
+        # Prioritize words that activate operations
         dataset_tokens = list(self.uni.keys())[:min(20, len(self.uni))]
+        # Add operation-activating words to the front
+        op_words = [w for w in context if w in self.numeric_space.word_to_operation][:5]
+        dataset_tokens = op_words + [t for t in dataset_tokens if t not in op_words][:20]
+        
         similarities = []
         for dtok in dataset_tokens:
             if self.numeric_space.is_numeric(dtok):
@@ -871,6 +965,11 @@ class FourDMuscle:
                 sim = np.dot(prob_embedding, merged)
             else:
                 sim = np.dot(prob_embedding, self.vsa.vec_flat(dtok))
+            
+            # Boost similarity for operation-activating words
+            if dtok in self.numeric_space.word_to_operation:
+                sim *= 1.3
+            
             similarities.append(sim)
         
         if similarities:
@@ -901,8 +1000,8 @@ class FourDMuscle:
         
         # DIAGRAM INTEGRATION: Apply the diagram flow (pass token list instead of embeddings)
         probs_matrix = np.log(base + 1e-12)
-        diagram_output = self.apply_diagram_flow(probs_matrix, user_input_indices, tokens)
-        
+        # FIXED - includes context
+        diagram_output = self.apply_diagram_flow(probs_matrix, user_input_indices, tokens, ctx)        
         # Convert back to dict and blend with original
         diagram_probs = {tok: float(diagram_output[i]) for i, tok in enumerate(tokens)}
         
