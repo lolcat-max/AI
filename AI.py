@@ -5,6 +5,7 @@ Convert the ConcGen pipeline into a '4D muscle' module:
 - internal embeddings / activations are 4D tensors (C, X, Y, Z)
 - algorithmic building blocks adapted to 4D
 - retains ZeroKernelProjector, DomeSpiral, KnowledgeSubsets, SCO, etc.
+- multiprocessing for fast dataset processing
 """
 KB_len = 999
 LEN = 999
@@ -13,10 +14,146 @@ from collections import defaultdict, Counter, deque
 from dataclasses import dataclass
 from enum import Enum
 import random
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # ------------------------
-# Utilities
+# Multiprocessing helpers
 # ------------------------
+def process_sequence_unigrams(seq):
+    """Process a single sequence for unigram counts"""
+    return Counter(seq)
+
+def process_sequence_rings(args):
+    """Process a single sequence for ring transitions"""
+    seq, n_rings = args
+    rings = [defaultdict(Counter) for _ in range(n_rings)]
+    for i in range(1, len(seq)):
+        prev = seq[i-1]
+        curr = seq[i]
+        for r in range(n_rings):
+            rings[r][prev][curr] += 1 + 0.2 * np.cos(2*np.pi*r/n_rings)
+    return rings
+
+def process_sequence_context(seq):
+    """Process a single sequence for context index"""
+    ctx_idx = defaultdict(Counter)
+    L = len(seq)
+    for i, t in enumerate(seq):
+        for j in range(max(0, i-6), min(L, i+7)):
+            if j == i:
+                continue
+            ctx_idx[t][seq[j]] += 1
+    return dict(ctx_idx)
+
+def merge_counters(counter_list):
+    """Merge a list of Counters into one"""
+    result = Counter()
+    for c in counter_list:
+        result.update(c)
+    return result
+
+def merge_ring_dicts(ring_list):
+    """Merge ring dictionaries from multiple processes"""
+    n_rings = len(ring_list[0])
+    merged = [defaultdict(Counter) for _ in range(n_rings)]
+    for rings in ring_list:
+        for r in range(n_rings):
+            for prev, counts in rings[r].items():
+                merged[r][prev].update(counts)
+    return merged
+
+def merge_context_dicts(ctx_list):
+    """Merge context index dictionaries"""
+    merged = defaultdict(Counter)
+    for ctx_dict in ctx_list:
+        for tok, counts in ctx_dict.items():
+            merged[tok].update(counts)
+    return dict(merged)
+
+def generate_single_sequence(args):
+    """
+    Generate a single sequence (for multiprocessing).
+    Returns the generated token sequence.
+    """
+    muscle_data, initial_ctx, max_len, temperature, seed = args
+    
+    # Set seed for this worker
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    # Reconstruct muscle object (lightweight reconstruction)
+    muscle = FourDMuscle(vsa_shape=muscle_data['vsa_shape'])
+    muscle.uni = muscle_data['uni']
+    muscle.rings = muscle_data['rings']
+    muscle.ctx_index = muscle_data['ctx_index']
+    muscle.ctx_index_norm = muscle_data['ctx_index_norm']
+    muscle.vsa.book = muscle_data['vsa_book']
+    muscle.knowledge.clusters = muscle_data['knowledge_clusters']
+    muscle.knowledge.token_to_cluster = muscle_data['knowledge_token_to_cluster']
+    muscle.knowledge.cluster_centers = muscle_data['knowledge_cluster_centers']
+    muscle.kernel.mean = muscle_data['kernel_mean']
+    muscle.kernel.U_data = muscle_data['kernel_U_data']
+    muscle.kernel.U_kernel = muscle_data['kernel_U_kernel']
+    
+    # Generate sequence
+    ctx = list(initial_ctx)
+    out = []
+    for _ in range(max_len):
+        tok = muscle.sample(ctx, temperature=temperature)
+        if tok is None:
+            break
+        out.append(tok)
+        ctx.append(tok)
+    
+    return out
+
+def compute_token_similarities(args):
+    """
+    Compute similarities between a token and all vocabulary tokens.
+    Used for parallel clustering in KnowledgeSubsets.
+    """
+    tok, vocab, vecs = args
+    v = vecs[tok]
+    similarities = {}
+    for other_tok in vocab:
+        if tok != other_tok:
+            similarities[other_tok] = float(np.dot(v, vecs[other_tok]))
+    return tok, similarities
+
+def assign_tokens_to_clusters(args):
+    """
+    Assign a batch of tokens to their nearest cluster.
+    """
+    tokens, cluster_centers, vecs = args
+    assignments = {}
+    for tok in tokens:
+        v = vecs[tok]
+        best_cluster, best_sim = 0, -1.0
+        for cid, c_tok in cluster_centers.items():
+            sim = float(np.dot(v, vecs[c_tok]))
+            if sim > best_sim:
+                best_sim, best_cluster = sim, cid
+        assignments[tok] = best_cluster
+    return assignments
+
+def find_best_center_for_cluster(args):
+    """
+    Find the best center token for a cluster (token with highest avg similarity).
+    """
+    cluster_tokens, vecs = args
+    if not cluster_tokens:
+        return None
+    
+    best_center, best_avg = cluster_tokens[0], -1.0
+    for cand in cluster_tokens:
+        cv = vecs[cand]
+        sims = [float(np.dot(cv, vecs[other])) for other in cluster_tokens if other != cand]
+        avg = np.mean(sims) if sims else -1.0
+        if avg > best_avg:
+            best_avg, best_center = avg, cand
+    
+    return best_center
 def flatten4(t):
     """Flatten a 4D activation (C,X,Y,Z) to 1D vector"""
     return t.reshape(-1)
@@ -28,6 +165,163 @@ def unflatten4(v, shape):
 def l2norm(v, eps=1e-12):
     n = np.linalg.norm(v)
     return v / max(n, eps)
+
+# ------------------------
+# Numeric Euclidean Space
+# ------------------------
+class NumericEuclideanSpace:
+    """
+    Separate Euclidean space for processing numeric tokens with logic operations.
+    Numbers are embedded in a different geometric space than text tokens.
+    """
+    def __init__(self, dim=64):
+        self.dim = dim
+        self.numeric_cache = {}
+        self.logic_operators = {
+            'add': lambda x, y: x + y,
+            'sub': lambda x, y: x - y,
+            'mul': lambda x, y: x * y,
+            'div': lambda x, y: x / (y + 1e-12),
+            'mod': lambda x, y: x % (y + 1e-12),
+            'pow': lambda x, y: np.power(x, np.clip(y, -10, 10)),
+            'max': lambda x, y: np.maximum(x, y),
+            'min': lambda x, y: np.minimum(x, y),
+        }
+    
+    def is_numeric(self, tok):
+        """Check if token represents a number"""
+        try:
+            float(tok)
+            return True
+        except (ValueError, TypeError):
+            return False
+    
+    def numeric_embedding(self, tok):
+        """
+        Embed a numeric token in Euclidean space using multiple geometric projections.
+        Creates a rich representation across different mathematical spaces.
+        """
+        if tok in self.numeric_cache:
+            return self.numeric_cache[tok]
+        
+        try:
+            val = float(tok)
+        except (ValueError, TypeError):
+            # Non-numeric fallback: hash-based embedding
+            h = hash(tok) & 0xFFFFFFFF
+            emb = np.array([np.sin(h * i * 0.01) for i in range(self.dim)])
+            emb = l2norm(emb)
+            self.numeric_cache[tok] = emb
+            return emb
+        
+        # Handle special values
+        if not np.isfinite(val):
+            # Infinity or NaN - use special embedding
+            h = hash(str(tok)) & 0xFFFFFFFF
+            emb = np.array([np.cos(h * i * 0.01) for i in range(self.dim)])
+            emb = l2norm(emb)
+            self.numeric_cache[tok] = emb
+            return emb
+        
+        # Clip extreme values to prevent overflow
+        val = np.clip(val, -1e10, 1e10)
+        
+        # Multi-space numeric embedding
+        emb = np.zeros(self.dim)
+        
+        # 1. Linear space (raw magnitude encoding)
+        emb[0:8] = np.tanh(val * np.linspace(0.01, 1.0, 8))
+        
+        # 2. Logarithmic space (scale-invariant)
+        log_val = np.log1p(np.abs(val)) * np.sign(val)
+        emb[8:16] = np.tanh(log_val * np.linspace(0.1, 2.0, 8))
+        
+        # 3. Trigonometric space (periodic features)
+        emb[16:24] = np.sin(val * np.linspace(0.1, 10.0, 8))
+        emb[24:32] = np.cos(val * np.linspace(0.1, 10.0, 8))
+        
+        # 4. Fractional space (decimal structure)
+        try:
+            int_val = int(val)
+            frac = val - int_val
+        except (OverflowError, ValueError):
+            frac = 0.0
+        emb[32:40] = np.sin(frac * 2 * np.pi * np.arange(1, 9))
+        
+        # 5. Modular arithmetic spaces
+        for i, mod in enumerate([2, 3, 5, 7, 11, 13, 17, 19]):
+            try:
+                emb[40 + i] = np.sin(2 * np.pi * (val % mod) / mod)
+            except (OverflowError, ValueError):
+                emb[40 + i] = 0.0
+        
+        # 6. Sign and magnitude decomposition
+        emb[48:56] = np.sign(val) * np.exp(-np.abs(val) * np.linspace(0.01, 1.0, 8))
+        
+        # 7. Polynomial basis (with clipping to prevent overflow)
+        safe_val = np.clip(np.abs(val), 0.0, 1000.0)
+        emb[56:64] = np.array([safe_val**p for p in np.linspace(0.5, 2.0, 8)])
+        # Clip polynomial results
+        emb[56:64] = np.clip(emb[56:64], -1e6, 1e6)
+        
+        # Normalize
+        emb = l2norm(emb)
+        self.numeric_cache[tok] = emb
+        return emb
+    
+    def apply_logic(self, num_embeddings, operator='add'):
+        """
+        Apply logical/arithmetic operations between numeric embeddings.
+        Operates in the numeric Euclidean space.
+        """
+        if len(num_embeddings) < 2:
+            return num_embeddings[0] if num_embeddings else np.zeros(self.dim)
+        
+        op_func = self.logic_operators.get(operator, self.logic_operators['add'])
+        
+        # Pairwise operation reduction
+        result = num_embeddings[0].copy()
+        for emb in num_embeddings[1:]:
+            result = op_func(result, emb)
+            # Clip to prevent overflow accumulation
+            result = np.clip(result, -1e6, 1e6)
+        
+        # Handle any NaN or inf values
+        result = np.nan_to_num(result, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return l2norm(result)
+    
+    def merge_with_text_space(self, numeric_emb, text_emb, blend=0.5):
+        """
+        Project numeric embedding into text embedding space using learned manifold.
+        Creates a bridge between numeric and text Euclidean spaces.
+        """
+        # Ensure compatible dimensions
+        if len(numeric_emb) < len(text_emb):
+            # Expand numeric embedding
+            numeric_expanded = np.zeros_like(text_emb)
+            # Repeat and blend
+            repeats = len(text_emb) // len(numeric_emb) + 1
+            numeric_repeated = np.tile(numeric_emb, repeats)[:len(text_emb)]
+            numeric_expanded = numeric_repeated
+        elif len(numeric_emb) > len(text_emb):
+            # Compress numeric embedding using average pooling
+            pool_size = len(numeric_emb) // len(text_emb)
+            numeric_expanded = np.zeros_like(text_emb)
+            for i in range(len(text_emb)):
+                start = i * pool_size
+                end = min(start + pool_size, len(numeric_emb))
+                numeric_expanded[i] = np.mean(numeric_emb[start:end])
+        else:
+            numeric_expanded = numeric_emb
+        
+        # Blend in joint manifold
+        merged = blend * numeric_expanded + (1 - blend) * text_emb
+        
+        # Apply non-linear projection (simulates manifold curvature)
+        merged = np.tanh(merged * 2.0)
+        
+        return l2norm(merged)
 
 # ------------------------
 # 4D VSA (muscle embedding)
@@ -202,39 +496,62 @@ class KnowledgeSubsets4D:
         self.token_to_cluster = {}
         self.cluster_centers = {}
 
-    def build(self, vocab, vsa4d):
+    def build(self, vocab, vsa4d, n_processes=None):
+        """
+        Build knowledge clusters with multiprocessing support.
+        
+        Args:
+            vocab: List of tokens
+            vsa4d: VSA4D object for embeddings
+            n_processes: Number of processes (None = auto)
+        """
         if not vocab:
             return
+        
+        if n_processes is None:
+            n_processes = max(1, cpu_count() - 1)
+        
+        # Precompute all vectors (shared across iterations)
         vecs = {tok: vsa4d.vec_flat(tok) for tok in vocab}
+        
+        # Initialize centers
         centers = list(vocab)[:self.n_clusters]
         self.cluster_centers = {i: centers[i] for i in range(len(centers))}
-        clusters = defaultdict(list)
-        for _ in range(3):
-            clusters.clear()
+        
+        # K-means iterations with parallel token assignment
+        for iteration in range(3):
+            clusters = defaultdict(list)
             self.token_to_cluster.clear()
-            for tok in vocab:
-                v = vecs[tok]
-                best, bsim = 0, -1.0
-                for cid in self.cluster_centers:
-                    c_tok = self.cluster_centers[cid]
-                    sim = float(np.dot(v, vecs[c_tok]))
-                    if sim > bsim:
-                        bsim, best = sim, cid
-                clusters[best].append(tok)
-                self.token_to_cluster[tok] = best
-            # recompute centers
-            for cid, toks in clusters.items():
-                if not toks:
-                    continue
-                best_center, best_avg = toks[0], -1.0
-                for cand in toks:
-                    cv = vecs[cand]
-                    sims = [float(np.dot(cv, vecs[o])) for o in toks if o!=cand]
-                    avg = np.mean(sims) if sims else -1.0
-                    if avg > best_avg:
-                        best_avg, best_center = avg, cand
-                self.cluster_centers[cid] = best_center
-        self.clusters = {cid: set(toks[:self.cluster_size]) for cid,toks in clusters.items() if toks}
+            
+            # Split vocabulary into chunks for parallel processing
+            chunk_size = max(1, len(vocab) // (n_processes * 2))
+            vocab_chunks = [vocab[i:i+chunk_size] for i in range(0, len(vocab), chunk_size)]
+            
+            # Parallel token assignment
+            args_list = [(chunk, self.cluster_centers, vecs) for chunk in vocab_chunks]
+            
+            with Pool(n_processes) as pool:
+                results = pool.map(assign_tokens_to_clusters, args_list)
+            
+            # Merge assignments
+            for assignments in results:
+                for tok, cid in assignments.items():
+                    clusters[cid].append(tok)
+                    self.token_to_cluster[tok] = cid
+            
+            # Recompute centers in parallel
+            cluster_args = [(clusters[cid], vecs) for cid in self.cluster_centers.keys()]
+            
+            with Pool(n_processes) as pool:
+                new_centers = pool.map(find_best_center_for_cluster, cluster_args)
+            
+            for cid, new_center in zip(self.cluster_centers.keys(), new_centers):
+                if new_center is not None:
+                    self.cluster_centers[cid] = new_center
+        
+        # Finalize clusters with size limit
+        self.clusters = {cid: set(toks[:self.cluster_size]) 
+                        for cid, toks in clusters.items() if toks}
 
     def get_active(self, ctx):
         if not ctx:
@@ -317,6 +634,7 @@ class StochasticCardinalOrder4D:
 class FourDMuscle:
     def __init__(self, vsa_shape=(4,8,8,4)):
         self.vsa = VSA4D(shape=vsa_shape)
+        self.numeric_space = NumericEuclideanSpace(dim=64)
         self.kernel = ZeroKernelProjector4D(vsa_shape=vsa_shape, n_components=64, kernel_dim=128, alpha=0.6)
         self.dome = DomeSpiral4D(n_spirals=50, dome_height=3.0, decay=0.15)
         self.knowledge = KnowledgeSubsets4D(n_clusters=12, cluster_size=500)
@@ -326,32 +644,54 @@ class FourDMuscle:
         self.ctx_index = {}
         self.ctx_index_norm = {}
 
-    def train(self, corp):
-        # build unigram & rings & ctx_index (lightweight)
-        for seq in corp:
-            for i,t in enumerate(seq):
-                self.uni[t] += 1
-                if i>0:
-                    prev = seq[i-1]
-                    for r in range(len(self.rings)):
-                        self.rings[r][prev][t] += 1 + 0.2 * np.cos(2*np.pi*r/len(self.rings))
-        # context index
-        ctx_idx = defaultdict(Counter)
-        for seq in corp:
-            L = len(seq)
-            for i,t in enumerate(seq):
-                for j in range(max(0, i-6), min(L, i+7)):
-                    if j==i: continue
-                    ctx_idx[t][seq[j]] += 1
-        self.ctx_index = dict(ctx_idx)
+    def train(self, corp, n_processes=None):
+        """
+        Train the model on corpus using multiprocessing.
+        
+        Args:
+            corp: List of sequences (each sequence is a list of tokens)
+            n_processes: Number of processes to use (None = auto-detect)
+        """
+        if n_processes is None:
+            n_processes = max(1, cpu_count() - 1)
+        
+        print(f"Training with {n_processes} processes on {len(corp)} sequences...")
+        
+        # Multiprocessing for unigram counts
+        print("Building unigrams...")
+        with Pool(n_processes) as pool:
+            unigram_results = pool.map(process_sequence_unigrams, corp)
+        self.uni = merge_counters(unigram_results)
+        
+        # Multiprocessing for ring transitions
+        print("Building ring transitions...")
+        ring_args = [(seq, len(self.rings)) for seq in corp]
+        with Pool(n_processes) as pool:
+            ring_results = pool.map(process_sequence_rings, ring_args)
+        self.rings = merge_ring_dicts(ring_results)
+        
+        # Multiprocessing for context index
+        print("Building context index...")
+        with Pool(n_processes) as pool:
+            ctx_results = pool.map(process_sequence_context, corp)
+        self.ctx_index = merge_context_dicts(ctx_results)
+        
+        # Normalize context index
+        print("Normalizing context index...")
         for tok, ctr in self.ctx_index.items():
             tot = sum(ctr.values())
-            self.ctx_index_norm[tok] = {k:v/tot for k,v in ctr.items()} if tot>0 else {}
-        # knowledge subsets
+            self.ctx_index_norm[tok] = {k: v/tot for k, v in ctr.items()} if tot > 0 else {}
+        
+        # Knowledge subsets with multiprocessing
+        print("Building knowledge subsets (parallel k-means clustering)...")
         vocab = list(self.uni.keys())
-        self.knowledge.build(vocab, self.vsa)
-        # kernel
+        self.knowledge.build(vocab, self.vsa, n_processes=n_processes)
+        
+        # Kernel projector (single-threaded due to SVD)
+        print("Fitting kernel projector...")
         self.kernel.fit(corp, self.vsa)
+        
+        print("Training complete!")
 
     def probs_raw(self, ctx):
         if not ctx:
@@ -376,6 +716,21 @@ class FourDMuscle:
         if not base_probs: return {}
         tokens = list(base_probs.keys())
         scores = {t:0.0 for t in tokens}
+        
+        # Separate numeric context analysis
+        numeric_ctx = [tok for tok in ctx if self.numeric_space.is_numeric(tok)]
+        if numeric_ctx:
+            # Compute numeric logic pattern
+            numeric_embs = [self.numeric_space.numeric_embedding(tok) for tok in numeric_ctx]
+            numeric_pattern = self.numeric_space.apply_logic(numeric_embs, operator='add')
+            
+            # Boost tokens that align with numeric pattern
+            for t in tokens:
+                if self.numeric_space.is_numeric(t):
+                    t_emb = self.numeric_space.numeric_embedding(t)
+                    numeric_sim = np.dot(numeric_pattern, t_emb)
+                    scores[t] += 1.2 * np.tanh(numeric_sim)
+        
         if ctx:
             last = ctx[-1]
             for ri, ring in enumerate(self.rings):
@@ -447,10 +802,11 @@ class FourDMuscle:
 
     def apply_diagram_flow(self, probs_matrix, user_input_indices, token_list):
         """
-        Implements the diagram architecture:
+        Implements the diagram architecture with numeric logic merging:
         - Takes probability matrix as input
         - Uses gradient-based range selection
         - Applies feed-forward control
+        - Merges numeric embeddings from different Euclidean space
         - Returns generation feedback adjusted probabilities
         """
         # Gradient where with range (from user input)
@@ -468,17 +824,53 @@ class FourDMuscle:
         # Feed forward control (normalize and scale)
         feed_forward = exp_transform / (exp_transform.sum() + 1e-12)
         
+        # NUMERIC LOGIC MERGING: Separate handling for numeric tokens
+        numeric_tokens = [tok for tok in token_list if self.numeric_space.is_numeric(tok)]
+        
+        if numeric_tokens:
+            # Extract numeric embeddings in their own Euclidean space
+            numeric_embeddings = [self.numeric_space.numeric_embedding(tok) 
+                                 for tok in numeric_tokens]
+            
+            # Apply logic operations (addition in this case, but could be any operator)
+            merged_numeric = self.numeric_space.apply_logic(numeric_embeddings, operator='add')
+            
+            # Boost probabilities for numeric tokens using merged representation
+            for i, tok in enumerate(token_list):
+                if self.numeric_space.is_numeric(tok):
+                    numeric_emb = self.numeric_space.numeric_embedding(tok)
+                    # Similarity in numeric space
+                    similarity = np.dot(merged_numeric, numeric_emb)
+                    # Apply boost
+                    feed_forward[i] *= (1.0 + 0.4 * np.tanh(similarity))
+            
+            # Renormalize after numeric boost
+            feed_forward /= (feed_forward.sum() + 1e-12)
+        
         # Generation feedback (modulate by dataset similarity using token space)
         # Build a weighted embedding from current probabilities
         prob_embedding = np.zeros((self.vsa.dim,), dtype=np.float64)
         for i, tok in enumerate(token_list):
-            prob_embedding += feed_forward[i] * self.vsa.vec_flat(tok)
+            if self.numeric_space.is_numeric(tok):
+                # Merge numeric embedding into text space
+                num_emb = self.numeric_space.numeric_embedding(tok)
+                text_emb = self.vsa.vec_flat(tok)
+                merged = self.numeric_space.merge_with_text_space(num_emb, text_emb, blend=0.6)
+                prob_embedding += feed_forward[i] * merged
+            else:
+                prob_embedding += feed_forward[i] * self.vsa.vec_flat(tok)
         
         # Compare with dataset tokens to get feedback signal
         dataset_tokens = list(self.uni.keys())[:min(20, len(self.uni))]
         similarities = []
         for dtok in dataset_tokens:
-            sim = np.dot(prob_embedding, self.vsa.vec_flat(dtok))
+            if self.numeric_space.is_numeric(dtok):
+                num_emb = self.numeric_space.numeric_embedding(dtok)
+                text_emb = self.vsa.vec_flat(dtok)
+                merged = self.numeric_space.merge_with_text_space(num_emb, text_emb, blend=0.6)
+                sim = np.dot(prob_embedding, merged)
+            else:
+                sim = np.dot(prob_embedding, self.vsa.vec_flat(dtok))
             similarities.append(sim)
         
         if similarities:
@@ -572,21 +964,155 @@ class FourDMuscle:
         # record attribution
         self.sco.record_attribution(tuple(ctx[-2:]), tok, float(p[idx]))
         return tok
+    
+    def serialize_for_multiprocessing(self):
+        """
+        Serialize model data for multiprocessing.
+        Returns a dictionary with all necessary data.
+        """
+        return {
+            'vsa_shape': self.vsa.shape,
+            'vsa_book': self.vsa.book,
+            'uni': self.uni,
+            'rings': self.rings,
+            'ctx_index': self.ctx_index,
+            'ctx_index_norm': self.ctx_index_norm,
+            'knowledge_clusters': self.knowledge.clusters,
+            'knowledge_token_to_cluster': self.knowledge.token_to_cluster,
+            'knowledge_cluster_centers': self.knowledge.cluster_centers,
+            'kernel_mean': self.kernel.mean,
+            'kernel_U_data': self.kernel.U_data,
+            'kernel_U_kernel': self.kernel.U_kernel,
+        }
+    
+    def generate_parallel(self, initial_ctx, n_sequences=4, max_len=None, 
+                         temperature=0.9, n_processes=None):
+        """
+        Generate multiple sequences in parallel.
+        
+        Args:
+            initial_ctx: Starting context (list of tokens)
+            n_sequences: Number of sequences to generate
+            max_len: Maximum length per sequence (default: LEN)
+            temperature: Sampling temperature
+            n_processes: Number of processes (None = auto)
+        
+        Returns:
+            List of generated sequences (each is a list of tokens)
+        """
+        if max_len is None:
+            max_len = LEN
+        
+        if n_processes is None:
+            n_processes = min(n_sequences, max(1, cpu_count() - 1))
+        
+        print(f"Generating {n_sequences} sequences with {n_processes} processes...")
+        
+        # Serialize model data
+        muscle_data = self.serialize_for_multiprocessing()
+        
+        # Create arguments for each generation task
+        args_list = [
+            (muscle_data, initial_ctx, max_len, temperature, 
+             np.random.randint(0, 1000000))
+            for _ in range(n_sequences)
+        ]
+        
+        # Generate in parallel
+        with Pool(n_processes) as pool:
+            results = pool.map(generate_single_sequence, args_list)
+        
+        return results
 
 # ------------------------
 # Example usage
 # ------------------------
 def example_usage():
-    with open(input("Filename: "), encoding="UTF-8") as f:
+    print("=== 4D Muscle Text Generator ===")
+    filename = input("Filename: ")
+    
+    print(f"\nLoading and preprocessing {filename}...")
+    with open(filename, encoding="UTF-8") as f:
         text = f.read().lower().split(".")[:KB_len]
+    
     corpus = []
     for sentence in text:
-        corpus.append(sentence.split())
+        tokens = sentence.split()
+        if tokens:  # Skip empty sentences
+            corpus.append(tokens)
+    
+    print(f"Loaded {len(corpus)} sentences")
+    
+    # Initialize model
+    print("\nInitializing 4D Muscle model...")
     muscle = FourDMuscle(vsa_shape=(1,8,8,2))
-    muscle.train(corpus)
+    
+    # Train with multiprocessing
+    n_procs = input("Number of processes (press Enter for auto): ").strip()
+    n_procs = int(n_procs) if n_procs else None
+    
+    muscle.train(corpus, n_processes=n_procs)
+    
+    print("\n=== Generation Mode ===")
+    print("Commands:")
+    print("  - Enter context words for single generation")
+    print("  - Type 'parallel N' to generate N sequences in parallel")
+    print("  - Type 'batch' for batch parallel generation")
+    print("  - Type 'quit' to exit\n")
+    
     while True:
-        ctx = input("USER: ").split()
-        print("starting ctx:", ctx)
+        user_input = input("USER: ").strip()
+        
+        if user_input.lower() in ['quit', 'exit', 'q']:
+            break
+        
+        # Check for parallel generation command
+        if user_input.lower().startswith('parallel'):
+            parts = user_input.split()
+            n_seq = int(parts[1]) if len(parts) > 1 else 4
+            
+            ctx_input = input("Enter starting context: ").strip()
+            ctx = ctx_input.split() if ctx_input else []
+            
+            temp = input("Temperature (default 0.9): ").strip()
+            temp = float(temp) if temp else 0.9
+            
+            max_len = input("Max length per sequence (default 999): ").strip()
+            max_len = int(max_len) if max_len else LEN
+            
+            print()
+            results = muscle.generate_parallel(ctx, n_sequences=n_seq, 
+                                              max_len=max_len, temperature=temp)
+            
+            print("\n=== PARALLEL GENERATION RESULTS ===")
+            for i, seq in enumerate(results, 1):
+                print(f"\nSequence {i} ({len(seq)} tokens):")
+                print(' '.join(seq))
+            print()
+            continue
+        
+        # Check for batch mode
+        if user_input.lower() == 'batch':
+            n_seq = input("Number of sequences: ").strip()
+            n_seq = int(n_seq) if n_seq else 4
+            
+            ctx_input = input("Enter starting context: ").strip()
+            ctx = ctx_input.split() if ctx_input else []
+            
+            print()
+            results = muscle.generate_parallel(ctx, n_sequences=n_seq)
+            
+            print("\n=== BATCH GENERATION RESULTS ===")
+            for i, seq in enumerate(results, 1):
+                print(f"\n[{i}] " + ' '.join(seq))
+            print()
+            continue
+        
+        # Single generation
+        ctx = user_input.split()
+        print(f"Starting context: {ctx}")
+        print("Generating...\n")
+        
         out = []
         for i in range(LEN):
             tok = muscle.sample(ctx, temperature=0.9)
@@ -594,7 +1120,9 @@ def example_usage():
                 break
             out.append(tok)
             ctx.append(tok)
-        print("generated:", ' '.join(out))
+        
+        print("GENERATED:", ' '.join(out))
+        print()
 
 if __name__ == "__main__":
     example_usage()
