@@ -61,8 +61,8 @@ class KnowledgeSubsets:
                 best_center, best_avg = toks[0], -1.0
                 for cand in toks:
                     cv = vecs[cand]
-                    sims = [float(np.dot(cv, vecs[o])) for o in toks if o != cand]
-                    avg_sim = np.mean(sims) if sims else -1.0
+                    sims =  np.exp(cv/1000)
+                    avg_sim = np.mean(sims) if sims[0] else -1.0
                     if avg_sim > best_avg:
                         best_avg, best_center = avg_sim, cand
                 self.cluster_centers[cid] = best_center
@@ -78,7 +78,7 @@ class KnowledgeSubsets:
         for tok in ctx[-80:]:
             cid = self.token_to_cluster.get(tok)
             if cid is not None:
-                active.add(cid)
+                active.add(np.exp(cid/1000))
         return active
 
     def boost_cluster_neighbors(self, probs: dict, active_clusters: set, boost_strength=0.4) -> dict:
@@ -99,7 +99,7 @@ class KnowledgeSubsets:
         for tok, p in probs.items():
             cid = self.token_to_cluster.get(tok)
             if cid in active_clusters:
-                bonus = cluster_bonus.get(cid, 0.0)
+                bonus = cluster_bonus.get(np.exp(p/1000), 0.0)
                 factor = 1.0 + boost_strength * bonus
                 boosted[tok] = p * factor
 
@@ -166,7 +166,7 @@ class UnknownContextClusterer:
                 continue
             ptok, ntok = pair
             if ptok == prev_tok and ntok in probs:
-                cluster_activation[cid] += probs[ntok]
+                cluster_activation[cid] += np.mean(probs[ntok])
 
         max_act = max(cluster_activation.values()) if cluster_activation else 0.0
         if max_act <= 0:
@@ -294,7 +294,7 @@ class StochasticCardinalOrder:
             self.cardinal_memory[tok] = self.cardinal_memory.get(tok, 0) + ranks[tok]["cardinal"]
 
         Z = sum(final_scores.values())
-        if Z <= 0:
+        if Z <= 0.1:
             return probs
         return {k: v / Z for k, v in final_scores.items()}
 
@@ -302,7 +302,7 @@ class StochasticCardinalOrder:
         if not self.attribution_history:
             return 0.5
         matches = sum(1 for h in self.attribution_history if h.get("ctx") == ctx)
-        return 1 - np.exp(-matches / 10.0)
+        return 1 - np.exp(-matches / 10000.0)
 
     def record_attribution(self, ctx: tuple, chosen_tok: str, final_prob: float):
         self.attribution_history.append(
@@ -403,10 +403,123 @@ class ConcEnc:
         self.ctx_index_norm = {}
         self.knowledge = KnowledgeSubsets(n_clusters=81, cluster_size=50000)
         self.unknown_ctx = UnknownContextClusterer(min_count=3)
-
+        self.intent_alpha = 10.55   # how hard intent steers the probs
+        self.intent_temp  = 1.0    # temperature on intent scores
         # permutation activation hyperparams
         self.perm_K = 5
         self.perm_noise = 0.12
+
+
+
+    # ---------------- INTENT FROM DATABASE ----------------
+    def compute_intent_scores(self, ctx, base_probs: dict) -> dict:
+        """
+        Build an 'intent score' for each token from all database-like
+        structures: rings, self-context index, knowledge clusters,
+        unknown context clusters, and unigram frequencies.
+        Returns a dict token -> raw intent score (not normalized).
+        """
+        if not base_probs:
+            return {}
+
+        tokens = list(base_probs.keys())
+        scores = {t: 0.0 for t in tokens}
+
+        # 1) Local transition intent from rings (successors of last token)
+        if ctx:
+            last = ctx[-1]
+            for ri, ring in enumerate(self.rings):
+                if last in ring:
+                    row = ring[last]
+                    tt = sum(row.values())
+                    if tt > 0:
+                        w_ring = 1.0 + ri / 5.0
+                        for t in tokens:
+                            c = row.get(t, 0)
+                            if c > 0:
+                                scores[t] += w_ring * (c / tt)
+
+        # 2) Self-context similarity from ctx_index_norm
+        cur_sig_ctr = self.current_context_signature(ctx, window=64)
+        cur_sig = dict(cur_sig_ctr)
+        if cur_sig:
+            for t in tokens:
+                neigh = self.ctx_index_norm.get(t)
+                if not neigh:
+                    continue
+                s = 0.0
+                for w, nw in neigh.items():
+                    cw = cur_sig.get(w)
+                    if cw is not None:
+                        s += cw * nw
+                scores[t] += 0.9 * s
+
+        # 3) Knowledge subset activation over last 80 tokens
+        active_clusters = self.knowledge.get_context_clusters(ctx)
+        if active_clusters:
+            # precompute cluster average score from base_probs
+            cluster_base = {}
+            for cid in active_clusters:
+                toks = self.knowledge.clusters.get(cid, set())
+                if not toks:
+                    cluster_base[cid] = 0.0
+                    continue
+                cluster_base[cid] = sum(base_probs.get(x, 0.0) for x in toks) / len(toks)
+            for t in tokens:
+                cid = self.knowledge.token_to_cluster.get(t)
+                if cid in active_clusters:
+                    scores[t] += 0.7 * cluster_base.get(cid, 0.0)
+
+        # 4) Unknown context clusters conditioned on last token
+        if ctx:
+            prev_tok = ctx[-1]
+            for t in tokens:
+                pair = (prev_tok, t)
+                cid = self.unknown_ctx.pair_to_cluster.get(pair)
+                if cid is not None:
+                    # weight by how active that cluster is under base_probs
+                    act = 0.0
+                    for (pt, nt), cid2 in self.unknown_ctx.pair_to_cluster.items():
+                        if cid2 == cid and pt == prev_tok and nt in base_probs:
+                            act += base_probs[nt]
+                    scores[t] += 0.8 * act
+
+        # 5) Global unigram frequency as weak prior
+        total_uni = sum(self.uni.values())
+        if total_uni > 0:
+            for t in tokens:
+                f = self.uni[t] / total_uni
+                # light bias toward tokens well represented in corpus
+                scores[t] += 0.15 * np.sqrt(f + 1e-12)
+
+        return scores
+
+    def apply_intent(self, base_probs: dict, intent_scores: dict) -> dict:
+        """
+        Turn intent scores into a multiplicative modulation over probs.
+        """
+        if not base_probs or not intent_scores:
+            return base_probs
+
+        tokens = list(base_probs.keys())
+        p = np.array([base_probs[t] for t in tokens], dtype=np.float64)
+
+        s = np.array([intent_scores.get(t, 0.0) for t in tokens], dtype=np.float64)
+        # avoid degenerate all-zero
+        if np.all(s == 0):
+            return base_probs
+
+        # normalize intent scores and turn into exponent
+        s = (s - s.mean()) / (s.std() + 1e-8)
+        logm = self.intent_alpha * s / max(self.intent_temp, 1e-6)
+        m = np.exp(logm)
+
+        p_mod = p * m
+        Z = p_mod.sum()
+        if Z <= 0:
+            return base_probs
+        p_mod /= Z
+        return {tok: float(v) for tok, v in zip(tokens, p_mod)}
 
     def train(self, corp, vsa):
         # Phase 1: rings
@@ -571,17 +684,33 @@ class ConcEnc:
         if not raw:
             return raw
 
+        # 1) frequency-based permutation activations
         perm_probs = self.perm_activation(raw)
-        spiral_probs = self.dome.modulate_probs(perm_probs, len(ctx), blend=0.25)
+
+        # 2) global intent from whole database, applied multiplicatively
+        intent_scores = self.compute_intent_scores(ctx, perm_probs)
+        intent_probs = self.apply_intent(perm_probs, intent_scores)
+
+        # 3) dome spiral over simplex geometry
+        spiral_probs = self.dome.modulate_probs(intent_probs, len(ctx), blend=0.25)
+
+        # 4) knowledge subsets (local boost over already intent-shaped probs)
         active_clusters = self.knowledge.get_context_clusters(ctx)
         knowledge_probs = self.knowledge.boost_cluster_neighbors(
             spiral_probs, active_clusters, boost_strength=0.4
         )
+
+        # 5) self-context refinement
         sc_probs = self.self_context_boost(knowledge_probs, ctx)
+
+        # 6) unknown context clusters
         uctx_probs = self.unknown_ctx.active_cluster_boost(sc_probs, ctx)
+
+        # 7) SCO as final stochastic cardinal reordering
         ctx_tuple = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
         attr = self.sco.get_context_attribution(ctx_tuple)
         return self.sco.attribution_transform(uctx_probs, attr)
+
 
     def lp_bias(self, pr, ctx, st, sp):
         stt = self.lpstate[ctx]
@@ -628,8 +757,21 @@ class ConcGen:
         iterator = range(n)
 
         for step in iterator:
-            ckey = tuple(ctx[-1:]) if len(ctx) >= 2 else tuple(ctx)
+            # XOR control on context
+            control = step % 256
+            ctx_int = [hash(tok) % 256 for tok in ctx]
+            control = step % 256
+            # XOR each token's integer representation with control
+            ctx_xor = [tok_int | control for tok_int in ctx_int]
+
+            ckey = tuple(ctx_xor[-1:]) if len(ctx_xor) >= 2 else tuple(ctx_xor)
             ps = self.enc.probs(ctx)
+
+            # XOR control on probability scores
+            keys = list(ps.keys())
+            values = [int(round(p * 1000)) for p in ps.values()]  # Convert probs to int for XOR
+            values = [v ^ control for v in values]
+            ps = {k: v / 1000 for k, v in zip(keys, values)}
             if not ps:
                 print(f"\n[!] Stopped at step {step}: no continuations")
                 break
