@@ -1,7 +1,7 @@
 # =====================================================================
 # COUNTER-INTUITIVE STOCHASTIC CARDINAL ORDERING ON ATTRIBUTION
 # WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS + UNKNOWN CTX
-# + PERMUTATION ACTIVATIONS
+# + PERMUTATION ACTIVATIONS + ENTROPY BLOCKATION
 # =====================================================================
 KB_len = 99999
 
@@ -13,6 +13,151 @@ from enum import Enum
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 from tqdm import tqdm
+
+
+# ---------------------------------------------------------------------
+# ENTROPY BLOCKATION
+# ---------------------------------------------------------------------
+class EntropyBlocker:
+    """
+    Blocks high-entropy probability distributions by:
+    1. Computing Shannon entropy of the distribution
+    2. If entropy exceeds threshold, suppress low-probability tokens
+    3. Dynamically adjust blocking strength based on context
+    4. Track entropy history for adaptive thresholding
+    """
+    def __init__(self, 
+                 base_threshold=2.5,      # Base entropy threshold (bits)
+                 aggressive_mode=True,    # More aggressive blocking
+                 top_k_preserve=20,       # Always preserve top-k tokens
+                 suppression_factor=0.1): # How much to suppress blocked tokens
+
+        self.base_threshold = base_threshold
+        self.aggressive_mode = aggressive_mode
+        self.top_k_preserve = top_k_preserve
+        self.suppression_factor = suppression_factor
+
+        # Adaptive tracking
+        self.entropy_history = deque(maxlen=100)
+        self.block_count = 0
+        self.total_count = 0
+
+    def compute_entropy(self, probs: dict) -> float:
+        """Compute Shannon entropy in bits"""
+        if not probs:
+            return 0.0
+
+        p_array = np.array(list(probs.values()), dtype=np.float64)
+        p_array = p_array[p_array > 0]  # Remove zeros
+
+        if len(p_array) == 0:
+            return 0.0
+
+        # Shannon entropy: -sum(p * log2(p))
+        entropy = -np.sum(p_array * np.log2(p_array + 1e-12))
+        return float(entropy)
+
+    def compute_adaptive_threshold(self) -> float:
+        """Compute dynamic threshold based on recent entropy"""
+        if len(self.entropy_history) < 10:
+            return self.base_threshold
+
+        recent = np.array(list(self.entropy_history))
+        mean_entropy = recent.mean()
+        std_entropy = recent.std()
+
+        # Threshold = mean - 0.5*std (blocks above-average entropy)
+        adaptive = mean_entropy - 0.5 * std_entropy
+
+        # Clamp between reasonable bounds
+        return np.clip(adaptive, self.base_threshold * 0.5, self.base_threshold * 2.0)
+
+    def block_entropy(self, probs: dict, ctx_len: int) -> dict:
+        """
+        Main entropy blocking function.
+        Returns modified probability distribution with entropy suppression.
+        """
+        if not probs or len(probs) <= 1:
+            return probs
+
+        self.total_count += 1
+
+        # Compute current entropy
+        entropy = self.compute_entropy(probs)
+        self.entropy_history.append(entropy)
+
+        # Get adaptive threshold
+        threshold = self.compute_adaptive_threshold()
+
+        # Adjust threshold based on context length (stricter as context grows)
+        if ctx_len > 50:
+            threshold *= 0.85
+        elif ctx_len > 100:
+            threshold *= 0.7
+
+        # Check if we need to block
+        if entropy <= threshold:
+            return probs  # Low entropy, no blocking needed
+
+        self.block_count += 1
+
+        # === BLOCKING STRATEGY ===
+
+        # Sort tokens by probability (descending)
+        sorted_items = sorted(probs.items(), key=lambda x: -x[1])
+
+        if self.aggressive_mode:
+            # Aggressive: Keep only top-k, suppress rest heavily
+            blocked = {}
+            for i, (tok, p) in enumerate(sorted_items):
+                if i < self.top_k_preserve:
+                    # Amplify top tokens
+                    blocked[tok] = p * (1.5 ** (self.top_k_preserve - i) / self.top_k_preserve)
+                else:
+                    # Heavily suppress tail
+                    blocked[tok] = p * self.suppression_factor
+        else:
+            # Moderate: Use probability-based cutoff
+            cum_prob = 0.0
+            cutoff_prob = sorted_items[min(self.top_k_preserve, len(sorted_items)-1)][1]
+
+            blocked = {}
+            for tok, p in probs.items():
+                if p >= cutoff_prob:
+                    # Keep high-prob tokens
+                    blocked[tok] = p * 1.2
+                else:
+                    # Suppress low-prob tokens
+                    blocked[tok] = p * self.suppression_factor
+
+        # Renormalize
+        Z = sum(blocked.values())
+        if Z > 0:
+            blocked = {k: v / Z for k, v in blocked.items()}
+        else:
+            return probs
+
+        # Verify entropy reduction
+        new_entropy = self.compute_entropy(blocked)
+
+        # If blocking didn't help, return original
+        if new_entropy >= entropy * 0.95:
+            return probs
+
+        return blocked
+
+    def get_stats(self) -> dict:
+        """Return blocking statistics"""
+        block_rate = self.block_count / max(1, self.total_count)
+        avg_entropy = np.mean(list(self.entropy_history)) if self.entropy_history else 0.0
+
+        return {
+            "block_rate": block_rate,
+            "block_count": self.block_count,
+            "total_count": self.total_count,
+            "avg_entropy": avg_entropy,
+            "current_threshold": self.compute_adaptive_threshold()
+        }
 
 
 # ---------------------------------------------------------------------
@@ -61,7 +206,7 @@ class KnowledgeSubsets:
                 best_center, best_avg = toks[0], -1.0
                 for cand in toks:
                     cv = vecs[cand]
-                    sims =  np.exp(cv/1000)
+                    sims = np.exp(cv/1000)
                     avg_sim = np.mean(sims) if sims[0] else -1.0
                     if avg_sim > best_avg:
                         best_avg, best_center = avg_sim, cand
@@ -69,7 +214,6 @@ class KnowledgeSubsets:
 
         self.clusters = {cid: set(toks[:self.cluster_size]) for cid, toks in clusters.items() if toks}
         print(f"✓ Built {len(self.clusters)} knowledge clusters")
-
 
     def get_context_clusters(self, ctx):
         if not ctx:
@@ -403,15 +547,20 @@ class ConcEnc:
         self.ctx_index_norm = {}
         self.knowledge = KnowledgeSubsets(n_clusters=81, cluster_size=50000)
         self.unknown_ctx = UnknownContextClusterer(min_count=3)
-        self.intent_alpha = 10.55   # how hard intent steers the probs
-        self.intent_temp  = 1.0    # temperature on intent scores
-        # permutation activation hyperparams
+
+        # ENTROPY BLOCKATION
+        self.entropy_blocker = EntropyBlocker(
+            base_threshold=2.5,
+            aggressive_mode=True,
+            top_k_preserve=20,
+            suppression_factor=0.05
+        )
+
+        self.intent_alpha = 10.55
+        self.intent_temp  = 1.0
         self.perm_K = 5
         self.perm_noise = 0.12
 
-
-
-    # ---------------- INTENT FROM DATABASE ----------------
     def compute_intent_scores(self, ctx, base_probs: dict) -> dict:
         """
         Build an 'intent score' for each token from all database-like
@@ -457,7 +606,6 @@ class ConcEnc:
         # 3) Knowledge subset activation over last 80 tokens
         active_clusters = self.knowledge.get_context_clusters(ctx)
         if active_clusters:
-            # precompute cluster average score from base_probs
             cluster_base = {}
             for cid in active_clusters:
                 toks = self.knowledge.clusters.get(cid, set())
@@ -477,7 +625,6 @@ class ConcEnc:
                 pair = (prev_tok, t)
                 cid = self.unknown_ctx.pair_to_cluster.get(pair)
                 if cid is not None:
-                    # weight by how active that cluster is under base_probs
                     act = 0.0
                     for (pt, nt), cid2 in self.unknown_ctx.pair_to_cluster.items():
                         if cid2 == cid and pt == prev_tok and nt in base_probs:
@@ -489,7 +636,6 @@ class ConcEnc:
         if total_uni > 0:
             for t in tokens:
                 f = self.uni[t] / total_uni
-                # light bias toward tokens well represented in corpus
                 scores[t] += 0.15 * np.sqrt(f + 1e-12)
 
         return scores
@@ -503,13 +649,11 @@ class ConcEnc:
 
         tokens = list(base_probs.keys())
         p = np.array([base_probs[t] for t in tokens], dtype=np.float64)
-
         s = np.array([intent_scores.get(t, 0.0) for t in tokens], dtype=np.float64)
-        # avoid degenerate all-zero
+
         if np.all(s == 0):
             return base_probs
 
-        # normalize intent scores and turn into exponent
         s = (s - s.mean()) / (s.std() + 1e-8)
         logm = self.intent_alpha * s / max(self.intent_temp, 1e-6)
         m = np.exp(logm)
@@ -627,19 +771,9 @@ class ConcEnc:
         tt = sum(ag.values())
         return {k: v / tt for k, v in ag.items()} if tt else self.probs_raw([])
 
-    # -----------------------------------------------------------------
-    # PERMUTATION ACTIVATION GENERATION
-    # -----------------------------------------------------------------
-     # -----------------------------------------------------------------
-    # PERMUTATION ACTIVATION GENERATION (FREQ-BASED)
-    # -----------------------------------------------------------------
     def perm_activation(self, probs: dict) -> dict:
         """
-        Frequency-based permutation activations:
-        - treat probs as a freq vector
-        - apply K random monotone transforms in prob-space (no index shuffle)
-        - each transform acts like a 'permutation' over the simplex geometry
-        - average them and renormalize
+        Frequency-based permutation activations
         """
         if not probs:
             return probs
@@ -650,19 +784,12 @@ class ConcEnc:
         base /= base.sum()
 
         def one_pass(p):
-            # random temperature in [0.7, 1.3]
             temp = np.exp(np.random.uniform(np.log(10.7), np.log(100.3)))
-            # random exponent in [0.7, 1.4]
             alpha = np.random.uniform(0.1, 1.4)
-
-            # Gumbel noise in log-space, scaled by perm_noise
             g = -np.log(-np.log(np.random.uniform(0.001, 0.999, size=p.shape)))
             logp = np.log(p) / temp + self.perm_noise * g
-
-            # monotone power transform in prob-space
             p_tilde = np.exp(logp - logp.max())
             p_tilde = p_tilde ** alpha
-
             Z = p_tilde.sum()
             if Z <= 0:
                 return p
@@ -706,11 +833,13 @@ class ConcEnc:
         # 6) unknown context clusters
         uctx_probs = self.unknown_ctx.active_cluster_boost(sc_probs, ctx)
 
-        # 7) SCO as final stochastic cardinal reordering
+        # 7) ENTROPY BLOCKATION (NEW!)
+        blocked_probs = self.entropy_blocker.block_entropy(uctx_probs, len(ctx))
+
+        # 8) SCO as final stochastic cardinal reordering
         ctx_tuple = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
         attr = self.sco.get_context_attribution(ctx_tuple)
-        return self.sco.attribution_transform(uctx_probs, attr)
-
+        return self.sco.attribution_transform(blocked_probs, attr)
 
     def lp_bias(self, pr, ctx, st, sp):
         stt = self.lpstate[ctx]
@@ -740,7 +869,6 @@ class ConcGen:
             txt = f.read().lower()[:KB_len]
         snts = [s.split() for s in txt.split(".") if s.strip()]
 
-        # Pre-build VSA for vocab so clustering uses same vectors
         for s in snts:
             for t in s:
                 if len(t) % 4 == 0:
@@ -748,7 +876,7 @@ class ConcGen:
                 else:
                     self.vsa.vec(t)
         self.enc.train(snts, self.vsa)
-        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx + PermActs)")
+        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx + PermActs + ENTROPY BLOCK)")
 
     def gen(self, seed, n=600, t=0.95, show_progress=False, stream=True):
         ctx = list(seed)
@@ -757,11 +885,8 @@ class ConcGen:
         iterator = range(n)
 
         for step in iterator:
-            # XOR control on context
             control = step % 256
             ctx_int = [hash(tok) % 256 for tok in ctx]
-            control = step % 256
-            # XOR each token's integer representation with control
             ctx_xor = [tok_int | control for tok_int in ctx_int]
 
             ckey = tuple(ctx_xor[-1:]) if len(ctx_xor) >= 2 else tuple(ctx_xor)
@@ -769,9 +894,10 @@ class ConcGen:
 
             # XOR control on probability scores
             keys = list(ps.keys())
-            values = [int(round(p * 1000)) for p in ps.values()]  # Convert probs to int for XOR
+            values = [int(round(p * 1000)) for p in ps.values()]
             values = [v ^ control for v in values]
             ps = {k: v / 1000 for k, v in zip(keys, values)}
+
             if not ps:
                 print(f"\n[!] Stopped at step {step}: no continuations")
                 break
@@ -787,24 +913,17 @@ class ConcGen:
             pv /= pv.sum()
 
             keys = list(ps.keys())
+            nt = np.random.choice(keys, p=pv)
+            sp = ps[nt]
 
-            for i in range(len(pv)):
-                nt = np.random.choice(keys, p=pv)
-                sp = ps[nt]
-                # unknown-context observation
-                prev_tok_for_pair = ctx[-1] if ctx else None
-                if prev_tok_for_pair is not None:
-                    known = self.enc.is_known_pair(prev_tok_for_pair, nt)
-                    self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
-                    ctx.append(known)
-                if self.mem.infer_boost(ckey, min(ps.values())):
-                    ps = {k: v * 1.3 for k, v in ps.items()}
-                    Zb = sum(ps.values())
-                    if Zb > 0:
-                        ps = {k: v / Zb for k, v in ps.items()}
+            # unknown-context observation
+            prev_tok_for_pair = ctx[-1] if ctx else None
+            if prev_tok_for_pair is not None:
+                known = self.enc.is_known_pair(prev_tok_for_pair, nt)
+                self.enc.unknown_ctx.observe_pair(prev_tok_for_pair, nt, known)
 
-            self.enc.sco.record_attribution(ckey, nt, ps.items())
-            self.mem.record(ckey, nt, ps.items(), self.enc.lpstate[ckey], self.steps)
+            self.enc.sco.record_attribution(ckey, nt, sp)
+            self.mem.record(ckey, nt, sp, self.enc.lpstate[ckey], self.steps)
             ps = self.enc.lp_bias(ps, ckey, nt, sp)
 
             res.append(nt)
@@ -822,25 +941,25 @@ class ConcGen:
 # MAIN
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
+    mp.set_start_method("spawn", force=True)
     g = ConcGen()
     fn = input("Corpus file: ")
     g.fit(fn)
+
     while True:
         cmd = input("USER: ").strip()
-
-        # treat command as seed string
         sd = cmd.split()
         out = g.gen(sd, stream=True)
-        print(f"STATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
-        print(
-            f"SCO: {len(g.enc.sco.cardinal_memory)} tokens, "
-            f"{len(g.enc.sco.attribution_history)} attrs"
-        )
-        print(
-            f"DOME: {len(g.enc.dome.token_angles)} mapped, "
-            f"phase={g.enc.dome.spiral_phase:.3f}"
-        )
+
+        # Stats including entropy blocker
+        entropy_stats = g.enc.entropy_blocker.get_stats()
+
+        print(f"\nSTATS: {g.mem.dp_count} dps, {g.mem.rule_count} rules, {g.steps} steps")
+        print(f"SCO: {len(g.enc.sco.cardinal_memory)} tokens, {len(g.enc.sco.attribution_history)} attrs")
+        print(f"DOME: {len(g.enc.dome.token_angles)} mapped, phase={g.enc.dome.spiral_phase:.3f}")
         print(f"CTX: {len(g.enc.ctx_index_norm)} tokens indexed")
         print(f"KNOWLEDGE: {len(g.enc.knowledge.clusters)} clusters")
         print(f"UNKNOWN CTX CLUSTERS: {len(g.enc.unknown_ctx.user_clusters)}")
+        print(f"ENTROPY BLOCKER: {entropy_stats['block_rate']:.1%} blocked, "
+              f"avg entropy={entropy_stats['avg_entropy']:.2f} bits, "
+              f"threshold={entropy_stats['current_threshold']:.2f}")
