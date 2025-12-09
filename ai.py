@@ -585,7 +585,7 @@ class SquareSentenceActivator:
         for tok, p in probs.items():
             if tok in support:
                 q = square[tok]
-                out[tok] = (1 - self.square_strength) * p - self.square_strength * q
+                out[tok] = (1 - self.square_strength) * np.sqrt(q) - self.square_strength * q
             else:
                 out[tok] = p * self.tail_suppress
 
