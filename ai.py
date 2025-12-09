@@ -2,6 +2,7 @@
 # COUNTER-INTUITIVE STOCHASTIC CARDINAL ORDERING ON ATTRIBUTION
 # WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS + UNKNOWN CTX
 # + PERMUTATION ACTIVATIONS + ENTROPY BLOCKATION
+# + SQUARE SENTENCE ACTIVATION
 # =====================================================================
 KB_len = -1
 
@@ -26,7 +27,7 @@ class EntropyBlocker:
     3. Dynamically adjust blocking strength based on context
     4. Track entropy history for adaptive thresholding
     """
-    def __init__(self, 
+    def __init__(self,
                  base_threshold=2.5,      # Base entropy threshold (bits)
                  aggressive_mode=True,    # More aggressive blocking
                  top_k_preserve=20,       # Always preserve top-k tokens
@@ -118,7 +119,6 @@ class EntropyBlocker:
                     blocked[tok] = p * self.suppression_factor
         else:
             # Moderate: Use probability-based cutoff
-            cum_prob = 0.0
             cutoff_prob = sorted_items[min(self.top_k_preserve, len(sorted_items)-1)][1]
 
             blocked = {}
@@ -214,6 +214,7 @@ class KnowledgeSubsets:
 
         self.clusters = {cid: set(toks[:self.cluster_size]) for cid, toks in clusters.items() if toks}
         print(f"✓ Built {len(self.clusters)} knowledge clusters")
+
 
     def get_context_clusters(self, ctx):
         if not ctx:
@@ -520,6 +521,81 @@ class VSA:
 
 
 # ---------------------------------------------------------------------
+# SQUARE SENTENCE ACTIVATOR
+# ---------------------------------------------------------------------
+class SquareSentenceActivator:
+    """
+    Enforces near-uniform ('square') activation over a local support set
+    per sentence, while reducing positional entropy of transitions.
+    """
+    def __init__(self, window=32, top_k=16, square_strength=0.6, tail_suppress=0.05):
+        self.window = window
+        self.top_k = top_k
+        self.square_strength = square_strength
+        self.tail_suppress = tail_suppress
+
+    def _sentence_window(self, ctx):
+        """Use tokens since the last sentence boundary (simple heuristic)."""
+        if not ctx:
+            return []
+        boundary_idx = -1
+        for i in range(len(ctx) - 1, -1, -1):
+            if ctx[i] in {'.', '!', '?'}:
+                boundary_idx = i
+                break
+        if boundary_idx == -1:
+            start = max(0, len(ctx) - self.window)
+        else:
+            start = max(boundary_idx + 1, len(ctx) - self.window)
+        return ctx[start:]
+
+    def _local_support(self, probs: dict, ctx_window) -> list:
+        """
+        Support tokens:
+        - intersection of top_k by prob and tokens in this sentence
+        - if too few, pad with remaining top_k by prob
+        """
+        if not probs:
+            return []
+        sorted_toks = sorted(probs.items(), key=lambda x: -x[1])
+        top_by_prob = [t for t, _ in sorted_toks[: self.top_k]]
+        sent_set = set(ctx_window)
+        support = [t for t in top_by_prob if t in sent_set]
+        if len(support) < self.top_k // 2:
+            for t in top_by_prob:
+                if t not in support:
+                    support.append(t)
+                    if len(support) >= self.top_k:
+                        break
+        return support
+
+    def modulate(self, probs: dict, ctx) -> dict:
+        if not probs:
+            return probs
+
+        ctx_window = self._sentence_window(ctx)
+        support = self._local_support(probs, ctx_window)
+        if not support:
+            return probs
+
+        m = len(support)
+        square = {t: 1.0 / m for t in support}
+
+        out = {}
+        for tok, p in probs.items():
+            if tok in support:
+                q = square[tok]
+                out[tok] = (1 - self.square_strength) * p - self.square_strength * q
+            else:
+                out[tok] = p * self.tail_suppress
+
+        Z = sum(out.values())
+        if Z <= 0:
+            return probs
+        return {k: v / Z for k, v in out.items()}
+
+
+# ---------------------------------------------------------------------
 # CONCENTRIC ENCODER (full pipeline)
 # ---------------------------------------------------------------------
 def batch_proc(batch):
@@ -554,6 +630,14 @@ class ConcEnc:
             aggressive_mode=True,
             top_k_preserve=20,
             suppression_factor=0.05
+        )
+
+        # SQUARE SENTENCE ACTIVATION
+        self.square_activator = SquareSentenceActivator(
+            window=32,
+            top_k=16,
+            square_strength=0.6,
+            tail_suppress=0.05
         )
 
         self.intent_alpha = 10.55
@@ -833,10 +917,13 @@ class ConcEnc:
         # 6) unknown context clusters
         uctx_probs = self.unknown_ctx.active_cluster_boost(sc_probs, ctx)
 
-        # 7) ENTROPY BLOCKATION (NEW!)
-        blocked_probs = self.entropy_blocker.block_entropy(uctx_probs, len(ctx))
+        # 7) Square pattern per sentence (NEW)
+        square_probs = self.square_activator.modulate(uctx_probs, ctx)
 
-        # 8) SCO as final stochastic cardinal reordering
+        # 8) ENTROPY BLOCKATION
+        blocked_probs = self.entropy_blocker.block_entropy(square_probs, len(ctx))
+
+        # 9) SCO as final stochastic cardinal reordering
         ctx_tuple = tuple(ctx[-2:]) if len(ctx) >= 2 else tuple(ctx)
         attr = self.sco.get_context_attribution(ctx_tuple)
         return self.sco.attribution_transform(blocked_probs, attr)
@@ -871,10 +958,9 @@ class ConcGen:
 
         for s in snts:
             for t in s:
-
-                    self.vsa.vec(t)
+                self.vsa.vec(t)
         self.enc.train(snts, self.vsa)
-        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx + PermActs + ENTROPY BLOCK)")
+        print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx + PermActs + ENTROPY BLOCK + SQUARE)")
 
     def gen(self, seed, n=600, t=0.95, show_progress=False, stream=True):
         ctx = list(seed)
