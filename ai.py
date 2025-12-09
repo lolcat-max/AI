@@ -901,7 +901,7 @@ class ConcGen:
                 break
 
             if self.mem.infer_boost(ckey, min(ps.values())):
-                ps = {k: v * 1.3 for k, v in ps.items()}
+                ps = {k: v * 10.3 for k, v in ps.items()}
                 Zb = sum(ps.values())
                 if Zb > 0:
                     ps = {k: v / Zb for k, v in ps.items()}
