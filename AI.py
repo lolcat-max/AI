@@ -635,8 +635,8 @@ class ConcEnc:
         # SQUARE SENTENCE ACTIVATION
         self.square_activator = SquareSentenceActivator(
             window=8,
-            top_k=16,
-            square_strength=0.1,
+            top_k=160,
+            square_strength=10.1,
             tail_suppress=0.01
         )
 
