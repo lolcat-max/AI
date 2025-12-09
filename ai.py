@@ -3,7 +3,7 @@
 # WITH DOME SPIRAL + SELF-CONTEXT + KNOWLEDGE SUBSETS + UNKNOWN CTX
 # + PERMUTATION ACTIVATIONS + ENTROPY BLOCKATION
 # =====================================================================
-KB_len = 99999
+KB_len = -1
 
 import numpy as np
 import random
@@ -871,9 +871,7 @@ class ConcGen:
 
         for s in snts:
             for t in s:
-                if len(t) % 4 == 0:
-                    continue
-                else:
+
                     self.vsa.vec(t)
         self.enc.train(snts, self.vsa)
         print("TRAINED ✓ (SCO + Dome + Self-Context + Knowledge + Unknown Ctx + PermActs + ENTROPY BLOCK)")
