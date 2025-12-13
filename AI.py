@@ -97,7 +97,7 @@ def train_epoch(model, optimizer, criterion, loader, epsilon=0.15):
         destroyed_logits = model.fc_out(destroyed.squeeze(1))
         loss_destroy = criterion(destroyed_logits, target)
         
-        total_loss_batch = 0.7 * loss_clean + 0.3 * loss_destroy
+        total_loss_batch = 0.3 * loss_clean + 0.7 * loss_destroy
         total_loss_batch.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
