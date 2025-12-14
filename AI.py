@@ -33,7 +33,7 @@ EPS_MAX = 0.30
 EPS_GROW_EVERY = 4
 EPS_GROW_MULT = 1.15
 
-ADV_EVERY = 3           # 2 => clean, adv, clean, adv...
+ADV_EVERY = 4          # 2 => clean, adv, clean, adv...
 EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
 
