@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 from tqdm import tqdm
 
@@ -38,6 +37,60 @@ EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
 
 # -------------------------
+# Custom non-commutative op: (A @ B)
+# -------------------------
+class NonCommutativeMatMul(torch.autograd.Function):
+    """
+    Explicit autograd for matrix multiplication to emphasize non-commutative backward.
+    For C = A @ B:
+      dL/dA = dL/dC @ B^T
+      dL/dB = A^T @ dL/dC
+    """
+    @staticmethod
+    def forward(ctx, A, B):
+        ctx.save_for_backward(A, B)
+        return A @ B
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        A, B = ctx.saved_tensors
+        grad_A = grad_out @ B.transpose(-1, -2)
+        grad_B = A.transpose(-1, -2) @ grad_out
+        return grad_A, grad_B
+
+nc_matmul = NonCommutativeMatMul.apply
+
+
+class NCLinear(nn.Module):
+    """
+    Linear layer implemented via nc_matmul so backward order is explicit.
+    Keeps parameter names 'weight'/'bias' to remain checkpoint-friendly with nn.Linear.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Same general init style as nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = self.in_features
+            bound = 1 / (fan_in ** 0.5) if fan_in > 0 else 0.0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # x: (..., in_features)
+        # weight: (out_features, in_features) => use weight.T for (..., out_features)
+        y = nc_matmul(x, self.weight.transpose(-1, -2))
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+# -------------------------
 # Dataset
 # -------------------------
 class SeqDataset(Dataset):
@@ -50,7 +103,7 @@ class SeqDataset(Dataset):
         self.seq_len = seq_len
         self.word_to_ix = word_to_ix
 
-        ids = [self.word_to_ix.get(w, 0) for w in words]
+        ids = [self.word_to_ix.get(w, self.word_to_ix.get("<unk>", 0)) for w in words]
         self.samples = []
         for i in range(len(ids) - seq_len):
             x = ids[i:i + seq_len]
@@ -72,7 +125,9 @@ class RNNNextWord(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.rnn = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-        self.fc_out = nn.Linear(hidden_dim, vocab_size)
+
+        # Non-commutative backward explicit linear head (checkpoint-friendly names)
+        self.fc_out = NCLinear(hidden_dim, vocab_size)
 
     def forward(self, x, h=None):
         """
@@ -97,14 +152,37 @@ class RNNNextWord(nn.Module):
 # -------------------------
 # Broadband Quarter-Wave Recognition Model
 # -------------------------
+class SpectrogramDataset(Dataset):
+    """
+    Expects:
+      data: list/array shaped like (N, C, L) (Conv1d format)
+      labels: list/array shaped like (N,)
+    """
+    def __init__(self, data, labels, dtype=torch.float32):
+        assert len(data) == len(labels)
+        self.data = data
+        self.labels = labels
+        self.dtype = dtype
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        x = torch.tensor(self.data[idx], dtype=self.dtype)
+        y = torch.tensor(self.labels[idx], dtype=torch.long)
+        return x, y
+
+
 class BroadbandQuarterWaveNet(nn.Module):
     def __init__(self, input_channels, num_classes):
-        super(BroadbandQuarterWaveNet, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
         self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(256, num_classes)
+
+        # Also use explicit non-commutative backward linear head
+        self.fc = NCLinear(256, num_classes)
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
@@ -133,13 +211,13 @@ def save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, path=
         "num_layers": num_layers,
     }
     torch.save(ckpt, path)
-    print(f"💾 Saved checkpoint to {path}")
+    print(f"Saved checkpoint to {path}")
 
 def load_checkpoint(path=CKPT_PATH):
     if not os.path.exists(path):
         return None
     ckpt = torch.load(path, map_location=device)
-    print(f"📂 Loaded checkpoint epoch={ckpt['epoch']} loss={ckpt['loss']:.3f}")
+    print(f"Loaded checkpoint epoch={ckpt['epoch']} loss={ckpt['loss']:.3f}")
     return ckpt
 
 # -------------------------
@@ -172,29 +250,27 @@ def train_epoch_alternating(model, optimizer, criterion, loader,
     model.train()
     total_loss, batches = 0.0, 0
 
-    progress_bar = tqdm(loader, desc=f"Epoch alt ε={epsilon:.2f}", leave=False)
+    progress_bar = tqdm(loader, desc=f"Epoch alt eps={epsilon:.2f}", leave=False)
     for step, (x, y) in enumerate(progress_bar):
         x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         do_adv = (step % adv_every) == (adv_every - 1)
 
         if not do_adv:
             logits, _ = model(x)
             loss = criterion(logits, y)
-            mode = "clean"
         else:
             emb_adv = fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=clamp_val)
             out_adv, _ = model.rnn(emb_adv)
             logits_adv = model.fc_out(out_adv[:, -1, :])
             loss = criterion(logits_adv, y)
-            mode = "adv"
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += float(loss.item())
         batches += 1
         progress_bar.set_postfix({"loss": f"{loss.item():.3f}"})
 
@@ -211,18 +287,20 @@ def generate(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
     if len(seed_words) == 0:
         seed_words = ["the"]
 
+    unk = word_to_ix.get("<unk>", 0)
+
     # Prime hidden state with all seed tokens
     h = None
-    ids = [word_to_ix.get(w, 0) for w in seed_words]
+    ids = [word_to_ix.get(w, unk) for w in seed_words]
     x0 = torch.tensor([ids], device=device, dtype=torch.long)  # (1,Tseed)
-    logits, h = model(x0, h=h)
+    _, h = model(x0, h=h)
 
     generated = list(seed_words)
     cur_id = torch.tensor([[ids[-1]]], device=device, dtype=torch.long)  # (1,1)
 
     for _ in range(length):
         logits, h = model.forward_step(cur_id, h=h)
-        probs = F.softmax(logits[0] / max(1e-6, temp), dim=-1)
+        probs = F.softmax(logits[0] / max(1e-6, float(temp)), dim=-1)
         next_ix = torch.multinomial(probs, 1).item()
         generated.append(ix_to_word[next_ix])
         cur_id = torch.tensor([[next_ix]], device=device, dtype=torch.long)
@@ -245,16 +323,20 @@ if __name__ == "__main__":
         hidden_dim = int(ckpt.get("hidden_dim", HIDDEN_DIM))
         num_layers = int(ckpt.get("num_layers", NUM_LAYERS))
 
-        model = RNNNextWord(vocab_size, embed_dim=embed_dim, hidden_dim=hidden_dim, num_layers=num_layers).to(device)
-        model.load_state_dict(ckpt["model_state"])
+        model = RNNNextWord(
+            vocab_size, embed_dim=embed_dim, hidden_dim=hidden_dim, num_layers=num_layers
+        ).to(device)
+
+        # Load parameters (will work if shapes match; NCLinear uses weight/bias names)
+        model.load_state_dict(ckpt["model_state"], strict=True)
 
         optimizer = optim.Adam(model.parameters(), lr=LR)
         optimizer.load_state_dict(ckpt["optim_state"])
         criterion = nn.CrossEntropyLoss()
 
         start_epoch = int(ckpt["epoch"])
-        print("✅ Model fully loaded from checkpoint.")
-        print(f"ℹ️  Vocab={vocab_size} | seq_len={seq_len} | embed={embed_dim} | hidden={hidden_dim} | layers={num_layers}")
+        print("Model fully loaded from checkpoint.")
+        print(f"Vocab={vocab_size} | seq_len={seq_len} | embed={embed_dim} | hidden={hidden_dim} | layers={num_layers} | start_epoch={start_epoch}")
 
     else:
         # Load corpus
@@ -265,16 +347,19 @@ if __name__ == "__main__":
                     text = f.read().lower()
             else:
                 raise FileNotFoundError
-            print(f"✅ Loaded '{filename}'")
+            print(f"Loaded '{filename}'")
         except FileNotFoundError:
             url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
             text = requests.get(url, timeout=30).text.lower()
-            print("✅ Loaded Shakespeare (fallback)")
+            print("Loaded Shakespeare (fallback)")
 
-        words = text.split()[:KB_len]
+        words = text.split()
+        if KB_len is not None and isinstance(KB_len, int) and KB_len > 0:
+            words = words[:KB_len]
 
-        # Stable vocab
-        vocab = sorted(set(words))
+        # Stable vocab with explicit <unk> at index 0
+        uniq = set(words)
+        vocab = (["<unk>"] + sorted(uniq)) if "<unk>" not in uniq else sorted(uniq)
         word_to_ix = {w: i for i, w in enumerate(vocab)}
         ix_to_word = {i: w for w, i in word_to_ix.items()}
         vocab_size = len(word_to_ix)
@@ -289,8 +374,9 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=LR)
         criterion = nn.CrossEntropyLoss()
 
-        print("🚀 RNN (GRU) + Alternating Clean/FGSM Training")
+        print("RNN (GRU) + Alternating Clean/FGSM Training")
         epsilon = EPS_START
+        avg_loss = 0.0
 
         for epoch in tqdm(range(1, NUM_EPOCHS + 1), desc="Training"):
             avg_loss = train_epoch_alternating(
@@ -302,7 +388,7 @@ if __name__ == "__main__":
             if epoch % EPS_GROW_EVERY == 0:
                 epsilon = min(EPS_MAX, epsilon * EPS_GROW_MULT)
                 sample = generate(model, word_to_ix, ix_to_word, "the", length=20, temp=0.8)
-                print(f"  ↑ ε={epsilon:.3f} | Sample: {sample}")
+                print(f"  eps={epsilon:.3f} | Sample: {sample}")
 
         save_checkpoint(
             model, optimizer, NUM_EPOCHS, avg_loss,
@@ -311,23 +397,23 @@ if __name__ == "__main__":
         )
 
     # Interactive generation
-    print("\n🎯 Interactive mode:")
+    print("\nInteractive mode (Ctrl+C to exit):")
     while True:
         try:
             cmd = input("SEED TEXT: ").strip()
             if not cmd:
                 continue
-            out = generate(model, word_to_ix, ix_to_word, cmd, length=800, temp=0.8)
-            print(f"CONTINUATION: {out}\n")
+            out = generate(model, word_to_ix, ix_to_word, cmd, length=200, temp=0.8)
+            print(f"CONTINUATION:\n{out}\n")
         except KeyboardInterrupt:
-            print("\nExiting!")
+            print("\nExiting interactive mode.")
             break
 
     # Broadband Quarter-Wave Recognition Example
-    print("\n🎯 Broadband Quarter-Wave Recognition Mode:")
-    # Example data (replace with your own)
-    data = [[[0.1] * 100] for _ in range(1000)]  # Example spectrograms
-    labels = [0] * 1000  # Example labels
+    print("\nBroadband Quarter-Wave Recognition Mode:")
+    # Example data (replace with your own): (N=1000, C=1, L=100)
+    data = [[[0.1] * 100] for _ in range(1000)]
+    labels = [0] * 1000
 
     broadband_dataset = SpectrogramDataset(data, labels)
     broadband_loader = DataLoader(broadband_dataset, batch_size=32, shuffle=True)
@@ -343,13 +429,13 @@ if __name__ == "__main__":
             data_batch = data_batch.to(device)
             label_batch = label_batch.to(device)
 
-            broadband_optimizer.zero_grad()
+            broadband_optimizer.zero_grad(set_to_none=True)
             outputs = broadband_model(data_batch)
             loss = broadband_criterion(outputs, label_batch)
             loss.backward()
             broadband_optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += float(loss.item())
 
         print(f"Broadband Epoch {epoch+1}/5, Loss: {total_loss/len(broadband_loader):.4f}")
 
