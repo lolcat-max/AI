@@ -411,7 +411,6 @@ if __name__ == "__main__":
     # Interactive generation
     print("\n🎯 Interactive mode:")
     print("Type text and press Enter. Ctrl+C to exit.")
-    print("Use prefix 'mk:' to force Markov-corridor hybrid sampling (if Markov model is available).")
     while True:
         try:
             cmd = input("SEED TEXT: ").strip()
