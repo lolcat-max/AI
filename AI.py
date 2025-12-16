@@ -1,8 +1,6 @@
 import os
 import re
 import requests
-from collections import defaultdict, Counter
-
 from tqdm import tqdm
 
 import torch
@@ -38,12 +36,6 @@ EPS_GROW_MULT = 1.15
 ADV_EVERY = 4          # 2 => clean, adv, clean, adv...
 EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
-
-# Markov corridor config
-MARKOV_ORDER = 2       # n-gram order
-CORRIDOR_LEN = 8       # how many visible recent words
-MARKOV_ALPHA = 0.5     # blend between GRU and Markov
-MARKOV_TEMP = 1.0      # temperature for Markov probs
 
 # -------------------------
 # Dataset
@@ -98,9 +90,30 @@ class RNNNextWord(nn.Module):
         token_id: (B,1) long
         """
         emb = self.embedding(token_id)          # (B,1,E)
-        out, h_next = self.rnn(emb, h)          # (B,1,H)
+        out, h_next = self.rnn(emb, h)          # out: (B,1,H)
         logits = self.fc_out(out[:, -1, :])     # (B,V)
         return logits, h_next
+
+# -------------------------
+# Broadband Quarter-Wave Recognition Model
+# -------------------------
+class BroadbandQuarterWaveNet(nn.Module):
+    def __init__(self, input_channels, num_classes):
+        super(BroadbandQuarterWaveNet, self).__init__()
+        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
 
 # -------------------------
 # Save / load
@@ -130,52 +143,6 @@ def load_checkpoint(path=CKPT_PATH):
     return ckpt
 
 # -------------------------
-# Markov (corridor compaction)
-# -------------------------
-def build_markov_model(words, order=2):
-    """
-    Simple n-gram Markov model over word strings.
-    model[context_tuple] -> Counter(next_word_string)
-    """
-    model = defaultdict(Counter)
-    if len(words) <= order:
-        return model
-    for i in range(len(words) - order):
-        ctx = tuple(words[i:i+order])
-        nx = words[i+order]
-        model[ctx][nx] += 1
-    return model
-
-def markov_next_dist(model, context_words, word_to_ix, temp=1.0):
-    """
-    context_words: list[str], recent words
-    Returns a 1D tensor over vocab with probabilities or None if no context found.
-    Backoff uses decreasing context length.
-    """
-    if len(context_words) == 0:
-        return None
-
-    max_order = min(len(context_words), MARKOV_ORDER)
-    for order in range(max_order, 0, -1):
-        ctx = tuple(context_words[-order:])
-        if ctx in model:
-            cnt = model[ctx]
-            total = sum(cnt.values())
-            probs = torch.zeros(len(word_to_ix), dtype=torch.float32)
-            for w, c in cnt.items():
-                idx = word_to_ix.get(w, 0)
-                probs[idx] = c / total
-            if temp != 1.0:
-                # soft temperature on Markov distribution
-                probs = probs.pow(1.0 / temp)
-            probs_sum = probs.sum()
-            if probs_sum <= 0:
-                return None
-            probs = probs / probs_sum
-            return probs
-    return None
-
-# -------------------------
 # FGSM on embeddings
 # -------------------------
 def fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=2.0):
@@ -184,8 +151,8 @@ def fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=2.0):
     during perturbation construction.
     """
     emb = model.embedding(x).detach().requires_grad_(True)    # (B,T,E)
-    out, _ = model.rnn(emb)                                   # (B,T,H)
-    logits = model.fc_out(out[:, -1, :])                      # (B,V)
+    out, _ = model.rnn(emb)                                  # (B,T,H)
+    logits = model.fc_out(out[:, -1, :])                     # (B,V)
     loss = criterion(logits, y)
 
     grad = torch.autograd.grad(loss, emb, retain_graph=False, create_graph=False)[0]
@@ -215,11 +182,13 @@ def train_epoch_alternating(model, optimizer, criterion, loader,
         if not do_adv:
             logits, _ = model(x)
             loss = criterion(logits, y)
+            mode = "clean"
         else:
             emb_adv = fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=clamp_val)
             out_adv, _ = model.rnn(emb_adv)
             logits_adv = model.fc_out(out_adv[:, -1, :])
             loss = criterion(logits_adv, y)
+            mode = "adv"
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -232,7 +201,7 @@ def train_epoch_alternating(model, optimizer, criterion, loader,
     return total_loss / max(1, batches)
 
 # -------------------------
-# Generation (plain GRU)
+# Generation
 # -------------------------
 @torch.no_grad()
 def generate(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
@@ -261,68 +230,10 @@ def generate(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
     return " ".join(generated)
 
 # -------------------------
-# Generation (Markov corridor)
-# -------------------------
-@torch.no_grad()
-def generate_corridor(model, word_to_ix, ix_to_word,
-                      seed_text, markov_model,
-                      corridor_len=CORRIDOR_LEN,
-                      length=50, temp=0.8,
-                      alpha=MARKOV_ALPHA,
-                      markov_temp=MARKOV_TEMP):
-    """
-    Hybrid RNN + Markov corridor:
-      - GRU sees only recent tokens (like usual).
-      - Markov model sees recent words, acts as compact summary of longer history.
-      - Next-token probs = (1-alpha)*GRU + alpha*Markov (when Markov info available).
-    """
-    model.eval()
-
-    seed_words = seed_text.split()
-    if len(seed_words) == 0:
-        seed_words = ["the"]
-
-    # corridor over seed
-    ctx_words = seed_words[-corridor_len:]
-
-    # prime GRU on corridor ids only
-    h = None
-    ids = [word_to_ix.get(w, 0) for w in ctx_words]
-    x0 = torch.tensor([ids], device=device, dtype=torch.long)
-    logits, h = model(x0, h=h)
-
-    generated = list(seed_words)
-    cur_id = torch.tensor([[ids[-1]]], device=device, dtype=torch.long)
-
-    for _ in range(length):
-        logits, h = model.forward_step(cur_id, h=h)
-        nn_probs = F.softmax(logits[0] / max(1e-6, temp), dim=-1)
-
-        # Markov corridor: use words in current visible corridor
-        ctx_words = generated[-corridor_len:]
-        mk_probs = markov_next_dist(markov_model, ctx_words, word_to_ix, temp=markov_temp)
-        if mk_probs is not None:
-            mk_probs = mk_probs.to(nn_probs.device)
-            probs = (1.0 - alpha) * nn_probs + alpha * mk_probs
-            probs = probs / probs.sum().clamp_min(1e-8)
-        else:
-            probs = nn_probs
-
-        next_ix = torch.multinomial(probs, 1).item()
-        next_word = ix_to_word[next_ix]
-        generated.append(next_word)
-        cur_id = torch.tensor([[next_ix]], device=device, dtype=torch.long)
-
-    return " ".join(generated)
-
-# -------------------------
 # Main
 # -------------------------
 if __name__ == "__main__":
     ckpt = load_checkpoint(CKPT_PATH)
-
-    markov_model = None
-    words = None
 
     if ckpt is not None:
         word_to_ix = ckpt["word_to_ix"]
@@ -344,10 +255,6 @@ if __name__ == "__main__":
         start_epoch = int(ckpt["epoch"])
         print("✅ Model fully loaded from checkpoint.")
         print(f"ℹ️  Vocab={vocab_size} | seq_len={seq_len} | embed={embed_dim} | hidden={hidden_dim} | layers={num_layers}")
-
-        # If you still have your original corpus file around, you can rebuild words & Markov here.
-        # Otherwise Markov corridor will be unavailable until you retrain once with this script.
-        # For safety, keep markov_model as None here unless you reload text.
 
     else:
         # Load corpus
@@ -382,11 +289,6 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=LR)
         criterion = nn.CrossEntropyLoss()
 
-        # Build Markov model (for corridor compaction)
-        print("🧮 Building Markov corridor model...")
-        markov_model = build_markov_model(words, order=MARKOV_ORDER)
-        print(f"Markov model states: {len(markov_model)}")
-
         print("🚀 RNN (GRU) + Alternating Clean/FGSM Training")
         epsilon = EPS_START
 
@@ -397,6 +299,10 @@ if __name__ == "__main__":
             )
             print(f"Epoch {epoch:2d}: avg_loss={avg_loss:.3f}")
 
+            if epoch % EPS_GROW_EVERY == 0:
+                epsilon = min(EPS_MAX, epsilon * EPS_GROW_MULT)
+                sample = generate(model, word_to_ix, ix_to_word, "the", length=20, temp=0.8)
+                print(f"  ↑ ε={epsilon:.3f} | Sample: {sample}")
 
         save_checkpoint(
             model, optimizer, NUM_EPOCHS, avg_loss,
@@ -404,32 +310,47 @@ if __name__ == "__main__":
             seq_len=SEQ_LEN, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS
         )
 
-    # If we didn't build Markov because we only loaded a ckpt, corridor gen will fall back to pure GRU
-    if markov_model is None:
-        print("ℹ️  No Markov model built in this run; corridor generation will fall back to pure GRU.")
-
     # Interactive generation
     print("\n🎯 Interactive mode:")
-    print("Type text and press Enter. Ctrl+C to exit.")
     while True:
         try:
             cmd = input("SEED TEXT: ").strip()
             if not cmd:
                 continue
-            seed = cmd[3:].strip() or "the"
-            if markov_model is not None:
-                out = generate_corridor(
-                    model, word_to_ix, ix_to_word,
-                    seed_text=seed,
-                    markov_model=markov_model,
-                    corridor_len=CORRIDOR_LEN,
-                    length=800,
-                    temp=0.8,
-                    alpha=MARKOV_ALPHA,
-                    markov_temp=MARKOV_TEMP
-                )
-        
+            out = generate(model, word_to_ix, ix_to_word, cmd, length=800, temp=0.8)
             print(f"CONTINUATION: {out}\n")
         except KeyboardInterrupt:
             print("\nExiting!")
             break
+
+    # Broadband Quarter-Wave Recognition Example
+    print("\n🎯 Broadband Quarter-Wave Recognition Mode:")
+    # Example data (replace with your own)
+    data = [[[0.1] * 100] for _ in range(1000)]  # Example spectrograms
+    labels = [0] * 1000  # Example labels
+
+    broadband_dataset = SpectrogramDataset(data, labels)
+    broadband_loader = DataLoader(broadband_dataset, batch_size=32, shuffle=True)
+
+    broadband_model = BroadbandQuarterWaveNet(input_channels=1, num_classes=10).to(device)
+    broadband_criterion = nn.CrossEntropyLoss()
+    broadband_optimizer = optim.Adam(broadband_model.parameters(), lr=1e-3)
+
+    broadband_model.train()
+    for epoch in range(5):
+        total_loss = 0.0
+        for data_batch, label_batch in broadband_loader:
+            data_batch = data_batch.to(device)
+            label_batch = label_batch.to(device)
+
+            broadband_optimizer.zero_grad()
+            outputs = broadband_model(data_batch)
+            loss = broadband_criterion(outputs, label_batch)
+            loss.backward()
+            broadband_optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Broadband Epoch {epoch+1}/5, Loss: {total_loss/len(broadband_loader):.4f}")
+
+    print("Broadband Quarter-Wave Recognition complete.")
