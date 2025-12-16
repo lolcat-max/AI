@@ -409,34 +409,4 @@ if __name__ == "__main__":
             print("\nExiting interactive mode.")
             break
 
-    # Broadband Quarter-Wave Recognition Example
-    print("\nBroadband Quarter-Wave Recognition Mode:")
-    # Example data (replace with your own): (N=1000, C=1, L=100)
-    data = [[[0.1] * 100] for _ in range(1000)]
-    labels = [0] * 1000
-
-    broadband_dataset = SpectrogramDataset(data, labels)
-    broadband_loader = DataLoader(broadband_dataset, batch_size=32, shuffle=True)
-
-    broadband_model = BroadbandQuarterWaveNet(input_channels=1, num_classes=10).to(device)
-    broadband_criterion = nn.CrossEntropyLoss()
-    broadband_optimizer = optim.Adam(broadband_model.parameters(), lr=1e-3)
-
-    broadband_model.train()
-    for epoch in range(5):
-        total_loss = 0.0
-        for data_batch, label_batch in broadband_loader:
-            data_batch = data_batch.to(device)
-            label_batch = label_batch.to(device)
-
-            broadband_optimizer.zero_grad(set_to_none=True)
-            outputs = broadband_model(data_batch)
-            loss = broadband_criterion(outputs, label_batch)
-            loss.backward()
-            broadband_optimizer.step()
-
-            total_loss += float(loss.item())
-
-        print(f"Broadband Epoch {epoch+1}/5, Loss: {total_loss/len(broadband_loader):.4f}")
-
-    print("Broadband Quarter-Wave Recognition complete.")
+ 
