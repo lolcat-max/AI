@@ -1,5 +1,6 @@
 import os
 import requests
+import math
 from tqdm import tqdm
 
 import torch
@@ -12,39 +13,36 @@ from torch.utils.data import Dataset, DataLoader
 # Config
 # -------------------------
 KB_len = -1
-CKPT_PATH = "rnn_alt_fgsm_model.pth"
+CKPT_PATH = "slope_tensor_fusion.pth"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model/data hyperparams (saved into checkpoint too)
+# Hyperparams
 SEQ_LEN = 8
 EMBED_DIM = 64
 HIDDEN_DIM = 128
 NUM_LAYERS = 1
 
-# Training hyperparams
+# Training
 BATCH_SIZE = 512
-LR = 1e-2
-NUM_EPOCHS = 15
+LR = 5e-3
+NUM_EPOCHS = 1
 
 EPS_START = 0.10
 EPS_MAX = 0.30
 EPS_GROW_EVERY = 4
 EPS_GROW_MULT = 1.15
 
-ADV_EVERY = 4          # 2 => clean, adv, clean, adv...
+ADV_EVERY = 4
 EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
 
 # -------------------------
-# Custom non-commutative op: (A @ B)
+# 1. Non-Commutative Physics Operators
 # -------------------------
 class NonCommutativeMatMul(torch.autograd.Function):
     """
-    Explicit autograd for matrix multiplication to emphasize non-commutative backward.
-    For C = A @ B:
-      dL/dA = dL/dC @ B^T
-      dL/dB = A^T @ dL/dC
+    Explicit autograd for A @ B emphasizing non-commutative operator mechanics.
     """
     @staticmethod
     def forward(ctx, A, B):
@@ -54,18 +52,15 @@ class NonCommutativeMatMul(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         A, B = ctx.saved_tensors
+        # dL/dA = dL/dC @ B^T
         grad_A = grad_out @ B.transpose(-1, -2)
+        # dL/dB = A^T @ dL/dC
         grad_B = A.transpose(-1, -2) @ grad_out
         return grad_A, grad_B
 
 nc_matmul = NonCommutativeMatMul.apply
 
-
 class NCLinear(nn.Module):
-    """
-    Linear layer implemented via nc_matmul so backward order is explicit.
-    Keeps parameter names 'weight'/'bias' to remain checkpoint-friendly with nn.Linear.
-    """
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         self.in_features = int(in_features)
@@ -75,104 +70,43 @@ class NCLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Same general init style as nn.Linear
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
         if self.bias is not None:
             fan_in = self.in_features
-            bound = 1 / (fan_in ** 0.5) if fan_in > 0 else 0.0
+            bound = 1 / (math.sqrt(fan_in)) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):
-        # x: (..., in_features)
-        # weight: (out_features, in_features) => use weight.T for (..., out_features)
         y = nc_matmul(x, self.weight.transpose(-1, -2))
         if self.bias is not None:
             y = y + self.bias
         return y
 
 # -------------------------
-# Dataset
+# 2. Slope Dynamics Module
 # -------------------------
-class SeqDataset(Dataset):
+class SlopeTensorLayer(nn.Module):
     """
-    Takes a word stream and returns (x_seq, y_next).
-    x_seq: (T,) token ids
-    y_next: ()  token id for next word
+    Calculates the first derivative (slope) of the embedding sequence to model momentum.
     """
-    def __init__(self, words, word_to_ix, seq_len=8):
-        self.seq_len = seq_len
-        self.word_to_ix = word_to_ix
-
-        ids = [self.word_to_ix.get(w, self.word_to_ix.get("<unk>", 0)) for w in words]
-        self.samples = []
-        for i in range(len(ids) - seq_len):
-            x = ids[i:i + seq_len]
-            y = ids[i + seq_len]
-            self.samples.append((x, y))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        x, y = self.samples[idx]
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
-
-# -------------------------
-# Model
-# -------------------------
-class RNNNextWord(nn.Module):
-    def __init__(self, vocab_size, embed_dim=64, hidden_dim=128, num_layers=1):
+    def __init__(self, embed_dim, hidden_dim):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.rnn = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-
-        # Non-commutative backward explicit linear head (checkpoint-friendly names)
-        self.fc_out = NCLinear(hidden_dim, vocab_size)
-
-    def forward(self, x, h=None):
-        """
-        x: (B,T) long
-        h: (num_layers,B,H) or None
-        returns: logits (B,V), h_next
-        """
-        emb = self.embedding(x)                 # (B,T,E)
-        out, h_next = self.rnn(emb, h)          # out: (B,T,H)
-        logits = self.fc_out(out[:, -1, :])     # (B,V)
-        return logits, h_next
-
-    def forward_step(self, token_id, h=None):
-        """
-        token_id: (B,1) long
-        """
-        emb = self.embedding(token_id)          # (B,1,E)
-        out, h_next = self.rnn(emb, h)          # out: (B,1,H)
-        logits = self.fc_out(out[:, -1, :])     # (B,V)
-        return logits, h_next
+        self.slope_projector = NCLinear(embed_dim, hidden_dim)
+        
+    def forward(self, emb):
+        # d[t] = emb[t] - emb[t-1]
+        slope = emb[:, 1:, :] - emb[:, :-1, :] 
+        
+        # Pad t=0 with zero velocity
+        b, _, e = slope.shape
+        zero_pad = torch.zeros(b, 1, e, device=emb.device, dtype=emb.dtype)
+        slope = torch.cat([zero_pad, slope], dim=1) 
+        
+        return F.tanh(self.slope_projector(slope))
 
 # -------------------------
-# Broadband Quarter-Wave Recognition Model
+# 3. Component Models
 # -------------------------
-class SpectrogramDataset(Dataset):
-    """
-    Expects:
-      data: list/array shaped like (N, C, L) (Conv1d format)
-      labels: list/array shaped like (N,)
-    """
-    def __init__(self, data, labels, dtype=torch.float32):
-        assert len(data) == len(labels)
-        self.data = data
-        self.labels = labels
-        self.dtype = dtype
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        x = torch.tensor(self.data[idx], dtype=self.dtype)
-        y = torch.tensor(self.labels[idx], dtype=torch.long)
-        return x, y
-
-
 class BroadbandQuarterWaveNet(nn.Module):
     def __init__(self, input_channels, num_classes):
         super().__init__()
@@ -180,8 +114,6 @@ class BroadbandQuarterWaveNet(nn.Module):
         self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
         self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
         self.pool = nn.AdaptiveAvgPool1d(1)
-
-        # Also use explicit non-commutative backward linear head
         self.fc = NCLinear(256, num_classes)
 
     def forward(self, x):
@@ -189,224 +121,251 @@ class BroadbandQuarterWaveNet(nn.Module):
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return x
+        x = x.view(x.size(0), -1) 
+        return self.fc(x)
+
+class RNNBranch(nn.Module):
+    def __init__(self, embed_dim, hidden_dim, vocab_size, num_layers=1):
+        super().__init__()
+        self.rnn = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.fc_out = NCLinear(hidden_dim, vocab_size)
+
+    def forward(self, emb, h=None):
+        out, h_next = self.rnn(emb, h)
+        return out, h_next 
 
 # -------------------------
-# Save / load
+# 4. Fusion Paradigm Model
 # -------------------------
-def save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, path=CKPT_PATH,
-                    seq_len=SEQ_LEN, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS):
-    ckpt = {
-        "epoch": epoch,
-        "loss": float(loss),
-        "model_state": model.state_dict(),
-        "optim_state": optimizer.state_dict(),
-        "word_to_ix": word_to_ix,
-        "ix_to_word": ix_to_word,
-        "seq_len": seq_len,
-        "embed_dim": embed_dim,
-        "hidden_dim": hidden_dim,
-        "num_layers": num_layers,
-    }
-    torch.save(ckpt, path)
-    print(f"Saved checkpoint to {path}")
+class SemanticFusionNet(nn.Module):
+    def __init__(self, vocab_size, embed_dim=64, hidden_dim=128, num_layers=1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        # Branch 1: Particle Dynamics
+        self.rnn_branch = RNNBranch(embed_dim, hidden_dim, vocab_size, num_layers)
+        
+        # Branch 2: Slope Dynamics
+        self.slope_layer = SlopeTensorLayer(embed_dim, hidden_dim)
+        self.slope_gate = nn.Linear(hidden_dim * 2, hidden_dim)
+        
+        # Branch 3: Wave Impedance
+        self.wave_branch = BroadbandQuarterWaveNet(embed_dim, vocab_size)
+        
+        # Final Readout
+        self.fc_final = NCLinear(hidden_dim, vocab_size)
 
-def load_checkpoint(path=CKPT_PATH):
-    if not os.path.exists(path):
-        return None
-    ckpt = torch.load(path, map_location=device)
-    print(f"Loaded checkpoint epoch={ckpt['epoch']} loss={ckpt['loss']:.3f}")
-    return ckpt
+    def forward(self, x, h=None):
+        emb = self.embedding(x) # (B, T, E)
+
+        # Compute Slope (Velocity)
+        slope_h = self.slope_layer(emb)
+
+        # Particle Path (RNN)
+        rnn_out, h_next = self.rnn_branch.forward(emb, h)
+
+        # Slope Fusion
+        combined = torch.cat([rnn_out, slope_h], dim=-1)
+        gate = torch.sigmoid(self.slope_gate(combined))
+        fused_state = rnn_out + (gate * slope_h)
+        
+        logits_dynamics = self.fc_final(fused_state[:, -1, :])
+
+        # Wave Path (CNN)
+        emb_permuted = emb.transpose(1, 2)
+        logits_wave = self.wave_branch(emb_permuted)
+
+        return logits_dynamics + logits_wave, h_next
+
+    def forward_from_embeddings(self, emb, h=None):
+        slope_h = self.slope_layer(emb)
+        rnn_out, h_next = self.rnn_branch.forward(emb, h)
+        
+        combined = torch.cat([rnn_out, slope_h], dim=-1)
+        gate = torch.sigmoid(self.slope_gate(combined))
+        fused_state = rnn_out + (gate * slope_h)
+        logits_dynamics = self.fc_final(fused_state[:, -1, :])
+        
+        emb_permuted = emb.transpose(1, 2)
+        logits_wave = self.wave_branch(emb_permuted)
+        
+        return logits_dynamics + logits_wave, h_next
 
 # -------------------------
-# FGSM on embeddings
+# 5. Data & Training Utils
 # -------------------------
-def fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=2.0):
-    """
-    Create adversarial embeddings for x via FGSM, without backpropagating into model params
-    during perturbation construction.
-    """
-    emb = model.embedding(x).detach().requires_grad_(True)    # (B,T,E)
-    out, _ = model.rnn(emb)                                  # (B,T,H)
-    logits = model.fc_out(out[:, -1, :])                     # (B,V)
+class SeqDataset(Dataset):
+    def __init__(self, words, word_to_ix, seq_len=8):
+        self.seq_len = seq_len
+        self.word_to_ix = word_to_ix
+        unk = self.word_to_ix.get("<unk>", 0)
+        ids = [self.word_to_ix.get(w, unk) for w in words]
+        self.samples = []
+        for i in range(len(ids) - seq_len):
+            x = ids[i : i + seq_len]
+            y = ids[i + seq_len]
+            self.samples.append((x, y))
+
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        x, y = self.samples[idx]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+def fgsm_accelerate(model, x, y, criterion, epsilon, clamp_val=2.0):
+    emb = model.embedding(x).detach().requires_grad_(True)
+    logits, _ = model.forward_from_embeddings(emb, h=None)
     loss = criterion(logits, y)
-
     grad = torch.autograd.grad(loss, emb, retain_graph=False, create_graph=False)[0]
     emb_adv = emb + epsilon * grad.sign()
     emb_adv = torch.clamp(emb_adv, -clamp_val, clamp_val).detach()
     return emb_adv
 
-# -------------------------
-# Train (alternating)
-# -------------------------
-def train_epoch_alternating(model, optimizer, criterion, loader,
-                            epsilon=0.15, adv_every=2, clamp_val=2.0):
-    """
-    Alternates computation: clean update, then adversarial update, repeating.
-    adv_every=2 => clean (step 0), adv (step 1), clean (step 2), adv (step 3), ...
-    """
+def train_epoch_fusion(model, optimizer, criterion, loader, epsilon, adv_every=2, clamp_val=2.0):
     model.train()
     total_loss, batches = 0.0, 0
-
-    progress_bar = tqdm(loader, desc=f"Epoch alt eps={epsilon:.2f}", leave=False)
-    for step, (x, y) in enumerate(progress_bar):
+    pbar = tqdm(loader, desc=f"Slope Fusion eps={epsilon:.2f}", leave=False)
+    for step, (x, y) in enumerate(pbar):
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
-
-        do_adv = (step % adv_every) == (adv_every - 1)
-
-        if not do_adv:
+        
+        if (step % adv_every) != (adv_every - 1):
             logits, _ = model(x)
             loss = criterion(logits, y)
         else:
-            emb_adv = fgsm_embeddings(model, x, y, criterion, epsilon, clamp_val=clamp_val)
-            out_adv, _ = model.rnn(emb_adv)
-            logits_adv = model.fc_out(out_adv[:, -1, :])
+            emb_adv = fgsm_accelerate(model, x, y, criterion, epsilon, clamp_val)
+            logits_adv, _ = model.forward_from_embeddings(emb_adv)
             loss = criterion(logits_adv, y)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
-
-        total_loss += float(loss.item())
+        total_loss += loss.item()
         batches += 1
-        progress_bar.set_postfix({"loss": f"{loss.item():.3f}"})
-
+        pbar.set_postfix({"loss": f"{loss.item():.3f}"})
     return total_loss / max(1, batches)
 
-# -------------------------
-# Generation
-# -------------------------
 @torch.no_grad()
 def generate(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
     model.eval()
-
-    seed_words = seed_text.split()
-    if len(seed_words) == 0:
-        seed_words = ["the"]
-
+    seed_words = seed_text.lower().split()
+    if not seed_words: seed_words = ["the"]
     unk = word_to_ix.get("<unk>", 0)
-
-    # Prime hidden state with all seed tokens
-    h = None
-    ids = [word_to_ix.get(w, unk) for w in seed_words]
-    x0 = torch.tensor([ids], device=device, dtype=torch.long)  # (1,Tseed)
-    _, h = model(x0, h=h)
-
+    current_ids = [word_to_ix.get(w, unk) for w in seed_words]
     generated = list(seed_words)
-    cur_id = torch.tensor([[ids[-1]]], device=device, dtype=torch.long)  # (1,1)
-
+    
     for _ in range(length):
-        logits, h = model.forward_step(cur_id, h=h)
-        probs = F.softmax(logits[0] / max(1e-6, float(temp)), dim=-1)
+        if len(current_ids) < SEQ_LEN:
+            inp = [0]*(SEQ_LEN - len(current_ids)) + current_ids
+        else:
+            inp = current_ids[-SEQ_LEN:]
+            
+        x_tens = torch.tensor([inp], device=device, dtype=torch.long)
+        logits, _ = model(x_tens) 
+        probs = F.softmax(logits[0] / temp, dim=-1)
         next_ix = torch.multinomial(probs, 1).item()
-        generated.append(ix_to_word[next_ix])
-        cur_id = torch.tensor([[next_ix]], device=device, dtype=torch.long)
+        word = ix_to_word[next_ix]
+        generated.append(word)
+        current_ids.append(next_ix)
 
     return " ".join(generated)
+
+# -------------------------
+# 6. Save / Load Logic
+# -------------------------
+def save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, path):
+    print(f"\nSaving checkpoint to {path}...")
+    torch.save({
+        "epoch": epoch,
+        "loss": loss,
+        "model_state": model.state_dict(),
+        "optim_state": optimizer.state_dict(),
+        "word_to_ix": word_to_ix,
+        "ix_to_word": ix_to_word,
+    }, path)
+    print("Done.")
+
+def load_checkpoint(path, model, optimizer):
+    if not os.path.exists(path):
+        return None, 1, EPS_START
+    
+    print(f"Loading checkpoint from {path}...")
+    ckpt = torch.load(path, map_location=device)
+    
+    model.load_state_dict(ckpt["model_state"])
+    optimizer.load_state_dict(ckpt["optim_state"])
+    
+    # Restore vocab maps from checkpoint to ensure consistency
+    word_to_ix = ckpt["word_to_ix"]
+    ix_to_word = ckpt["ix_to_word"]
+    
+    start_epoch = ckpt["epoch"] + 1
+    print(f"Resuming from epoch {ckpt['epoch']} (Loss: {ckpt['loss']:.4f})")
+    
+    return (word_to_ix, ix_to_word), start_epoch, EPS_START
 
 # -------------------------
 # Main
 # -------------------------
 if __name__ == "__main__":
-    ckpt = load_checkpoint(CKPT_PATH)
+    try:
+        filename = "xaa"
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f: text = f.read().lower()
+            print(f"Loaded local '{filename}'")
+        else:
+            raise FileNotFoundError
+    except FileNotFoundError:
+        print("Downloading Shakespeare fallback...")
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        text = requests.get(url, timeout=30).text.lower()
+    
+    # Init Vocab (will be overwritten if checkpoint exists)
+    words = text.split()
+    if KB_len > 0: words = words[:KB_len]
+    uniq = sorted(list(set(words)))
+    vocab = ["<unk>"] + uniq
+    word_to_ix = {w:i for i,w in enumerate(vocab)}
+    ix_to_word = {i:w for w,i in word_to_ix.items()}
+    vocab_size = len(vocab)
+    print(f"Initial Vocab: {vocab_size} | Tokens: {len(words)}")
 
-    if ckpt is not None:
-        word_to_ix = ckpt["word_to_ix"]
-        ix_to_word = ckpt["ix_to_word"]
-        vocab_size = len(word_to_ix)
+    dataset = SeqDataset(words, word_to_ix, seq_len=SEQ_LEN)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    
+    # Model Init
+    model = SemanticFusionNet(vocab_size, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Load Checkpoint
+    vocab_data, start_epoch, epsilon = load_checkpoint(CKPT_PATH, model, optimizer)
+    if vocab_data:
+        word_to_ix, ix_to_word = vocab_data
+        # Note: If vocab size changed, model loading would have failed above.
+        # Strict consistency is assumed.
 
-        seq_len = int(ckpt.get("seq_len", SEQ_LEN))
-        embed_dim = int(ckpt.get("embed_dim", EMBED_DIM))
-        hidden_dim = int(ckpt.get("hidden_dim", HIDDEN_DIM))
-        num_layers = int(ckpt.get("num_layers", NUM_LAYERS))
-
-        model = RNNNextWord(
-            vocab_size, embed_dim=embed_dim, hidden_dim=hidden_dim, num_layers=num_layers
-        ).to(device)
-
-        # Load parameters (will work if shapes match; NCLinear uses weight/bias names)
-        model.load_state_dict(ckpt["model_state"], strict=True)
-
-        optimizer = optim.Adam(model.parameters(), lr=LR)
-        optimizer.load_state_dict(ckpt["optim_state"])
-        criterion = nn.CrossEntropyLoss()
-
-        start_epoch = int(ckpt["epoch"])
-        print("Model fully loaded from checkpoint.")
-        print(f"Vocab={vocab_size} | seq_len={seq_len} | embed={embed_dim} | hidden={hidden_dim} | layers={num_layers} | start_epoch={start_epoch}")
-
-    else:
-        # Load corpus
-        try:
-            filename = input("Filename (blank = fallback Shakespeare): ").strip()
-            if filename:
-                with open(filename, "r", encoding="utf-8") as f:
-                    text = f.read().lower()
-            else:
-                raise FileNotFoundError
-            print(f"Loaded '{filename}'")
-        except FileNotFoundError:
-            url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-            text = requests.get(url, timeout=30).text.lower()
-            print("Loaded Shakespeare (fallback)")
-
-        words = text.split()
-        if KB_len is not None and isinstance(KB_len, int) and KB_len > 0:
-            words = words[:KB_len]
-
-        # Stable vocab with explicit <unk> at index 0
-        uniq = set(words)
-        vocab = (["<unk>"] + sorted(uniq)) if "<unk>" not in uniq else sorted(uniq)
-        word_to_ix = {w: i for i, w in enumerate(vocab)}
-        ix_to_word = {i: w for w, i in word_to_ix.items()}
-        vocab_size = len(word_to_ix)
-
-        print(f"Vocab: {vocab_size}, Words: {len(words)}")
-
-        dataset = SeqDataset(words, word_to_ix, seq_len=SEQ_LEN)
-        train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-        print(f"Samples: {len(dataset)} (seq_len={SEQ_LEN})")
-
-        model = RNNNextWord(vocab_size, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=LR)
-        criterion = nn.CrossEntropyLoss()
-
-        print("RNN (GRU) + Alternating Clean/FGSM Training")
-        epsilon = EPS_START
-        avg_loss = 0.0
-
-        for epoch in tqdm(range(1, NUM_EPOCHS + 1), desc="Training"):
-            avg_loss = train_epoch_alternating(
-                model, optimizer, criterion, train_loader,
-                epsilon=epsilon, adv_every=ADV_EVERY, clamp_val=EMB_CLAMP
-            )
-            print(f"Epoch {epoch:2d}: avg_loss={avg_loss:.3f}")
-
-            if epoch % EPS_GROW_EVERY == 0:
+    print("\nStarting Slope Tensor Fusion Training...")
+    
+    try:
+        for epoch in range(start_epoch, NUM_EPOCHS + 1):
+            loss = train_epoch_fusion(model, optimizer, criterion, loader, epsilon, ADV_EVERY, EMB_CLAMP)
+            
+            if epoch % EPS_GROW_EVERY == 0: 
                 epsilon = min(EPS_MAX, epsilon * EPS_GROW_MULT)
-                sample = generate(model, word_to_ix, ix_to_word, "the", length=20, temp=0.8)
-                print(f"  eps={epsilon:.3f} | Sample: {sample}")
+            
+            print(f"Epoch {epoch} | Loss: {loss:.4f} | Eps: {epsilon:.3f}")
+            
+            # Save every epoch
+            save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, CKPT_PATH)
 
-        save_checkpoint(
-            model, optimizer, NUM_EPOCHS, avg_loss,
-            word_to_ix, ix_to_word, path=CKPT_PATH,
-            seq_len=SEQ_LEN, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS
-        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Saving current state...")
+        save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, CKPT_PATH)
 
-    # Interactive generation
-    print("\nInteractive mode (Ctrl+C to exit):")
+    print("\nInteractive Generator:")
     while True:
         try:
-            cmd = input("SEED TEXT: ").strip()
-            if not cmd:
-                continue
-            out = generate(model, word_to_ix, ix_to_word, cmd, length=200, temp=0.8)
-            print(f"CONTINUATION:\n{out}\n")
-        except KeyboardInterrupt:
-            print("\nExiting interactive mode.")
-            break
-
- 
+            seed = input(">> ")
+            if not seed: continue
+            print(generate(model, word_to_ix, ix_to_word, seed, length=100))
+        except KeyboardInterrupt: break
