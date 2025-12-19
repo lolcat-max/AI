@@ -34,7 +34,7 @@ EPS_MAX = 0.30
 EPS_GROW_EVERY = 4
 EPS_GROW_MULT = 1.15
 
-ADV_EVERY = 4
+ADV_EVERY = 1
 EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
 
@@ -437,4 +437,3 @@ if __name__ == "__main__":
             gen_ids.append(next_id)
             print(i2w[next_id], end=' ', flush=True)
         print("\n")
-
