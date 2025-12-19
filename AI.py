@@ -366,7 +366,7 @@ class TextDataset(Dataset):
 if __name__ == "__main__":
     # Load Data
     try:
-        with open("xaa", "r", encoding="utf-8") as f: text = f.read().lower()
+        with open(input("Filename: "), "r", encoding="utf-8") as f: text = f.read().lower()
     except:
         try:
             text = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower()
