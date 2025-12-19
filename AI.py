@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 # -------------------------
 # Config
 # -------------------------
-KB_len = 5000
+KB_len = -1
 CKPT_PATH = "zen_neural_trainer_no_img.pth"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -437,3 +437,4 @@ if __name__ == "__main__":
             gen_ids.append(next_id)
             print(i2w[next_id], end=' ', flush=True)
         print("\n")
+
