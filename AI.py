@@ -1,6 +1,7 @@
 import os
 import requests
 import math
+import numpy as np
 from tqdm import tqdm
 
 import torch
@@ -12,8 +13,8 @@ from torch.utils.data import Dataset, DataLoader
 # -------------------------
 # Config
 # -------------------------
-KB_len = -1
-CKPT_PATH = "slope_tensor_fusion.pth"
+KB_len = 5000
+CKPT_PATH = "zen_neural_trainer_no_img.pth"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,334 +39,401 @@ EMB_CLAMP = 2.0
 GRAD_CLIP_NORM = 1.0
 
 # -------------------------
-# 1. Non-Commutative Physics Operators
+# 1. Zen Simulation Engine (2D Physics)
+# -------------------------
+# -------------------------
+# 1. Zen Simulation Engine (Recurrent Travel)
+# -------------------------
+class ZenSimulationEngine:
+    """
+    Runs a 2D particle simulation with Recurrent Travel (Memory-based trajectory).
+    """
+    def __init__(self, num_particles=200):
+        self.num_particles = num_particles
+        # State: [x, y, vx, vy, life]
+        self.particles = np.zeros((num_particles, 5), dtype=np.float32)
+        self.head_idx = 0
+        self.t = 0.0
+        self.entity_pos = np.array([0.0, 0.0], dtype=np.float32)
+        
+        # --- Recurrence State ---
+        # The 'memory' of travel. Stores accumulated momentum/bias.
+        self.recurrence_vec = np.array([0.0, 0.0], dtype=np.float32)
+        self.recurrence_decay = 0.12 # How fast history fades
+        self.feedback_strength = 0.95 # How much history affects current move
+        
+        # Default Params
+        self.speed = 0.05
+        self.decay = 0.95
+        self.emit_rate = 2
+        self.chaos = 0.02
+    
+    def get_zen_target(self, t):
+        # The "Ideal" Path (Lemniscate)
+        scale = 3.0 + np.sin(t * 0.3) * 0.5
+        denom = 1 + np.sin(t)**2
+        x = scale * np.cos(t) / denom
+        y = scale * np.sin(t) * np.cos(t) / denom
+        return np.array([x, y], dtype=np.float32)
+
+    def step(self, control_signals=None):
+        # 1. Apply Neural Modulation
+        if control_signals:
+            impulse, emotion, wave_mix = control_signals
+            target_speed = 0.05 + (emotion * 0.05) - (impulse * 0.03)
+            self.speed = 0.9 * self.speed + 0.1 * target_speed
+            
+            # Recurrence modulation: High emotion = stronger chaotic memory
+            self.feedback_strength = 0.15 + (emotion * 0.1)
+            self.recurrence_decay = 0.90 + (impulse * 0.08) # Impulse stabilizes memory
+            
+            self.chaos = 0.01 + (emotion * 0.05)
+            self.decay = 0.90 + (wave_mix * 0.09)
+
+        self.t += self.speed
+        
+        # 2. Calculate Recurrent Movement
+        # A. Where we "should" be based on the Zen formula
+        target_pos = self.get_zen_target(self.t)
+        
+        # B. Calculate the pull towards the target
+        ideal_velocity = (target_pos - self.entity_pos) * 0.1
+        
+        # C. Update Recurrence Vector (The Memory)
+        # New Recurrence = (Old Recurrence * Decay) + (Current Ideal Velocity)
+        self.recurrence_vec = (self.recurrence_vec * self.recurrence_decay) + ideal_velocity
+        
+        # D. Apply Recurrence to Position
+        # Movement is a blend of immediate target pull AND historical momentum
+        # This creates overshoots, swirls, and "orbiting" behavior around the path
+        prev_pos = self.entity_pos.copy()
+        
+        step_move = (ideal_velocity * (1.0 - self.feedback_strength)) + \
+                    (self.recurrence_vec * self.feedback_strength * 2.0)
+        
+        self.entity_pos += step_move
+        
+        # Calculate actual resulting velocity for particles
+        actual_velocity = self.entity_pos - prev_pos
+        
+        # 3. Emit Particles with Recurrent Curl
+        # Particles inherit the *recurrence vector* as well, creating curved trails
+        for _ in range(int(self.emit_rate)):
+            idx = self.head_idx
+            self.particles[idx, 0:2] = self.entity_pos
+            
+            drift = np.random.normal(0, self.chaos, 2)
+            
+            # Blend actual velocity with the hidden recurrence field
+            # This makes particles curl even after leaving the emitter
+            particle_vel = (actual_velocity * 0.4) + (self.recurrence_vec * 10.9) + drift
+            
+            self.particles[idx, 2:4] = particle_vel
+            self.particles[idx, 4] = 1.0
+            self.head_idx = (self.head_idx + 1) % self.num_particles
+            
+        # 4. Physics Update
+        self.particles[:, 0:2] += self.particles[:, 2:4]
+        self.particles[:, 2:4] *= 0.19 # Drag
+        self.particles[:, 4] *= self.decay
+        
+        return self.get_state_tensor()
+
+    def get_state_tensor(self):
+        # We also want to feed the Recurrence Vector to the Neural Net
+        # so it can "feel" the momentum.
+        
+        # Particle Data
+        p_data = self.particles[:, :4].copy()
+        p_data[:, :2] /= 4.0 
+        p_data[:, 2:4] /= 0.1
+        
+        # Recurrence Data (Append to end or mix in)
+        # For simplicity, we just use particle data here, 
+        # but the particle motion now implicitly contains recurrence info.
+        flat = torch.from_numpy(p_data.flatten())
+        return flat.to(device)
+
+
+# -------------------------
+# 2. Network Components
 # -------------------------
 class NonCommutativeMatMul(torch.autograd.Function):
-    """
-    Explicit autograd for A @ B emphasizing non-commutative operator mechanics.
-    """
     @staticmethod
     def forward(ctx, A, B):
         ctx.save_for_backward(A, B)
         return A @ B
-
     @staticmethod
     def backward(ctx, grad_out):
         A, B = ctx.saved_tensors
-        # dL/dA = dL/dC @ B^T
-        grad_A = grad_out @ B.transpose(-1, -2)
-        # dL/dB = A^T @ dL/dC
-        grad_B = A.transpose(-1, -2) @ grad_out
-        return grad_A, grad_B
+        return grad_out @ B.transpose(-1, -2), A.transpose(-1, -2) @ grad_out
 
 nc_matmul = NonCommutativeMatMul.apply
 
 class NCLinear(nn.Module):
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-        if self.bias is not None:
-            fan_in = self.in_features
-            bound = 1 / (math.sqrt(fan_in)) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        if self.bias is not None: nn.init.uniform_(self.bias, -0.1, 0.1)
     def forward(self, x):
         y = nc_matmul(x, self.weight.transpose(-1, -2))
-        if self.bias is not None:
-            y = y + self.bias
-        return y
+        return y + self.bias if self.bias is not None else y
 
-# -------------------------
-# 2. Slope Dynamics Module
-# -------------------------
-class SlopeTensorLayer(nn.Module):
-    """
-    Calculates the first derivative (slope) of the embedding sequence to model momentum.
-    """
-    def __init__(self, embed_dim, hidden_dim):
+class SimulationSensoryCortex(nn.Module):
+    def __init__(self, num_particles, output_dim=128):
         super().__init__()
-        self.slope_projector = NCLinear(embed_dim, hidden_dim)
+        input_size = num_particles * 4 # x, y, vx, vy per particle
+        self.proj = nn.Sequential(
+            NCLinear(input_size, 256),
+            nn.ReLU(),
+            NCLinear(256, output_dim),
+            nn.Tanh()
+        )
+    def forward(self, sim_state):
+        if sim_state.dim() == 1:
+            sim_state = sim_state.unsqueeze(0)
+        return self.proj(sim_state)
+
+class LogicDesignController(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.to_reward = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh())
+        self.to_dist   = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Tanh())
+        self.corr_proj = nn.Linear(hidden_dim * 2 + 1, hidden_dim)
+        self.impulse_head = nn.Linear(hidden_dim, 1)
+        self.emotion_head = nn.Linear(hidden_dim, 1)
+        self.unaware_head = nn.Linear(hidden_dim * 2 + hidden_dim + 2, 1)
+        self.temp_head = nn.Linear(3, 1)   
+        self.mix_head  = nn.Linear(3, 1)   
+
+    def forward(self, input_h):
+        # input_h now comes purely from Sim or Text, not Image
+        reward_h = self.to_reward(input_h)
+        dist_h   = self.to_dist(input_h)
+        corr = torch.tanh((reward_h * dist_h).mean(dim=-1, keepdim=True))
+        rd = torch.cat([reward_h, dist_h, corr], dim=-1)
+        corr_h = torch.tanh(self.corr_proj(rd))
+        reward_h = reward_h + 0.35 * corr_h
+        dist_h   = dist_h   + 0.35 * corr_h
         
-    def forward(self, emb):
-        # d[t] = emb[t] - emb[t-1]
-        slope = emb[:, 1:, :] - emb[:, :-1, :] 
+        impulse = torch.sigmoid(self.impulse_head(reward_h))
+        emotion = torch.sigmoid(self.emotion_head(dist_h))
+        unaware = torch.sigmoid(self.unaware_head(torch.cat([reward_h, dist_h, corr_h, impulse, emotion], dim=-1)))
         
-        # Pad t=0 with zero velocity
-        b, _, e = slope.shape
-        zero_pad = torch.zeros(b, 1, e, device=emb.device, dtype=emb.dtype)
-        slope = torch.cat([zero_pad, slope], dim=1) 
+        knobs = torch.cat([emotion, impulse, unaware], dim=-1)
+        temp_mult = 0.6 + 1.2 * torch.sigmoid(self.temp_head(knobs))
+        wave_mix  = torch.sigmoid(self.mix_head(knobs))
         
-        return F.tanh(self.slope_projector(slope))
+        return reward_h, dist_h, impulse, emotion, unaware, temp_mult, wave_mix
 
 # -------------------------
-# 3. Component Models
+# 3. Main Model
 # -------------------------
-class BroadbandQuarterWaveNet(nn.Module):
-    def __init__(self, input_channels, num_classes):
+class ZenFusionNet(nn.Module):
+    def __init__(self, vocab_size, num_particles, embed_dim=64, hidden_dim=128, num_layers=1):
         super().__init__()
-        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
-        self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = NCLinear(256, num_classes)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = self.pool(x)
-        x = x.view(x.size(0), -1) 
-        return self.fc(x)
-
-class RNNBranch(nn.Module):
-    def __init__(self, embed_dim, hidden_dim, vocab_size, num_layers=1):
-        super().__init__()
-        self.rnn = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
-        self.fc_out = NCLinear(hidden_dim, vocab_size)
-
-    def forward(self, emb, h=None):
-        out, h_next = self.rnn(emb, h)
-        return out, h_next 
-
-# -------------------------
-# 4. Fusion Paradigm Model
-# -------------------------
-class SemanticFusionNet(nn.Module):
-    def __init__(self, vocab_size, embed_dim=64, hidden_dim=128, num_layers=1):
-        super().__init__()
+        self.num_layers = num_layers
         self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+        # Cortices (Only Sim now)
+        self.sim_cortex = SimulationSensoryCortex(num_particles, output_dim=hidden_dim)
         
-        # Branch 1: Particle Dynamics
-        self.rnn_branch = RNNBranch(embed_dim, hidden_dim, vocab_size, num_layers)
-        
-        # Branch 2: Slope Dynamics
-        self.slope_layer = SlopeTensorLayer(embed_dim, hidden_dim)
+        # Logic
+        self.logic = LogicDesignController(hidden_dim)
+
+        # Dynamics
+        self.rnn_branch = nn.GRU(embed_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.slope_projector = NCLinear(embed_dim, hidden_dim)
         self.slope_gate = nn.Linear(hidden_dim * 2, hidden_dim)
+
+        # Wave
+        self.conv1 = nn.Conv1d(embed_dim, 64, 3, padding=1)
+        self.conv2 = nn.Conv1d(64, 128, 5, padding=2)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc_wave = NCLinear(128, vocab_size)
         
-        # Branch 3: Wave Impedance
-        self.wave_branch = BroadbandQuarterWaveNet(embed_dim, vocab_size)
-        
-        # Final Readout
         self.fc_final = NCLinear(hidden_dim, vocab_size)
 
-    def forward(self, x, h=None):
+    def forward(self, x, h=None, sim_tensor=None):
         emb = self.embedding(x) # (B, T, E)
 
-        # Compute Slope (Velocity)
-        slope_h = self.slope_layer(emb)
-
-        # Particle Path (RNN)
-        rnn_out, h_next = self.rnn_branch.forward(emb, h)
-
-        # Slope Fusion
-        combined = torch.cat([rnn_out, slope_h], dim=-1)
-        gate = torch.sigmoid(self.slope_gate(combined))
-        fused_state = rnn_out + (gate * slope_h)
+        # 1. Process Simulation State
+        sim_h = None
+        if sim_tensor is not None:
+            sim_h = self.sim_cortex(sim_tensor) # (B, H)
         
-        logits_dynamics = self.fc_final(fused_state[:, -1, :])
-
-        # Wave Path (CNN)
-        emb_permuted = emb.transpose(1, 2)
-        logits_wave = self.wave_branch(emb_permuted)
-
-        return logits_dynamics + logits_wave, h_next
-
-    def forward_from_embeddings(self, emb, h=None):
-        slope_h = self.slope_layer(emb)
-        rnn_out, h_next = self.rnn_branch.forward(emb, h)
+        impulse, emotion, wave_mix, temp_mult = None, None, None, None
         
-        combined = torch.cat([rnn_out, slope_h], dim=-1)
-        gate = torch.sigmoid(self.slope_gate(combined))
-        fused_state = rnn_out + (gate * slope_h)
-        logits_dynamics = self.fc_final(fused_state[:, -1, :])
+        # Use Simulation State to drive Logic Controller
+        logic_input = sim_h
         
-        emb_permuted = emb.transpose(1, 2)
-        logits_wave = self.wave_branch(emb_permuted)
-        
-        return logits_dynamics + logits_wave, h_next
-
-# -------------------------
-# 5. Data & Training Utils
-# -------------------------
-class SeqDataset(Dataset):
-    def __init__(self, words, word_to_ix, seq_len=8):
-        self.seq_len = seq_len
-        self.word_to_ix = word_to_ix
-        unk = self.word_to_ix.get("<unk>", 0)
-        ids = [self.word_to_ix.get(w, unk) for w in words]
-        self.samples = []
-        for i in range(len(ids) - seq_len):
-            x = ids[i : i + seq_len]
-            y = ids[i + seq_len]
-            self.samples.append((x, y))
-
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, idx):
-        x, y = self.samples[idx]
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
-
-def fgsm_accelerate(model, x, y, criterion, epsilon, clamp_val=2.0):
-    emb = model.embedding(x).detach().requires_grad_(True)
-    logits, _ = model.forward_from_embeddings(emb, h=None)
-    loss = criterion(logits, y)
-    grad = torch.autograd.grad(loss, emb, retain_graph=False, create_graph=False)[0]
-    emb_adv = emb + epsilon * grad.sign()
-    emb_adv = torch.clamp(emb_adv, -clamp_val, clamp_val).detach()
-    return emb_adv
-
-def train_epoch_fusion(model, optimizer, criterion, loader, epsilon, adv_every=2, clamp_val=2.0):
-    model.train()
-    total_loss, batches = 0.0, 0
-    pbar = tqdm(loader, desc=f"Slope Fusion eps={epsilon:.2f}", leave=False)
-    for step, (x, y) in enumerate(pbar):
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        
-        if (step % adv_every) != (adv_every - 1):
-            logits, _ = model(x)
-            loss = criterion(logits, y)
-        else:
-            emb_adv = fgsm_accelerate(model, x, y, criterion, epsilon, clamp_val)
-            logits_adv, _ = model.forward_from_embeddings(emb_adv)
-            loss = criterion(logits_adv, y)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-        optimizer.step()
-        total_loss += loss.item()
-        batches += 1
-        pbar.set_postfix({"loss": f"{loss.item():.3f}"})
-    return total_loss / max(1, batches)
-
-@torch.no_grad()
-def generate(model, word_to_ix, ix_to_word, seed_text, length=50, temp=0.8):
-    model.eval()
-    seed_words = seed_text.lower().split()
-    if not seed_words: seed_words = ["the"]
-    unk = word_to_ix.get("<unk>", 0)
-    current_ids = [word_to_ix.get(w, unk) for w in seed_words]
-    generated = list(seed_words)
-    
-    for _ in range(length):
-        if len(current_ids) < SEQ_LEN:
-            inp = [0]*(SEQ_LEN - len(current_ids)) + current_ids
-        else:
-            inp = current_ids[-SEQ_LEN:]
+        if logic_input is not None:
+            _, _, impulse, emotion, unaware, temp_mult, wave_mix = self.logic(logic_input)
             
-        x_tens = torch.tensor([inp], device=device, dtype=torch.long)
-        logits, _ = model(x_tens) 
-        probs = F.softmax(logits[0] / temp, dim=-1)
-        next_ix = torch.multinomial(probs, 1).item()
-        word = ix_to_word[next_ix]
-        generated.append(word)
-        current_ids.append(next_ix)
+            # Seed hidden state with Logic Context (from Simulation)
+            if h is None:
+                h = logic_input.unsqueeze(0).repeat(self.num_layers, 1, 1)
 
-    return " ".join(generated)
+        # 2. Particle Dynamics (Text)
+        slope = emb[:, 1:, :] - emb[:, :-1, :]
+        slope = torch.cat([torch.zeros(emb.size(0), 1, emb.size(2)).to(device), slope], dim=1)
+        slope_h = torch.tanh(self.slope_projector(slope))
+        
+        rnn_out, h_next = self.rnn_branch(emb, h)
+        
+        combined = torch.cat([rnn_out, slope_h], dim=-1)
+        gate = torch.sigmoid(self.slope_gate(combined))
+        
+        # Modulate Gate with Emotion/Impulse
+        if emotion is not None:
+             gate = gate * (1.0 + emotion.unsqueeze(1) * 0.5)
 
-# -------------------------
-# 6. Save / Load Logic
-# -------------------------
-def save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, path):
-    print(f"\nSaving checkpoint to {path}...")
-    torch.save({
-        "epoch": epoch,
-        "loss": loss,
-        "model_state": model.state_dict(),
-        "optim_state": optimizer.state_dict(),
-        "word_to_ix": word_to_ix,
-        "ix_to_word": ix_to_word,
-    }, path)
-    print("Done.")
+        fused = rnn_out + (gate * slope_h)
+        logits_dyn = self.fc_final(fused[:, -1, :])
 
-def load_checkpoint(path, model, optimizer):
-    if not os.path.exists(path):
-        return None, 1, EPS_START
-    
-    print(f"Loading checkpoint from {path}...")
-    ckpt = torch.load(path, map_location=device)
-    
-    model.load_state_dict(ckpt["model_state"])
-    optimizer.load_state_dict(ckpt["optim_state"])
-    
-    # Restore vocab maps from checkpoint to ensure consistency
-    word_to_ix = ckpt["word_to_ix"]
-    ix_to_word = ckpt["ix_to_word"]
-    
-    start_epoch = ckpt["epoch"] + 1
-    print(f"Resuming from epoch {ckpt['epoch']} (Loss: {ckpt['loss']:.4f})")
-    
-    return (word_to_ix, ix_to_word), start_epoch, EPS_START
+        # 3. Wave Branch
+        x_perm = emb.transpose(1, 2)
+        wave = F.relu(self.conv1(x_perm))
+        wave = F.relu(self.conv2(wave))
+        wave = self.pool(wave).view(emb.size(0), -1)
+        logits_wave = self.fc_wave(wave)
 
-# -------------------------
-# Main
-# -------------------------
-if __name__ == "__main__":
-    try:
-        filename = "xaa"
-        if os.path.exists(filename):
-            with open(filename, "r", encoding="utf-8") as f: text = f.read().lower()
-            print(f"Loaded local '{filename}'")
+        # 4. Mix
+        if wave_mix is not None:
+            logits = (1 - wave_mix) * logits_dyn + wave_mix * logits_wave
         else:
-            raise FileNotFoundError
-    except FileNotFoundError:
-        print("Downloading Shakespeare fallback...")
-        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-        text = requests.get(url, timeout=30).text.lower()
-    
-    # Init Vocab (will be overwritten if checkpoint exists)
-    words = text.split()
-    if KB_len > 0: words = words[:KB_len]
-    uniq = sorted(list(set(words)))
-    vocab = ["<unk>"] + uniq
-    word_to_ix = {w:i for i,w in enumerate(vocab)}
-    ix_to_word = {i:w for w,i in word_to_ix.items()}
-    vocab_size = len(vocab)
-    print(f"Initial Vocab: {vocab_size} | Tokens: {len(words)}")
+            logits = logits_dyn + logits_wave
 
-    dataset = SeqDataset(words, word_to_ix, seq_len=SEQ_LEN)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    
-    # Model Init
-    model = SemanticFusionNet(vocab_size, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+        # Return control signals to feedback into Simulation
+        control_signals = None
+        if impulse is not None:
+            c_imp = impulse.mean().item()
+            c_emo = emotion.mean().item()
+            c_mix = wave_mix.mean().item()
+            control_signals = (c_imp, c_emo, c_mix)
+
+        return logits, h_next, temp_mult, control_signals
+
+# -------------------------
+# 4. Training Loop
+# -------------------------
+def train(model, optimizer, loader, sim_engine, num_epochs):
     criterion = nn.CrossEntropyLoss()
     
-    # Load Checkpoint
-    vocab_data, start_epoch, epsilon = load_checkpoint(CKPT_PATH, model, optimizer)
-    if vocab_data:
-        word_to_ix, ix_to_word = vocab_data
-        # Note: If vocab size changed, model loading would have failed above.
-        # Strict consistency is assumed.
+    for epoch in range(1, num_epochs+1):
+        total_loss = 0
+        pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
+        
+        for x, y in pbar:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            
+            # 1. Step Simulation
+            sim_flat = sim_engine.step() 
+            sim_batch = sim_flat.unsqueeze(0).expand(x.size(0), -1)
+            
+            # 2. Forward Pass (No Image)
+            logits, _, _, controls = model(x, sim_tensor=sim_batch)
+            
+            # 3. Feedback
+            if controls:
+                sim_engine.step(control_signals=controls)
+            
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            
+            pbar.set_postfix({"loss": f"{loss.item():.3f}", "speed": f"{sim_engine.speed:.3f}"})
+            
+        print(f"Epoch {epoch} Done. Loss: {total_loss/len(loader):.4f}")
+        torch.save(model.state_dict(), CKPT_PATH)
 
-    print("\nStarting Slope Tensor Fusion Training...")
-    
+# -------------------------
+# 5. Utils & Main
+# -------------------------
+class TextDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        x_list, y_val = self.data[idx]
+        return torch.tensor(x_list, dtype=torch.long), torch.tensor(y_val, dtype=torch.long)
+
+if __name__ == "__main__":
+    # Load Data
     try:
-        for epoch in range(start_epoch, NUM_EPOCHS + 1):
-            loss = train_epoch_fusion(model, optimizer, criterion, loader, epsilon, ADV_EVERY, EMB_CLAMP)
-            
-            if epoch % EPS_GROW_EVERY == 0: 
-                epsilon = min(EPS_MAX, epsilon * EPS_GROW_MULT)
-            
-            print(f"Epoch {epoch} | Loss: {loss:.4f} | Eps: {epsilon:.3f}")
-            
-            # Save every epoch
-            save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, CKPT_PATH)
+        with open("xaa", "r", encoding="utf-8") as f: text = f.read().lower()
+    except:
+        try:
+            text = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower()
+        except:
+            text = "hello world " * 1000
+        
+    words = text.split()[:KB_len]
+    vocab = sorted(list(set(words)))
+    w2i = {w:i for i,w in enumerate(vocab)}
+    i2w = {i:w for w,i in w2i.items()}
+    
+    raw_samples = []
+    for i in range(len(words)-SEQ_LEN):
+        raw_samples.append((
+            [w2i[w] for w in words[i:i+SEQ_LEN]],
+            w2i[words[i+SEQ_LEN]]
+        ))
+    
+    dataset = TextDataset(raw_samples)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    
+    # Init Components (No Image Tensor)
+    sim_engine = ZenSimulationEngine(num_particles=200)
+    
+    model = ZenFusionNet(len(vocab), num_particles=200).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    
+    if os.path.exists(CKPT_PATH):
+        print("Loading checkpoint...")
+        try:
+            model.load_state_dict(torch.load(CKPT_PATH))
+        except:
+            print("Checkpoint mismatch or error, starting fresh.")
 
+    print("Starting Zen Neural Trainer (Sim Only)...")
+    try:
+        train(model, optimizer, loader, sim_engine, NUM_EPOCHS)
     except KeyboardInterrupt:
-        print("\nTraining interrupted. Saving current state...")
-        save_checkpoint(model, optimizer, epoch, loss, word_to_ix, ix_to_word, CKPT_PATH)
+        print("Saving...")
+        torch.save(model.state_dict(), CKPT_PATH)
 
     print("\nInteractive Generator:")
     while True:
-        try:
-            seed = input(">> ")
-            if not seed: continue
-            print(generate(model, word_to_ix, ix_to_word, seed, length=100))
-        except KeyboardInterrupt: break
+        seed = input(">> ")
+        if not seed: break
+        
+        model.eval()
+        gen_ids = [w2i.get(w, 0) for w in seed.split()]
+        
+        print(f"[Sim State] Pos: {sim_engine.entity_pos} | Speed: {sim_engine.speed:.3f}")
+        
+        for _ in range(500):
+            sim_flat = sim_engine.step()
+            
+            inp = gen_ids[-SEQ_LEN:]
+            if len(inp) < SEQ_LEN: inp = [0]*(SEQ_LEN-len(inp)) + inp
+            xt = torch.tensor([inp], device=device)
+            sim_t = sim_flat.unsqueeze(0)
+            
+            with torch.no_grad():
+                logits, _, temp_mult, ctrls = model(xt, sim_tensor=sim_t)
+            
+            if ctrls: sim_engine.step(ctrls)
+
+            temp = 0.6 * (temp_mult.item() if temp_mult else 1.0)
+            probs = F.softmax(logits[0] / temp, dim=-1)
+            next_id = torch.multinomial(probs, 1).item()
+            gen_ids.append(next_id)
+            print(i2w[next_id], end=' ', flush=True)
+        print("\n")
