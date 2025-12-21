@@ -290,7 +290,7 @@ def answer_question(question: str) -> str:
 # ------------ Demo ------------
 if __name__ == "__main__":
     try:
-        with open(input("Filename: "), "r", encoding="utf-8") as f:
+        with open(input("QA Core Filename: "), "r", encoding="utf-8") as f:
             corpus = f.read().lower()
     except:
         try:
@@ -301,5 +301,5 @@ if __name__ == "__main__":
 
     ingest_corpus(corpus)
     while True:
-        print("A:", answer_question(input("USER: ")))
+        print("Product:", answer_question(input("USER: ")))
         print()
