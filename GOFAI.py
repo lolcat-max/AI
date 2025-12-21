@@ -47,8 +47,9 @@ def add_fact(action: str, obj: str, subject: Optional[str] = None, place: Option
         fact["answer"] = subject   # used for WHO / WHAT
     if place:
         fact["place"] = place      # used for WHERE
-    KNOWLEDGE_BASE.append(fact)
 
+    if fact not in KNOWLEDGE_BASE:   # simple dedup
+        KNOWLEDGE_BASE.append(fact)
 
 # ------------ WordNet helpers ------------
 
@@ -248,8 +249,9 @@ def object_matches(kb_obj: str, query_obj: Optional[str]) -> bool:
         q_expanded |= wn_synonym_set(l)
 
     return bool(kb_expanded & q_expanded)
+def infer_answer(ctx: DescriptorContext) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
 
-def infer_answer(ctx: DescriptorContext) -> Dict[str, Any]:
     for fact in KNOWLEDGE_BASE:
         kb_obj = fact.get("obj")
         kb_action = fact.get("action")
@@ -267,31 +269,46 @@ def infer_answer(ctx: DescriptorContext) -> Dict[str, Any]:
                 continue
 
         if ctx.qtype == "WHO" and "answer" in fact:
-            return {"person": fact["answer"], "obj": kb_obj, "action": kb_action}
+            results.append(
+                {"type": "WHO", "person": fact["answer"], "obj": kb_obj, "action": kb_action}
+            )
+        elif ctx.qtype == "WHERE" and "place" in fact:
+            results.append(
+                {"type": "WHERE", "place": fact["place"], "obj": kb_obj, "action": kb_action}
+            )
+        elif ctx.qtype == "WHAT" and "answer" in fact:
+            results.append(
+                {"type": "WHAT", "thing": f"{kb_obj} is associated with {fact['answer']}"}
+            )
 
-        if ctx.qtype == "WHERE" and "place" in fact:
-            return {"place": fact["place"], "obj": kb_obj, "action": kb_action}
+    return results
 
-        if ctx.qtype == "WHAT" and "answer" in fact:
-            return {"thing": f"{kb_obj} is associated with {fact['answer']}"}
-
-    return {}
 
 
 # ------------ 5. Realization ------------
 
-def realize_answer(question: str, ctx: DescriptorContext, bindings: Dict[str, Any]) -> str:
-    if not bindings:
+def realize_answer(question: str, ctx: DescriptorContext, bindings_list: List[Dict[str, Any]]) -> str:
+    if not bindings_list:
         return "I do not know the answer to that."
-    obj = bindings.get("obj", ctx.obj)
-    action = bindings.get("action", ctx.action)
-    if "person" in bindings:
-        return f"{bindings['person']} {action} {obj}."
-    if "place" in bindings:
-        return f"{obj.capitalize()} is located in {bindings['place']}."
-    if "thing" in bindings:
-        return bindings["thing"]
-    return "I have some data, but cannot express it clearly."
+
+    lines = []
+    for bindings in bindings_list:
+        obj = bindings.get("obj", ctx.obj)
+        action = bindings.get("action", ctx.action)
+
+        if bindings.get("type") == "WHO" and "person" in bindings:
+            lines.append(f"{bindings['person']} {action} {obj}.")
+        elif bindings.get("type") == "WHERE" and "place" in bindings:
+            lines.append(f"{obj.capitalize()} is located in {bindings['place']}.")
+        elif bindings.get("type") == "WHAT" and "thing" in bindings:
+            lines.append(bindings["thing"])
+
+    # if something went wrong and lines is empty, fall back
+    if not lines:
+        return "I have some data, but cannot express it clearly."
+
+    # join multiple answers; you can change separator if you like
+    return "\n".join(lines)
 
 
 # ------------ Public API ------------
@@ -300,8 +317,8 @@ def answer_question(question: str) -> str:
     pd = build_prompt_descriptor(question)
     sd = build_syntax_descriptor(pd)
     ctx = build_context(pd, sd)
-    bindings = infer_answer(ctx)
-    return realize_answer(question, ctx, bindings)
+    bindings_list = infer_answer(ctx)
+    return realize_answer(question, ctx, bindings_list)
 
 
 # ------------ Demo ------------
