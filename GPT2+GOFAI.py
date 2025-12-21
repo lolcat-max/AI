@@ -7,9 +7,9 @@ from nltk.corpus import wordnet as wn
 from nltk.stem import WordNetLemmatizer
 from nltk import word_tokenize, pos_tag, sent_tokenize
 from nltk.chunk import RegexpParser
+from transformers import pipeline
 
 # ------------ NLTK resources ------------
-
 for pkg in ["punkt", "averaged_perceptron_tagger", "wordnet", "omw-1.4"]:
     try:
         nltk.data.find(pkg)
@@ -38,21 +38,18 @@ class DescriptorContext:
     modifiers: Dict[str, str]
 
 # ------------ KB (dynamic) ------------
-
 KNOWLEDGE_BASE: List[Dict[str, Any]] = []
 
 def add_fact(action: str, obj: str, subject: Optional[str] = None, place: Optional[str] = None):
     fact: Dict[str, Any] = {"action": action, "obj": obj}
     if subject:
-        fact["answer"] = subject   # used for WHO / WHAT
+        fact["answer"] = subject
     if place:
-        fact["place"] = place      # used for WHERE
-
-    if fact not in KNOWLEDGE_BASE:   # simple dedup
+        fact["place"] = place
+    if fact not in KNOWLEDGE_BASE:
         KNOWLEDGE_BASE.append(fact)
 
 # ------------ WordNet helpers ------------
-
 def wn_lemmatize_verb(token: str) -> str:
     v = lemmatizer.lemmatize(token, pos="v")
     if v != token:
@@ -73,9 +70,7 @@ def wn_synonym_set(phrase: str) -> Set[str]:
             syns.add(name)
     return syns
 
-
 # ------------ 0. IE: SVO + location with RegexpParser ------------
-
 GRAMMAR = r"""
   NP: {<DT|PRP\$|JJ|NNP|NNPS|NN|NNS>+}
   VP: {<VB|VBD|VBG|VBN|VBP|VBZ><RB>*}
@@ -84,9 +79,6 @@ GRAMMAR = r"""
 chunker = RegexpParser(GRAMMAR)
 
 def triples_from_sentence(sent: str):
-    """
-    Very shallow heuristic SVO extractor: NP before VP, NP after VP.[web:75][web:107]
-    """
     tokens = word_tokenize(sent)
     tagged = pos_tag(tokens)
     tree = chunker.parse(tagged)
@@ -96,7 +88,6 @@ def triples_from_sentence(sent: str):
     objects: List[str] = []
 
     last_vp_seen = False
-
     for subtree in tree:
         if isinstance(subtree, nltk.Tree) and subtree.label() == "NP":
             np_text = " ".join(tok for tok, _ in subtree.leaves())
@@ -119,33 +110,23 @@ def triples_from_sentence(sent: str):
     return triples
 
 def location_from_sentence(sent: str):
-    """
-    Heuristic for 'X is in Y' / 'X is located in Y'.[web:75]
-    """
     tokens = word_tokenize(sent)
     tagged = pos_tag(tokens)
-    # look for pattern: NP 'is' 'located'? 'in' NP
     words = [w for w, t in tagged]
     tags = [t for w, t in tagged]
 
     results = []
     for i, (w, t) in enumerate(zip(words, tags)):
         if w.lower() in {"is", "was", "are"}:
-            # preceding NP
             left = words[max(0, i-3):i]
             left_tags = tags[max(0, i-3):i]
-            if not left:
-                continue
-            if not any(tag.startswith("NN") for tag in left_tags):
+            if not left or not any(tag.startswith("NN") for tag in left_tags):
                 continue
             thing = " ".join(left)
 
-            # optional 'located'
             j = i + 1
             if j < len(words) and words[j].lower() == "located":
                 j += 1
-
-            # 'in' + NP
             if j < len(words) and words[j].lower() == "in":
                 k = j + 1
                 right = words[k:k+3]
@@ -161,15 +142,12 @@ def ingest_corpus(text: str):
             obj_norm = wn_lemmatize_noun_phrase(obj)
             subj_norm = wn_lemmatize_noun_phrase(subj)
             add_fact(action=action, obj=obj_norm, subject=subj_norm)
-
         for thing, _, place in location_from_sentence(sent):
             obj_norm = wn_lemmatize_noun_phrase(thing)
             place_norm = wn_lemmatize_noun_phrase(place)
             add_fact(action="located", obj=obj_norm, place=place_norm)
 
-
 # ------------ 1. Prompt Descriptor ------------
-
 def build_prompt_descriptor(question: str) -> PromptDescriptor:
     text = question.strip().lower()
     m = re.match(r"^(\w+)", text)
@@ -177,14 +155,11 @@ def build_prompt_descriptor(question: str) -> PromptDescriptor:
     qtype = first.upper() if first in WH_WORDS else "UNKNOWN"
     return PromptDescriptor(qtype=qtype, raw=question)
 
-
 # ------------ 2. Syntax Descriptor ------------
-
 def tokenize_question(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z']+", text.lower())
 
 def find_main_verb_q(tokens: List[str]) -> Optional[str]:
-    # skip initial wh-word if present
     start = 1 if tokens and tokens[0] in WH_WORDS else 0
     for tok in tokens[start:]:
         if wn.synsets(tok, pos=wn.VERB):
@@ -199,7 +174,7 @@ def extract_object_q(tokens: List[str], verb: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     stop_words = WH_WORDS | {"the", "a", "an", "of", "did", "do", "is", "was", "in"}
-    obj_tokens = [t for t in tokens[idx + 1 :] if t not in stop_words]
+    obj_tokens = [t for t in tokens[idx + 1:] if t not in stop_words]
     if not obj_tokens:
         return None
     return " ".join(obj_tokens)
@@ -215,40 +190,30 @@ def build_syntax_descriptor(pd: PromptDescriptor) -> SyntaxDescriptor:
         modifiers["ASK_PLACE"] = "true"
     return SyntaxDescriptor(verb=verb, obj=obj, modifiers=modifiers)
 
-
 # ------------ 3. Descriptor Context ------------
 def build_context(pd: PromptDescriptor, sd: SyntaxDescriptor) -> DescriptorContext:
     action = wn_lemmatize_verb(sd.verb) if sd.verb else None
     obj = wn_lemmatize_noun_phrase(sd.obj) if sd.obj else None
     return DescriptorContext(qtype=pd.qtype, action=action, obj=obj, modifiers=sd.modifiers)
 
-
 # ------------ 4. Inference ------------
 def object_matches(kb_obj: str, query_obj: Optional[str]) -> bool:
     if not query_obj:
         return False
-
-    # exact equality of normalized phrases
     if kb_obj == query_obj:
         return True
-
     kb_lemmas = set(kb_obj.split())
     q_lemmas = set(query_obj.split())
-
-    # direct lemma overlap (multiword context is fine)
     if kb_lemmas & q_lemmas:
         return True
-
-    # synonym-expanded overlap per lemma
     kb_expanded: Set[str] = set(kb_lemmas)
     for l in kb_lemmas:
         kb_expanded |= wn_synonym_set(l)
-
     q_expanded: Set[str] = set(q_lemmas)
     for l in q_lemmas:
         q_expanded |= wn_synonym_set(l)
-
     return bool(kb_expanded & q_expanded)
+
 def infer_answer(ctx: DescriptorContext) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
@@ -257,8 +222,6 @@ def infer_answer(ctx: DescriptorContext) -> List[Dict[str, Any]]:
         kb_action = fact.get("action")
         if kb_obj is None or kb_action is None:
             continue
-
-        # WHO/WHERE rely mainly on object semantics
         if ctx.qtype in {"WHO", "WHERE"}:
             if not object_matches(kb_obj, ctx.obj):
                 continue
@@ -267,52 +230,56 @@ def infer_answer(ctx: DescriptorContext) -> List[Dict[str, Any]]:
                 continue
             if not object_matches(kb_obj, ctx.obj):
                 continue
-
         if ctx.qtype == "WHO" and "answer" in fact:
-            results.append(
-                {"type": "WHO", "person": fact["answer"], "obj": kb_obj, "action": kb_action}
-            )
+            results.append({"type": "WHO", "person": fact["answer"], "obj": kb_obj, "action": kb_action})
         elif ctx.qtype == "WHERE" and "place" in fact:
-            results.append(
-                {"type": "WHERE", "place": fact["place"], "obj": kb_obj, "action": kb_action}
-            )
+            results.append({"type": "WHERE", "place": fact["place"], "obj": kb_obj, "action": kb_action})
         elif ctx.qtype == "WHAT" and "answer" in fact:
-            results.append(
-                {"type": "WHAT", "thing": f"{kb_obj} is associated with {fact['answer']}"}
-            )
+            results.append({"type": "WHAT", "thing": f"{kb_obj} is associated with {fact['answer']}"})
 
     return results
 
-
-
-# ------------ 5. Realization ------------
+# ------------ 5. Realization with LLM extension ------------
+# ------------ 5. Realization with LLM extension and CoT ------------
+# ------------ 5. Realization with LLM extension and CoT ------------
+llm_pipeline = pipeline("text-generation", model="gpt2", max_new_tokens=1000)
 
 def realize_answer(question: str, ctx: DescriptorContext, bindings_list: List[Dict[str, Any]]) -> str:
-    if not bindings_list:
-        return "I do not know the answer to that."
-
     lines = []
     for bindings in bindings_list:
         obj = bindings.get("obj", ctx.obj)
         action = bindings.get("action", ctx.action)
 
         if bindings.get("type") == "WHO" and "person" in bindings:
-            lines.append(f"{bindings['person']} {action} {obj}.")
+            answer = f"{bindings['person']} {action} {obj}."
         elif bindings.get("type") == "WHERE" and "place" in bindings:
-            lines.append(f"{obj.capitalize()} is located in {bindings['place']}.")
+            answer = f"{obj.capitalize()} is located in {bindings['place']}."
         elif bindings.get("type") == "WHAT" and "thing" in bindings:
-            lines.append(bindings["thing"])
+            answer = bindings["thing"]
+        else:
+            answer = "I have some data, but cannot express it clearly."
 
-    # if something went wrong and lines is empty, fall back
-    if not lines:
-        return "I have some data, but cannot express it clearly."
+        # Chain-of-thought prompt
+        cot_prompt = (
+            f"{question} {answer}\n"
+           
+        )
 
-    # join multiple answers; you can change separator if you like
-    return "\n".join(lines)
+        try:
+            result = llm_pipeline(cot_prompt, num_return_sequences=1)
+            cot_answer = result[0]['generated_text'].strip()
+            lines.append(cot_answer)
+            return lines[0]
+        except Exception as e:
+            lines.append(answer)
+            return lines[0]
+        break
+    return "I have no data."
+    
+
 
 
 # ------------ Public API ------------
-
 def answer_question(question: str) -> str:
     pd = build_prompt_descriptor(question)
     sd = build_syntax_descriptor(pd)
@@ -320,14 +287,14 @@ def answer_question(question: str) -> str:
     bindings_list = infer_answer(ctx)
     return realize_answer(question, ctx, bindings_list)
 
-
 # ------------ Demo ------------
-
 if __name__ == "__main__":
     try:
-        with open(input("Filename: "), "r", encoding="utf-8") as f: corpus = f.read().lower()
+        with open(input("Filename: "), "r", encoding="utf-8") as f:
+            corpus = f.read().lower()
     except:
         try:
+            import requests
             corpus = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower()
         except:
             corpus = "hello world " * 1000
