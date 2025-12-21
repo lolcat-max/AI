@@ -183,10 +183,12 @@ def tokenize_question(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z']+", text.lower())
 
 def find_main_verb_q(tokens: List[str]) -> Optional[str]:
-    for tok in tokens:
+    # skip initial wh-word if present
+    start = 1 if tokens and tokens[0] in WH_WORDS else 0
+    for tok in tokens[start:]:
         if wn.synsets(tok, pos=wn.VERB):
             return tok
-    return tokens[1] if len(tokens) > 1 else None
+    return None
 
 def extract_object_q(tokens: List[str], verb: Optional[str]) -> Optional[str]:
     if verb is None:
@@ -224,16 +226,28 @@ def build_context(pd: PromptDescriptor, sd: SyntaxDescriptor) -> DescriptorConte
 def object_matches(kb_obj: str, query_obj: Optional[str]) -> bool:
     if not query_obj:
         return False
+
+    # exact equality of normalized phrases
     if kb_obj == query_obj:
         return True
-    q_syns = wn_synonym_set(query_obj)
-    kb_syns = wn_synonym_set(kb_obj)
-    if kb_obj in q_syns or query_obj in kb_syns:
-        return True
-    if q_syns.intersection(kb_syns):
-        return True
-    return False
 
+    kb_lemmas = set(kb_obj.split())
+    q_lemmas = set(query_obj.split())
+
+    # direct lemma overlap (multiword context is fine)
+    if kb_lemmas & q_lemmas:
+        return True
+
+    # synonym-expanded overlap per lemma
+    kb_expanded: Set[str] = set(kb_lemmas)
+    for l in kb_lemmas:
+        kb_expanded |= wn_synonym_set(l)
+
+    q_expanded: Set[str] = set(q_lemmas)
+    for l in q_lemmas:
+        q_expanded |= wn_synonym_set(l)
+
+    return bool(kb_expanded & q_expanded)
 
 def infer_answer(ctx: DescriptorContext) -> Dict[str, Any]:
     for fact in KNOWLEDGE_BASE:
