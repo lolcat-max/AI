@@ -261,7 +261,7 @@ def realize_answer(question: str, ctx: DescriptorContext, bindings_list: List[Di
 
         # Chain-of-thought prompt
         cot_prompt = (
-            f"{question} {answer}\n"
+            f" {answer}, {question}\n {action}?"
            
         )
 
