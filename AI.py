@@ -139,10 +139,6 @@ if __name__ == "__main__":
     
     model = PlainNeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
-    
-    if os.path.exists(CKPT_PATH):
-        model.load_state_dict(torch.load(CKPT_PATH))
-        print("Loaded Checkpoint.")
 
     # Training
     criterion = nn.CrossEntropyLoss()
