@@ -106,6 +106,9 @@ def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500
             mask = inverter.get_mask(gen_ids[-2])
             constrained_logits = logits[0] + mask
             
+            mask = inverter.get_mask(gen_ids[-3])
+            constrained_logits = logits[0] + mask
+            
             probs = F.softmax(constrained_logits, dim=-1)
             
             # If choose_words is specified, segment probs to only those words
