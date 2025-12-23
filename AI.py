@@ -21,7 +21,7 @@ HIDDEN_DIM = 128
 NUM_LAYERS = 2
 BATCH_SIZE = 512
 LR = 5e-3
-NUM_EPOCHS = 5 #Trained lingual styles
+NUM_EPOCHS = 50 #Trained lingual styles
 
 # -------------------------
 # 1. Dataset & CKY Inverter
