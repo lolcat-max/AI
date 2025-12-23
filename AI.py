@@ -11,17 +11,17 @@ from tqdm import tqdm
 # -------------------------
 # Config
 # -------------------------
-KB_len = 9999
+KB_len = -1
 CKPT_PATH = "cky_neural_trainer.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
-EMBED_DIM = 640
-HIDDEN_DIM = 1280
+EMBED_DIM = 64
+HIDDEN_DIM = 128
 NUM_LAYERS = 2
 BATCH_SIZE = 512
 LR = 5e-3
-NUM_EPOCHS = 10
+NUM_EPOCHS = 1
 
 # -------------------------
 # 1. Dataset & CKY Inverter
@@ -101,6 +101,9 @@ def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500
             
             # Apply CKY Matrix Mask
             mask = inverter.get_mask(gen_ids[-1])
+            constrained_logits = logits[0] + mask
+            
+            mask = inverter.get_mask(gen_ids[-2])
             constrained_logits = logits[0] + mask
             
             probs = F.softmax(constrained_logits, dim=-1)
