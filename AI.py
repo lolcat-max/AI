@@ -89,7 +89,7 @@ class TextDataset(Dataset):
 # -------------------------
 # 3. Generation & Inference
 # -------------------------
-def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500):
+def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500, choose_words=None):
     model.eval()
     gen_ids = [w2i.get(w, 0) for w in seed.split()]
     
@@ -99,15 +99,28 @@ def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500
         with torch.no_grad():
             logits, _ = model(inp)
             
-            # INVERSION: Apply CKY Matrix Mask
+            # Apply CKY Matrix Mask
             mask = inverter.get_mask(gen_ids[-1])
             constrained_logits = logits[0] + mask
             
             probs = F.softmax(constrained_logits, dim=-1)
-            next_id = torch.multinomial(probs, 1).item()
+            
+            # If choose_words is specified, segment probs to only those words
+            if choose_words is not None:
+                # Get indices for the two words
+                indices = [w2i.get(w, 0) for w in choose_words]
+                probs_segment = probs[indices]
+                probs_segment = probs_segment / probs_segment.sum()  # Normalize
+                # Sample from only these two
+                next_id = np.random.choice(indices, p=probs_segment.cpu().numpy())
+            else:
+                # Default: sample from all words
+                next_id = torch.multinomial(probs, 1).item()
+            
             gen_ids.append(next_id)
             print(i2w[next_id], end=' ', flush=True)
     print("\n")
+
 
 # -------------------------
 # 4. Main Execution
