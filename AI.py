@@ -74,7 +74,7 @@ def generate_text(model, seed, w2i, i2w, seq_len, max_len=500, choose_words=None
             logits, _ = model(inp)
             
             
-            probs = F.softmax(constrained_logits, dim=-1)
+            probs = F.softmax(logits, dim=-1)
             
             # If choose_words is specified, segment probs to only those words
             if choose_words is not None:
