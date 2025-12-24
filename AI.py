@@ -12,14 +12,14 @@ from tqdm import tqdm
 # Config
 # -------------------------
 KB_len = -1
-CKPT_PATH = "cky_neural_trainer.pth"
+CKPT_PATH = "neural_trained.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
 EMBED_DIM = 64
-HIDDEN_DIM = 128
+HIDDEN_DIM = 512
 NUM_LAYERS = 2
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 LR = 5e-3
 NUM_EPOCHS = 1
 
@@ -144,23 +144,31 @@ if __name__ == "__main__":
 
     # Training
     criterion = nn.CrossEntropyLoss()
+
     for epoch in range(1, NUM_EPOCHS + 1):
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
+        i = 0
         for x, y in pbar:
             x, y = x.to(device), y.to(device)
-            # Clamp target indices to valid range before modification
+            # Clamp target indices to valid range
             y = torch.clamp(y, 0, len(vocab) - 1)
-            # Modify the first label in the batch by adding the last label
             
-            for i in range(9999):
-                y[i%EMBED_DIM] = (y[i%EMBED_DIM+1] + y[-1]) % (i+1)
-
+            # Ensure indices are within tensor dimensions
+            batch_size, seq_len = x.shape
+            idx_batch = i % batch_size
+            idx_seq = (i % EMBED_DIM + 1) % seq_len
+            
+            # Modify x[idx_batch, idx_seq] using y[idx_batch]
+            if batch_size > 0 and seq_len > 0:
+                x[idx_batch, idx_seq] = (y[idx_batch] + x[idx_batch, idx_seq]) % len(vocab)
+            
             optimizer.zero_grad()
             logits, _ = model(x)
             loss = criterion(logits, y)
             loss.backward()
             optimizer.step()
             pbar.set_postfix(loss=f"{loss.item():.3f}")
+            i += 1
         torch.save(model.state_dict(), CKPT_PATH)
 
     # Interactive Inverted CKY Generation
