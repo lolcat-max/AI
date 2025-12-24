@@ -167,7 +167,7 @@ if __name__ == "__main__":
             
             # Modify x[idx_batch, idx_seq] using y[idx_batch]
             if batch_size > 0 and seq_len > 0:
-                x[idx_batch, idx_seq] = (y[idx_batch] + x[idx_batch, idx_seq]) % len(vocab)
+                x[idx_batch, idx_seq] = (y[idx_batch] - x[idx_batch, idx_seq]) % len(vocab)
             
             optimizer.zero_grad()
             logits, _ = model(x)
