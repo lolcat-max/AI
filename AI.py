@@ -12,7 +12,7 @@ from tqdm import tqdm
 # Config
 # -------------------------
 KB_len = -1
-CKPT_PATH = "neural_trained.pth"
+CKPT_PATH = "cky_neural_trainer.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
@@ -21,7 +21,7 @@ HIDDEN_DIM = 128
 NUM_LAYERS = 2
 BATCH_SIZE = 512
 LR = 5e-3
-NUM_EPOCHS = 150 #Trained lingual styles
+NUM_EPOCHS = 1
 
 # -------------------------
 # 1. Dataset & CKY Inverter
@@ -35,9 +35,11 @@ def load_data(filename):
     return text.split()[:KB_len]
 
 class CKYInverter:
+    """Inverts CKY logic: Induces a transition matrix to constrain neural output."""
     def __init__(self, words, w2i):
         self.vocab_size = len(w2i)
         self.w2i = w2i
+        # The 'CKY Matrix' representation: rows=current_word, cols=next_word
         self.matrix = torch.zeros((self.vocab_size, self.vocab_size), device=device)
         self._induce_matrix(words)
 
@@ -49,12 +51,13 @@ class CKYInverter:
                 self.matrix[self.w2i[w1], self.w2i[w2]] = 1.0
 
     def get_mask(self, last_word_id):
+        """Returns a logit mask (-inf for illegal transitions)."""
         mask = torch.full((self.vocab_size,), -float('inf'), device=device)
         valid_indices = torch.where(self.matrix[last_word_id] > 0)[0]
         if len(valid_indices) > 0:
             mask[valid_indices] = 0.0
         else:
-            mask.fill_(0.0)
+            mask.fill_(0.0) # Fallback if word was a leaf/terminal
         return mask
 
 # -------------------------
@@ -76,79 +79,53 @@ class TextDataset(Dataset):
     def __init__(self, words, w2i, seq_len):
         self.samples = []
         for i in range(len(words) - seq_len):
-            x = [w2i.get(w, 0) for w in words[i:i + seq_len]]
-            y = w2i.get(words[i + seq_len], 0)
+            x = [w2i[w] for w in words[i:i + seq_len]]
+            y = w2i[words[i + seq_len]]
             self.samples.append((torch.tensor(x), torch.tensor(y)))
     
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
 
 # -------------------------
-# 3. Generation with Flexible Sampling
+# 3. Generation & Inference
 # -------------------------
-def generate_text_restructured(model, inverter, seed, w2i, i2w, seq_len, max_len=500, choose_words=None, sampling_strategy=None):
+def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500, choose_words=None):
     model.eval()
     gen_ids = [w2i.get(w, 0) for w in seed.split()]
+    
     print(f"\n>> Seed: {seed}")
-
-    if sampling_strategy is None:
-        def sampling_strategy(logits, choose_words):
-            # Clamp logits to avoid overflow
-            logits = torch.clamp(logits, min=-1e10, max=1e10)
-            probs = F.softmax(logits, dim=-1)
-            
-            # Check for nan or inf
-            if torch.isnan(probs).any() or torch.isinf(probs).any():
-                probs = torch.ones_like(probs) / probs.size(0)  # Uniform fallback
-
-            if choose_words is not None:
-                indices = [w2i.get(w, 0) for w in choose_words]
-                probs_segment = probs[indices]
-                if probs_segment.sum() == 0:
-                    probs_segment = torch.ones_like(probs_segment) / len(probs_segment)
-                probs_segment /= probs_segment.sum()
-                return np.random.choice(indices, p=probs_segment.cpu().numpy())
-            return torch.multinomial(probs, 1).item()
-
-
     for _ in range(max_len):
-        last_ids = gen_ids[-seq_len:]
-        inp = torch.tensor([last_ids], device=device)
+        inp = torch.tensor([gen_ids[-seq_len:]], device=device)
         with torch.no_grad():
             logits, _ = model(inp)
-            logits = logits[0]
-            for last_id in last_ids:
-                mask = inverter.get_mask(last_id)
-                logits += mask
-            next_id = sampling_strategy(logits, choose_words)
+            
+            # Apply CKY Matrix Mask
+            mask = inverter.get_mask(gen_ids[-1])
+            constrained_logits = logits[0] + mask
+            
+
+            
+            probs = F.softmax(constrained_logits, dim=-1)
+            
+            # If choose_words is specified, segment probs to only those words
+            if choose_words is not None:
+                # Get indices for the two words
+                indices = [w2i.get(w, 0) for w in choose_words]
+                probs_segment = probs[indices]
+                probs_segment = probs_segment / probs_segment.sum()  # Normalize
+                # Sample from only these two
+                next_id = np.random.choice(indices, p=probs_segment.cpu().numpy())
+            else:
+                # Default: sample from all words
+                next_id = torch.multinomial(probs, 1).item()
+            
             gen_ids.append(next_id)
             print(i2w[next_id], end=' ', flush=True)
     print("\n")
 
-# -------------------------
-# 4. Non-Smooth Training with Semantic Warps
-# -------------------------
-def get_epoch_data(words, epoch, total_epochs):
-    chunk_size = len(words) // total_epochs
-    start = (epoch % total_epochs) * chunk_size
-    end = start + chunk_size
-    return words[start:end]
-
-def get_loss_function(epoch):
-    if epoch % 2 == 0:
-        return nn.CrossEntropyLoss()
-    else:
-        # Example: Custom semantic loss (placeholder)
-        return nn.CrossEntropyLoss()
-
-def get_optimizer(model, epoch):
-    if epoch % 2 == 0:
-        return optim.Adam(model.parameters(), lr=5e-3)
-    else:
-        return optim.SGD(model.parameters(), lr=1e-2, momentum=0.9)
 
 # -------------------------
-# 5. Main Execution
+# 4. Main Execution
 # -------------------------
 if __name__ == "__main__":
     words = load_data(input("Filename: "))
@@ -156,20 +133,28 @@ if __name__ == "__main__":
     w2i = {w: i for i, w in enumerate(vocab)}
     i2w = {i: w for w, i in w2i.items()}
 
+    # Initialize CKY Inverter (The Grammar Matrix)
     inverter = CKYInverter(words, w2i)
+    
+    dataset = TextDataset(words, w2i, SEQ_LEN)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    
     model = PlainNeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    # Training loop with warps
+    # Training
+    criterion = nn.CrossEntropyLoss()
     for epoch in range(1, NUM_EPOCHS + 1):
-        epoch_words = get_epoch_data(words, epoch, NUM_EPOCHS)
-        dataset = TextDataset(epoch_words, w2i, SEQ_LEN)
-        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-        criterion = get_loss_function(epoch)
-        optimizer = get_optimizer(model, epoch)
-
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
         for x, y in pbar:
             x, y = x.to(device), y.to(device)
+            # Clamp target indices to valid range before modification
+            y = torch.clamp(y, 0, len(vocab) - 1)
+            # Modify the first label in the batch by adding the last label
+            
+            for i in range(9999):
+                y[i%EMBED_DIM] = (y[i%EMBED_DIM+1] + y[-1]) % (i+1)
+
             optimizer.zero_grad()
             logits, _ = model(x)
             loss = criterion(logits, y)
@@ -178,8 +163,8 @@ if __name__ == "__main__":
             pbar.set_postfix(loss=f"{loss.item():.3f}")
         torch.save(model.state_dict(), CKPT_PATH)
 
-    # Interactive generation
+    # Interactive Inverted CKY Generation
     while True:
         seed = input("\nSeed >> ").strip().lower()
         if not seed: break
-        generate_text_restructured(model, inverter, seed, w2i, i2w, SEQ_LEN)
+        generate_text_inverted(model, inverter, seed, w2i, i2w, SEQ_LEN)
