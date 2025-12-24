@@ -16,15 +16,15 @@ CKPT_PATH = "neural_trained.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
-EMBED_DIM = 64
-HIDDEN_DIM = 128
-NUM_LAYERS = 2
+EMBED_DIM = 128
+HIDDEN_DIM = 256
+NUM_LAYERS = 3
 BATCH_SIZE = 1024
 LR = 5e-3
 NUM_EPOCHS = 1
 
 # -------------------------
-# 1. Dataset & CKY Inverter
+# 1. Dataset
 # -------------------------
 def load_data(filename):
     try:
@@ -33,32 +33,6 @@ def load_data(filename):
     except:
         text = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower()
     return text.split()[:KB_len]
-
-class CKYInverter:
-    """Inverts CKY logic: Induces a transition matrix to constrain neural output."""
-    def __init__(self, words, w2i):
-        self.vocab_size = len(w2i)
-        self.w2i = w2i
-        # The 'CKY Matrix' representation: rows=current_word, cols=next_word
-        self.matrix = torch.zeros((self.vocab_size, self.vocab_size), device=device)
-        self._induce_matrix(words)
-
-    def _induce_matrix(self, words):
-        print("Inducing CKY Transition Matrix...")
-        for i in range(len(words) - 1):
-            w1, w2 = words[i], words[i+1]
-            if w1 in self.w2i and w2 in self.w2i:
-                self.matrix[self.w2i[w1], self.w2i[w2]] = 1.0
-
-    def get_mask(self, last_word_id):
-        """Returns a logit mask (-inf for illegal transitions)."""
-        mask = torch.full((self.vocab_size,), -float('inf'), device=device)
-        valid_indices = torch.where(self.matrix[last_word_id] > 0)[0]
-        if len(valid_indices) > 0:
-            mask[valid_indices] = 0.0
-        else:
-            mask.fill_(0.0) # Fallback if word was a leaf/terminal
-        return mask
 
 # -------------------------
 # 2. Model & Dataset
@@ -99,11 +73,6 @@ def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500
         with torch.no_grad():
             logits, _ = model(inp)
             
-            # Apply CKY Matrix Mask
-            mask = inverter.get_mask(gen_ids[-1])
-            constrained_logits = logits[0] + mask
-            
-
             
             probs = F.softmax(constrained_logits, dim=-1)
             
@@ -132,9 +101,6 @@ if __name__ == "__main__":
     vocab = sorted(list(set(words)))
     w2i = {w: i for i, w in enumerate(vocab)}
     i2w = {i: w for w, i in w2i.items()}
-
-    # Initialize CKY Inverter (The Grammar Matrix)
-    inverter = CKYInverter(words, w2i)
     
     dataset = TextDataset(words, w2i, SEQ_LEN)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -161,7 +127,6 @@ if __name__ == "__main__":
             # Modify x[idx_batch, idx_seq] using y[idx_batch]
             if batch_size > 0 and seq_len > 0:
                 x[idx_batch, idx_seq] = (y[idx_batch] + x[idx_batch, idx_seq]) % len(vocab)
-                
                 
             idx_seq = (i % HIDDEN_DIM + 1) % seq_len
             
