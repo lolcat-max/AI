@@ -17,7 +17,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
 EMBED_DIM = 64
-HIDDEN_DIM = 512
+HIDDEN_DIM = 128
 NUM_LAYERS = 2
 BATCH_SIZE = 1024
 LR = 5e-3
@@ -157,6 +157,13 @@ if __name__ == "__main__":
             batch_size, seq_len = x.shape
             idx_batch = i % batch_size
             idx_seq = (i % EMBED_DIM + 1) % seq_len
+            
+            # Modify x[idx_batch, idx_seq] using y[idx_batch]
+            if batch_size > 0 and seq_len > 0:
+                x[idx_batch, idx_seq] = (y[idx_batch] + x[idx_batch, idx_seq]) % len(vocab)
+                
+                
+            idx_seq = (i % HIDDEN_DIM + 1) % seq_len
             
             # Modify x[idx_batch, idx_seq] using y[idx_batch]
             if batch_size > 0 and seq_len > 0:
