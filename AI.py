@@ -63,7 +63,7 @@ class TextDataset(Dataset):
 # -------------------------
 # 3. Generation & Inference
 # -------------------------
-def generate_text(model, inverter, seed, w2i, i2w, seq_len, max_len=500, choose_words=None):
+def generate_text(model, seed, w2i, i2w, seq_len, max_len=500, choose_words=None):
     model.eval()
     gen_ids = [w2i.get(w, 0) for w in seed.split()]
     
@@ -146,4 +146,4 @@ if __name__ == "__main__":
     while True:
         seed = input("\nSeed >> ").strip().lower()
         if not seed: break
-        generate_text(model, inverter, seed, w2i, i2w, SEQ_LEN)
+        generate_text(model, seed, w2i, i2w, SEQ_LEN)
