@@ -225,7 +225,7 @@ def apply_aligned_inhibition(x, y, vocab_size, sources):
     # Modify positions along batch for file samples
     for i in range(batch_size):
         if file_mask[i]:
-            idx_seq = i % seq_len
+            idx_seq = file_mask[i] % seq_len
             # Inhibit by inverse modulation with target
             y[i] = (y[i] - x[i, idx_seq]) % vocab_size
     
