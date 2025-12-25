@@ -15,7 +15,7 @@ from collections import Counter
 # -------------------------
 KB_len = -1
 GEN_LEN = 500
-CKPT_PATH = "binding_model.pth"
+CKPT_PATH = "persona_binding_model.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
@@ -27,19 +27,71 @@ LR = 5e-3
 NUM_EPOCHS = 1
 
 # -------------------------
-# 1. Hugging Face & Extraction Modules
+# 1. Generic Q&A Data Fetching
 # -------------------------
 def fetch_hf_data():
-    """Extracts unique labels and raw prompt text from Hugging Face."""
-    url = "https://huggingface.co/datasets/fka/awesome-chatgpt-prompts/raw/main/prompts.csv"
-    try:
-        r = requests.get(url)
-        lines = r.text.splitlines()[1:]
-        labels = [line.split(',')[0].strip('"').lower() for line in lines if line]
-        prompts = [line.split(',"')[1].rstrip('"').lower() for line in lines if ',"' in line]
-        return list(set(labels)), " ".join(prompts).split()
-    except:
-        return [], []
+    """Extracts questions and answers from a generic Q&A dataset."""
+    # Built-in generic Q&A - always reliable
+    generic_qa = """
+    what is python? python is a high-level programming language known for simplicity and readability.
+    who created linux? linus torvalds created the linux operating system kernel in 1991.
+    where is silicon valley? silicon valley is located in the san francisco bay area of california.
+    when was the internet invented? the internet was invented in the late 1960s with arpanet.
+    why do we use databases? we use databases to efficiently store organize and retrieve structured data.
+    how does machine learning work? machine learning uses algorithms and statistical models to learn patterns from data.
+    what is artificial intelligence? artificial intelligence is technology that enables machines to simulate human intelligence.
+    who invented the telephone? alexander graham bell invented the first practical telephone in 1876.
+    where is the eiffel tower? the eiffel tower is located in paris france on the champ de mars.
+    when was world war two? world war two lasted from 1939 to 1945 involving most nations.
+    why is water important? water is essential for all known forms of life and biological processes.
+    how do computers process information? computers process information using binary code transistors and logical circuits.
+    what is the capital of france? the capital of france is paris a major european city.
+    who wrote hamlet? william shakespeare wrote the tragedy of hamlet prince of denmark.
+    where do penguins live? penguins live primarily in antarctica and cold southern hemisphere regions.
+    when was the first airplane flight? the wright brothers achieved the first powered flight in 1903.
+    why is the sky blue? the sky appears blue due to rayleigh scattering of sunlight by atmosphere.
+    how does photosynthesis work? photosynthesis converts light energy into chemical energy using chlorophyll in plants.
+    what is democracy? democracy is a system of government where power is vested in the people.
+    who discovered penicillin? alexander fleming discovered penicillin antibiotics in 1928 revolutionizing medicine.
+    what is gravity? gravity is the force that attracts objects with mass toward each other.
+    who painted the mona lisa? leonardo da vinci painted the mona lisa during the renaissance period.
+    where is mount everest? mount everest is located in the himalayas on the nepal-tibet border.
+    when was the declaration of independence signed? the declaration of independence was signed on july 4 1776.
+    why do seasons change? seasons change due to earth's axial tilt as it orbits the sun.
+    how do vaccines work? vaccines work by training the immune system to recognize and fight specific pathogens.
+    what is quantum physics? quantum physics studies the behavior of matter and energy at atomic scales.
+    who founded microsoft? bill gates and paul allen founded microsoft corporation in 1975.
+    where is the great wall of china? the great wall of china stretches across northern china spanning thousands of miles.
+    when did the moon landing occur? the first moon landing occurred on july 20 1969 with apollo 11.
+    """
+    
+    # Parse the Q&A pairs
+    lines = [line.strip() for line in generic_qa.strip().split('\n') if line.strip()]
+    questions = []
+    answers = []
+    
+    for line in lines:
+        if '?' in line:
+            parts = line.split('?', 1)
+            if len(parts) == 2:
+                questions.append(parts[0].strip().lower())
+                answers.append(parts[1].strip().lower())
+    
+    # Extract question types
+    question_types = set()
+    for q in questions:
+        words = q.split()
+        if words:
+            first_word = words[0]
+            if first_word in ['who', 'what', 'where', 'when', 'why', 'how', 'which', 'whom', 'whose', 'is', 'are', 'do', 'does', 'did', 'can', 'could', 'would', 'should']:
+                question_types.add(first_word)
+    
+    # Combine all text
+    all_text = " ".join(questions + answers)
+    all_words = all_text.split()
+    
+    print(f"  Loaded {len(questions)} Q&A pairs, {len(all_words)} words")
+    return list(question_types), all_words
 
 def extract_methods(words):
     """Detects action-based Methods using morphological heuristics."""
@@ -81,7 +133,7 @@ class CKYInverter:
 # -------------------------
 # 3. Model & Weighted Dataset with Source Tracking
 # -------------------------
-class NeuralNet(nn.Module):
+class PersonaNeuralNet(nn.Module):
     def __init__(self, v_size, e_dim, h_dim, layers):
         super().__init__()
         self.embedding = nn.Embedding(v_size, e_dim)
@@ -92,20 +144,20 @@ class NeuralNet(nn.Module):
         out, _ = self.rnn(x)
         return self.fc(out[:, -1, :])
 
-class BindingDataset(Dataset):
+class PersonaBindingDataset(Dataset):
     def __init__(self, words, w2i, methods, scenarios, seq_len, word_sources):
         """
-        word_sources: list where 0=file_data, 1=hf_data
+        word_sources: list where 0=file_data, 1=hf_qa_data
         """
         self.samples = []
         for i in range(len(words) - seq_len):
             ctx, target = words[i:i+seq_len], words[i+seq_len]
-            # 3.5x Weight boost for Method + (Scenario) co-occurrence
+            # 3.5x Weight boost for Method + Question Type (Scenario) co-occurrence
             is_bound = any(t in methods for t in ctx+[target]) and any(t in scenarios for t in ctx+[target])
             weight = 3.5 if is_bound else 1.0
             
             # Track source of this sequence
-            source = word_sources[i+seq_len]  # 0=file, 1=hf
+            source = word_sources[i+seq_len]  # 0=file, 1=hf_qa
             
             self.samples.append((
                 torch.tensor([w2i[w] for w in ctx]), 
@@ -122,18 +174,18 @@ class BindingDataset(Dataset):
 def apply_aligned_inhibition(x, y, vocab_size, sources):
     """
     Inhibit different axes based on data source:
-    - HuggingFace data (source=1): Inhibit sequence axis (dim 1)
+    - Generic Q&A data (source=1): Inhibit sequence axis (dim 1)
     - File data (source=0): Inhibit batch axis (dim 0)
     Ensures alignment between the two data streams.
     """
     batch_size, seq_len = x.shape
     
     # Create masks for each source type
-    hf_mask = (sources == 1)  # HuggingFace data
+    hf_mask = (sources == 1)  # Generic Q&A data
     file_mask = (sources == 0)  # File data
     
-    # For HuggingFace: inhibit sequence dimension (horizontal axis)
-    # Modify positions along sequence for HF samples
+    # For Generic Q&A: inhibit sequence dimension (horizontal axis)
+    # Modify positions along sequence for Q&A samples
     for i in range(seq_len):
         if i < batch_size and hf_mask[i % batch_size]:
             idx_batch = i % batch_size
@@ -158,7 +210,7 @@ def apply_aligned_inhibition(x, y, vocab_size, sources):
 def generate_text(model, inverter, renetworker, seed, w2i, i2w, seq_len):
     model.eval(); v_size = len(i2w)
     gen_ids = [w2i.get(w, 0) for w in seed.lower().split()]
-    print(f"\n>> Bound Seed: {seed}")
+    print(f"\n>> Q&A-Bound Seed: {seed}")
     for _ in range(GEN_LEN):
         inp = torch.tensor([gen_ids[-seq_len:]], device=device)
         with torch.no_grad():
@@ -176,37 +228,43 @@ if __name__ == "__main__":
     except: 
         local_raw = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower().split()
     
-    print("Fetching Labels from Hugging Face...")
-    hf_labels, hf_prompts = fetch_hf_data()
+    print("Fetching generic Q&A data...")
+    hf_labels, hf_qa_words = fetch_hf_data()
     
-    # Track source of each word: 0=file, 1=hf
+    if not hf_qa_words:
+        print("WARNING: No Q&A data loaded! Using empty list.")
+    
+    print(f"  Question types found: {hf_labels}")
+    print(f"  Total Q&A words: {len(hf_qa_words)}")
+    
+    # Track source of each word: 0=file, 1=hf_qa
     file_sources = [0] * len(local_raw)
-    hf_sources = [1] * len(hf_prompts)
+    hf_sources = [1] * len(hf_qa_words)
     
-    all_words = (local_raw + hf_prompts)[:KB_len]
+    all_words = (local_raw + hf_qa_words)[:KB_len]
     word_sources = (file_sources + hf_sources)[:KB_len]
     
     vocab = sorted(list(set(all_words)))
     w2i, i2w = {w: i for i, w in enumerate(vocab)}, {i: w for i, w in enumerate(vocab)}
     
     methods = extract_methods(all_words)
-    # Labels from HF are treated as Scenarios for tangential binding
+    # Question types from Q&A are treated as Scenarios for tangential binding
     scenarios = set(hf_labels)
     
     inverter = CKYInverter(all_words, w2i, len(vocab))
     renetworker = InhibitoryRenetworker()
     loader = DataLoader(
-        BindingDataset(all_words, w2i, methods, scenarios, SEQ_LEN, word_sources), 
+        PersonaBindingDataset(all_words, w2i, methods, scenarios, SEQ_LEN, word_sources), 
         batch_size=BATCH_SIZE, 
         shuffle=True
     )
     
-    model = NeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
+    model = PersonaNeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
     print(f"\nTraining with aligned inhibition:")
     print(f"  - File data ({len(local_raw)} words): Batch axis inhibition")
-    print(f"  - HuggingFace data ({len(hf_prompts)} words): Sequence axis inhibition")
+    print(f"  - Generic Q&A data ({len(hf_qa_words)} words): Sequence axis inhibition")
     
     for epoch in range(1, NUM_EPOCHS + 1):
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
