@@ -13,28 +13,18 @@ from tqdm import tqdm
 # -------------------------
 KB_len = -1
 CKPT_PATH = "neural_trained.pth"
-LOG_FILE = "generation_logs.txt"  # File where results will be stored
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SEQ_LEN = 3
+EMBED_DIM = 64
+HIDDEN_DIM = 128
 NUM_LAYERS = 2
 BATCH_SIZE = 1024
 LR = 5e-3
 NUM_EPOCHS = 1
 
 # -------------------------
-# 1. Logging Helper
-# -------------------------
-def log_experiment(embed_dim, hidden_dim, seed, generated_text):
-    """Appends model configuration and generated output to a log file."""
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"--- Experiment: EMBED={embed_dim}, HIDDEN={hidden_dim} ---\n")
-        f.write(f"Seed: {seed}\n")
-        f.write(f"Output: {generated_text}\n")
-        f.write("-" * 50 + "\n\n")
-
-# -------------------------
-# 2. Dataset & CKY Inverter
+# 1. Dataset & CKY Inverter
 # -------------------------
 def load_data(filename):
     try:
@@ -45,9 +35,11 @@ def load_data(filename):
     return text.split()[:KB_len]
 
 class CKYInverter:
+    """Inverts CKY logic: Induces a transition matrix to constrain neural output."""
     def __init__(self, words, w2i):
         self.vocab_size = len(w2i)
         self.w2i = w2i
+        # The 'CKY Matrix' representation: rows=current_word, cols=next_word
         self.matrix = torch.zeros((self.vocab_size, self.vocab_size), device=device)
         self._induce_matrix(words)
 
@@ -59,16 +51,17 @@ class CKYInverter:
                 self.matrix[self.w2i[w1], self.w2i[w2]] = 1.0
 
     def get_mask(self, last_word_id):
+        """Returns a logit mask (-inf for illegal transitions)."""
         mask = torch.full((self.vocab_size,), -float('inf'), device=device)
         valid_indices = torch.where(self.matrix[last_word_id] > 0)[0]
         if len(valid_indices) > 0:
             mask[valid_indices] = 0.0
         else:
-            mask.fill_(0.0)
+            mask.fill_(0.0) # Fallback if word was a leaf/terminal
         return mask
 
 # -------------------------
-# 3. Model & Dataset
+# 2. Model & Dataset
 # -------------------------
 class PlainNeuralNet(nn.Module):
     def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers):
@@ -94,84 +87,100 @@ class TextDataset(Dataset):
     def __getitem__(self, idx): return self.samples[idx]
 
 # -------------------------
-# 4. Updated Generation
+# 3. Generation & Inference
 # -------------------------
-def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=1000, choose_words=None):
+def generate_text_inverted(model, inverter, seed, w2i, i2w, seq_len, max_len=500, choose_words=None):
     model.eval()
     gen_ids = [w2i.get(w, 0) for w in seed.split()]
-    output_words = []
     
+    print(f"\n>> Seed: {seed}")
     for _ in range(max_len):
         inp = torch.tensor([gen_ids[-seq_len:]], device=device)
         with torch.no_grad():
             logits, _ = model(inp)
+            
+            # Apply CKY Matrix Mask
             mask = inverter.get_mask(gen_ids[-1])
             constrained_logits = logits[0] + mask
+            
+
+            
             probs = F.softmax(constrained_logits, dim=-1)
             
+            # If choose_words is specified, segment probs to only those words
             if choose_words is not None:
+                # Get indices for the two words
                 indices = [w2i.get(w, 0) for w in choose_words]
                 probs_segment = probs[indices]
-                probs_segment = probs_segment / (probs_segment.sum() + 1e-9)
+                probs_segment = probs_segment / probs_segment.sum()  # Normalize
+                # Sample from only these two
                 next_id = np.random.choice(indices, p=probs_segment.cpu().numpy())
             else:
+                # Default: sample from all words
                 next_id = torch.multinomial(probs, 1).item()
             
             gen_ids.append(next_id)
-            output_words.append(i2w[next_id])
-            
-    return " ".join(output_words)
+            print(i2w[next_id], end=' ', flush=True)
+    print("\n")
+
 
 # -------------------------
-# 5. Main Execution
+# 4. Main Execution
 # -------------------------
 if __name__ == "__main__":
-    fname = input("Filename: ")
-    words = load_data(fname)
+    words = load_data(input("Filename: "))
     vocab = sorted(list(set(words)))
     w2i = {w: i for i, w in enumerate(vocab)}
     i2w = {i: w for w, i in w2i.items()}
 
+    # Initialize CKY Inverter (The Grammar Matrix)
     inverter = CKYInverter(words, w2i)
+    
     dataset = TextDataset(words, w2i, SEQ_LEN)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
-    seed = "the king is" # Default seed for logging consistency
+    model = PlainNeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    for n in range(1, 99):
-        for m in range(1, 99):
-            EMBED_DIM, HIDDEN_DIM = n, m
-            model = PlainNeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
-            optimizer = optim.Adam(model.parameters(), lr=LR)
-            criterion = nn.CrossEntropyLoss()
+    # Training
+    criterion = nn.CrossEntropyLoss()
 
-            # Training
-            for epoch in range(1, NUM_EPOCHS + 1):
-                pbar = tqdm(loader, desc=f"Dim {n}/{m} Ep {epoch}")
-                for i, (x, y) in enumerate(pbar):
-                    x, y = x.to(device), y.to(device)
-                    y = torch.clamp(y, 0, len(vocab) - 1)
-                    
-                    # Apply your perturbation logic
-                    batch_size, seq_len = x.shape
-                    idx_batch = i % batch_size
-                    
-                    if batch_size > 0 and seq_len > 0:
-                        # Perturbation 1
-                        idx_seq1 = (i % EMBED_DIM + 1) % seq_len
-                        x[idx_batch, idx_seq1] = (y[idx_batch] + x[idx_batch, idx_seq1]) % len(vocab)
-                        # Perturbation 2
-                        idx_seq2 = (i % HIDDEN_DIM + 1) % seq_len
-                        x[idx_batch, idx_seq2] = (y[idx_batch] - x[idx_batch, idx_seq2]) % len(vocab)
-                    
-                    optimizer.zero_grad()
-                    logits, _ = model(x)
-                    loss = criterion(logits, y)
-                    loss.backward()
-                    optimizer.step()
-                    pbar.set_postfix(loss=f"{loss.item():.3f}")
+    for epoch in range(1, NUM_EPOCHS + 1):
+        pbar = tqdm(loader, desc=f"Epoch {epoch}")
+        i = 0
+        for x, y in pbar:
+            x, y = x.to(device), y.to(device)
+            # Clamp target indices to valid range
+            y = torch.clamp(y, 0, len(vocab) - 1)
+            
 
-            # Generate and Log
-            generated = generate_text_inverted(model, inverter, seed, w2i, i2w, SEQ_LEN)
-            print(f"\n[EMBED {n} | HIDDEN {m}] Generated: {generated[:1000]}...")
-            log_experiment(n, m, seed, generated)
+            for i in range(1,EMBED_DIM):
+                # Ensure indices are within tensor dimensions
+                batch_size, seq_len = x.shape
+                idx_batch = i % batch_size
+                idx_seq = (i % EMBED_DIM + 1) % i
+                # Modify x[idx_batch, idx_seq] using y[idx_batch]
+                if batch_size > 0 and seq_len > 0:
+                    x[idx_batch, idx_seq] = (y[idx_batch] + x[idx_batch, idx_seq]) % len(vocab)
+                    
+                    
+                idx_seq = (i % HIDDEN_DIM + 1) % seq_len
+                
+                # Modify x[idx_batch, idx_seq] using y[idx_batch]
+                if batch_size > 0 and seq_len > 0:
+                    y[idx_batch] = (y[idx_batch] - x[idx_batch, idx_seq]) % len(vocab)
+            
+            optimizer.zero_grad()
+            logits, _ = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            pbar.set_postfix(loss=f"{loss.item():.3f}")
+            i += 1
+        torch.save(model.state_dict(), CKPT_PATH)
+
+    # Interactive Inverted CKY Generation
+    while True:
+        seed = input("\nSeed >> ").strip().lower()
+        if not seed: break
+        generate_text_inverted(model, inverter, seed, w2i, i2w, SEQ_LEN)
