@@ -128,7 +128,7 @@ def apply_aligned_inhibition(x, y, v_size, sources):
     # SQuAD (Source 1): Sequence Axis (Horizontal)
     for i in range(seq):
         if i < batch and hf_mask[i % batch]:
-            x[i % batch, i % seq] = (y[i % batch] + x[i % batch, i % seq]) % v_size
+            x[i % batch, i % seq] = (hf_mask[i % batch] + x[i % batch, i % seq]) % v_size
     # TinyStories (Source 0): Batch Axis (Vertical)
     for i in range(batch):
         if file_mask[i]:
