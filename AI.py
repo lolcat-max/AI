@@ -117,7 +117,7 @@ def generate(model, seed, w2i, i2w):
     model.eval()
     ids = [w2i.get(w, 0) for w in seed.lower().split()]
     print(f"\n>> Seed: {seed}")
-    for i in range(3000):
+    for i in range(600):
         ctx = torch.tensor([ids[-SEQ_LEN:]], device=device)
         stretch = 1.3 if i % 10 == 0 else 1.0
         with torch.no_grad():
@@ -168,7 +168,5 @@ if __name__ == "__main__":
         print(f">> Model saved to {MODEL_PATH}")
 
     # Final Generation
-    generate(model, "once upon a", w2i, i2w)
-    
     while True:
         generate(model, input("USER: "), w2i, i2w)
