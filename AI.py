@@ -1,190 +1,174 @@
-import os, requests, re, pickle
-import numpy as np
+import os, pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from collections import Counter
+from datasets import load_dataset
 
 # -------------------------
-# Config
+# Configuration
 # -------------------------
-KB_len = -1
-GEN_LEN = 500
-CKPT_PATH = "persona_binding_model.pth"
-VOCAB_PATH = "vocab_data.pkl"
-INVERTER_PATH = "inverter_matrix.pt"
+SEQ_LEN, EMBED_DIM, HIDDEN_DIM = 3, 64, 128
+NUM_LAYERS, BATCH_SIZE, LR, NUM_EPOCHS = 2, 512, 1e-3, 3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SEQ_LEN = 3
-EMBED_DIM = 64
-HIDDEN_DIM = 128
-NUM_LAYERS = 2
-BATCH_SIZE = 1024
-LR = 5e-3
-NUM_EPOCHS = 1
-MODE = 'auto' 
+# -------------------------
+# 1. HF Data Fetching
+# -------------------------
+def fetch_hf_corpus():
+    """Fetches narrative and query data from Hugging Face [web:209][web:225]."""
+    print("Fetching HF Datasets...")
+    # 1. TinyStories (Narrative) - 5000 stories [web:211]
+    ts_ds = load_dataset('roneneldan/TinyStories', split='train[:5000]', trust_remote_code=True)
+    ts_words = " ".join(ts_ds['text']).lower().split()
+    
+    # 2. SQuAD (Query/Persona) - 3000 items [web:213]
+    squad_ds = load_dataset('squad', split='train[:3000]', trust_remote_code=True)
+    sq_text = []
+    for item in squad_ds:
+        # Extract question and first answer for persona grounding [web:225]
+        ans = item['answers']['text'][0].lower() if item['answers']['text'] else ""
+        sq_text.append(f"{item['question'].lower()} {ans}")
+    sq_words = " ".join(sq_text).split()
+    
+    return ts_words, sq_words
 
 # -------------------------
-# 1. Stretching Layer (The Eye Mechanism)
+# 2. Model Architecture
 # -------------------------
 class EyeStretchingLayer(nn.Module):
-    """Uses np.eye to stretch the neural activations along their principal axes."""
     def __init__(self, h_dim):
         super().__init__()
-        # Initialize identity matrix using np.eye as requested [web:7][web:39]
-        identity = np.eye(h_dim).astype(np.float32)
-        self.register_buffer('eye_basis', torch.from_numpy(identity))
-        
+        self.register_buffer('eye_basis', torch.eye(h_dim))
     def forward(self, x, eye_offset=1.0):
-        # Stretch the identity matrix: scale the diagonal [web:10][web:13]
-        # This acts as a scaling transformation in h_dim space [web:27]
-        stretched_matrix = self.eye_basis * eye_offset
-        # Apply the stretch to the hidden state batch
-        return torch.matmul(x, stretched_matrix)
+        return torch.matmul(x, self.eye_basis * eye_offset)
 
-# -------------------------
-# 2. Model & Dataset (Updated with Stretching)
-# -------------------------
 class PersonaNeuralNet(nn.Module):
     def __init__(self, v_size, e_dim, h_dim, layers):
         super().__init__()
         self.embedding = nn.Embedding(v_size, e_dim)
         self.rnn = nn.GRU(e_dim, h_dim, num_layers=layers, batch_first=True)
-        self.stretcher = EyeStretchingLayer(h_dim) # New stretching mechanism
+        self.stretcher = EyeStretchingLayer(h_dim)
         self.fc = nn.Linear(h_dim, v_size)
 
     def forward(self, x, eye_offset=1.0):
-        x = self.embedding(x)
-        out, _ = self.rnn(x)
-        # Apply the neural stretch before the final classification
-        stretched = self.stretcher(out[:, -1, :], eye_offset)
+        if x.dim() == 1: x = x.unsqueeze(0)
+        emb = self.embedding(x)
+        out, _ = self.rnn(emb)
+        # Always slice batch [:, -1, :] to prevent collapse [web:56][web:146]
+        last_hidden = out[:, -1, :] 
+        stretched = self.stretcher(last_hidden, eye_offset)
         return self.fc(stretched)
 
-class InhibitoryRenetworker(nn.Module):
-    def __init__(self, gap=0.06):
-        super().__init__(); self.gap = gap
-    def forward(self, activations):
-        lead = torch.max(activations, dim=-1, keepdim=True)[0]
-        mask = (lead - activations > 0) & (lead - activations < self.gap)
-        out = activations.clone()
-        out[mask] -= 100.0  
-        return out
+# -------------------------
+# 3. Alignment Logic
+# -------------------------
+def apply_aligned_inhibition(x, y, v_size, sources):
+    """Bidirectional manifold alignment [web:111]."""
+    hf_mask = (sources == 1).long()
+    # Shift indices for SQuAD source to bind persona-specific gradients
+    x = (x + hf_mask.unsqueeze(-1)) % v_size
+    return x, y
 
-class CKYInverter:
-    def __init__(self, matrix=None):
-        self.matrix = matrix
-    @classmethod
-    def from_words(cls, words, w2i, v_size):
-        mat = torch.zeros((v_size, v_size), device=device)
-        for i in range(len(words)-1):
-            w1, w2 = words[i], words[i+1]
-            if w1 in w2i and w2 in w2i: mat[w2i[w1], w2i[w2]] = 1.0
-        return cls(mat)
-    def get_grounding(self, last_id, v_size):
-        mask = torch.full((v_size,), -float('inf'), device=device)
-        valid = torch.where(self.matrix[last_id] > 0)[0]
-        if len(valid) > 0: mask[valid] = 0.0
-        else: mask.fill_(0.0)
-        return mask
-
-class PersonaBindingDataset(Dataset):
-    def __init__(self, words, w2i, methods, scenarios, seq_len, sources):
+class AlignedDataset(Dataset):
+    def __init__(self, ts_words, sq_words, w2i, seq_len):
         self.samples = []
-        for i in range(len(words) - seq_len):
-            ctx, target = words[i:i+seq_len], words[i+seq_len]
-            is_bound = any(t in methods for t in ctx+[target]) and any(t in scenarios for t in ctx+[target])
-            weight = 3.5 if is_bound else 1.0
-            self.samples.append((torch.tensor([w2i[w] for w in ctx]), torch.tensor(w2i[target]), torch.tensor(weight), torch.tensor(sources[i+seq_len])))
+        # TinyStories (Source 0)
+        for i in range(len(ts_words) - seq_len):
+            self.samples.append((
+                torch.tensor([w2i[w] for w in ts_words[i:i+seq_len]]),
+                torch.tensor(w2i[ts_words[i+seq_len]]),
+                torch.tensor(1.0), # Weight
+                torch.tensor(0)    # Source
+            ))
+        # SQuAD (Source 1) - Higher weight for query focus [web:25]
+        for i in range(len(sq_words) - seq_len):
+            self.samples.append((
+                torch.tensor([w2i[w] for w in sq_words[i:i+seq_len]]),
+                torch.tensor(w2i[sq_words[i+seq_len]]),
+                torch.tensor(3.5), # Weight boost for persona scenarios
+                torch.tensor(1)    # Source
+            ))
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
 
 # -------------------------
-# 3. Data & Training Logic
+# 4. Training & Generation
 # -------------------------
-def fetch_hf_data():
-    from datasets import load_dataset
-    ts_ds = load_dataset('roneneldan/TinyStories', split='train[:5000]', trust_remote_code=True)
-    ts_words = " ".join(ts_ds['text']).lower().split()
-    squad_ds = load_dataset('squad', split='train[:3000]', trust_remote_code=True)
-    questions, answers, contexts = [], [], []
-    for item in squad_ds:
-        questions.append(item['question'].lower())
-        answers.append(item['answers']['text'][0].lower() if item['answers']['text'] else "")
-        contexts.append(item['context'].lower())
-    qa_words = " ".join(questions + answers + contexts).split()
-    q_types = {q.split()[0] for q in questions if q.split()}
-    return list(q_types), ts_words, qa_words
+def run_training(model, loader, v_size):
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    model.train()
+    for epoch in range(1, NUM_EPOCHS + 1):
+        pbar = tqdm(loader, desc=f"Epoch {epoch}")
+        for x, y, w, src in pbar:
+            x, y, w, src = x.to(device), y.to(device), w.to(device), src.to(device)
+            x, y = apply_aligned_inhibition(x, y, v_size, src)
+            
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = (F.cross_entropy(logits, y, reduction='none') * w).mean()
+            loss.backward()
+            optimizer.step()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-def apply_aligned_inhibition(x, y, v_size, sources):
-    batch, seq = x.shape
-    hf_mask, file_mask = (sources == 1), (sources == 0)
-    for i in range(seq):
-        if i < batch and hf_mask[i % batch]:
-            x[file_mask[i] % batch, i % seq] = (hf_mask[i % batch] + x[i % batch, i % seq]) % v_size
-    for i in range(batch):
-        if file_mask[i]:
-            y[i] = (y[i] - x[i, i % seq]) % v_size
-    return x, y
-
-def generate(model, inverter, renetworker, seed, w2i, i2w):
-    model.eval(); v_size = len(i2w)
+def generate(model, seed, w2i, i2w):
+    model.eval()
     ids = [w2i.get(w, 0) for w in seed.lower().split()]
-    print(f"\n>> {seed}")
-    for i in range(GEN_LEN):
-        # Stretch neurons every 10 steps to simulate eye "saccades" [web:28]
-        current_eye_move = 1.3 if i % 10 == 0 else 1.0
-        
-        inp = torch.tensor([ids[-SEQ_LEN:]], device=device)
+    print(f"\n>> Seed: {seed}")
+    for i in range(3000):
+        ctx = torch.tensor([ids[-SEQ_LEN:]], device=device)
+        stretch = 1.3 if i % 10 == 0 else 1.0
         with torch.no_grad():
-            logits = model(inp, eye_offset=current_eye_move)
-            clean = renetworker(logits[0])
-            grounding = inverter.get_grounding(ids[-1], v_size)
-            probs = F.softmax(clean + grounding, dim=-1)
+            logits = model(ctx, eye_offset=stretch)
+            probs = F.softmax(logits, dim=-1).squeeze()
             next_id = torch.multinomial(probs, 1).item()
-            ids.append(next_id); print(i2w.get(next_id, "?"), end=' ', flush=True)
+            ids.append(next_id)
+            print(f"{i2w.get(next_id, '?')} ", end="", flush=True)
+    print("\n")
 
 # -------------------------
-# 4. Main Execution
+# Main
+# -------------------------
+# -------------------------
+# Main Execution (Updated with Save/Load)
 # -------------------------
 if __name__ == "__main__":
-    exists = all(os.path.exists(p) for p in [CKPT_PATH, VOCAB_PATH, INVERTER_PATH])
-    if MODE == 'load' or (MODE == 'auto' and exists):
-        with open(VOCAB_PATH, 'rb') as f: d = pickle.load(f)
-        w2i, i2w, scenarios, methods, v_size = d['w2i'], d['i2w'], d['scenarios'], d['methods'], d['v_size']
+    MODEL_PATH = "persona_model.pth"
+    META_PATH = "persona_meta.pkl"
+
+    # Attempt to load existing model and metadata [web:233][web:236]
+    if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
+        print(">> Loading existing checkpoint...")
+        with open(META_PATH, 'rb') as f:
+            meta = pickle.load(f)
+        w2i, i2w, v_size = meta['w2i'], meta['i2w'], meta['v_size']
+        
         model = PersonaNeuralNet(v_size, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
-        model.load_state_dict(torch.load(CKPT_PATH, map_location=device))
-        inverter = CKYInverter(torch.load(INVERTER_PATH, map_location=device))
-        renetworker = InhibitoryRenetworker()
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        model.eval()
     else:
-        q_types, ts_words, qa_words = fetch_hf_data()
-        sources = ([0] * len(ts_words)) + ([1] * len(qa_words))
-        all_words = (ts_words + qa_words)[:KB_len]
-        vocab = sorted(list(set(all_words)))
-        w2i, i2w = {w: i for i, w in enumerate(vocab)}, {i: w for i, w in enumerate(vocab)}
+        # If no checkpoint, perform training as usual
+        print(">> No checkpoint found. Initializing training...")
+        ts_words, sq_words = fetch_hf_corpus()
+        vocab = sorted(list(set(ts_words + sq_words)))
+        w2i, i2w, v_size = {w: i for i, w in enumerate(vocab)}, {i: w for i, w in enumerate(vocab)}, len(vocab)
         
-        methods = {w for w in all_words if w.endswith(('ing', 'ed', 'ion')) and len(w) > 4}
-        scenarios = set(q_types)
-        inverter = CKYInverter.from_words(all_words, w2i, len(vocab))
-        renetworker = InhibitoryRenetworker()
+        loader = DataLoader(AlignedDataset(ts_words, sq_words, w2i, SEQ_LEN), batch_size=BATCH_SIZE, shuffle=True)
+        model = PersonaNeuralNet(v_size, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
         
-        loader = DataLoader(PersonaBindingDataset(all_words, w2i, methods, scenarios, SEQ_LEN, sources), batch_size=BATCH_SIZE, shuffle=True)
-        model = PersonaNeuralNet(len(vocab), EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=LR)
+        # Standard training loop [web:99][web:171]
+        run_training(model, loader, v_size)
+        
+        # Save weights and vocabulary for future use [web:228][web:241]
+        torch.save(model.state_dict(), MODEL_PATH)
+        with open(META_PATH, 'wb') as f:
+            pickle.dump({'w2i': w2i, 'i2w': i2w, 'v_size': v_size}, f)
+        print(f">> Model saved to {MODEL_PATH}")
 
-        for epoch in range(1, NUM_EPOCHS + 1):
-            pbar = tqdm(loader, desc=f"Epoch {epoch}")
-            for x, y, w, src in pbar:
-                x, y, w, src = x.to(device), y.to(device), w.to(device), src.to(device)
-                x, y = apply_aligned_inhibition(x, y, len(vocab), src)
-                optimizer.zero_grad()
-                loss = (F.cross_entropy(model(x), y, reduction='none') * w).mean()
-                loss.backward(); optimizer.step()
-                pbar.set_postfix(loss=f"{loss.item():.3f}")
-
+    # Final Generation
+    generate(model, "once upon a", w2i, i2w)
+    
     while True:
-        seed = input("\nSeed >> ").strip()
-        if not seed: break
-        generate(model, inverter, renetworker, seed, w2i, i2w)
+        generate(model, input("USER: "), w2i, i2w)
