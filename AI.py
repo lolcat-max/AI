@@ -81,7 +81,7 @@ class AlignedDataset(Dataset):
                 torch.tensor([w2i[w] for w in ts_words[i:i+seq_len]]),
                 torch.tensor(w2i[ts_words[i+seq_len]]),
                 torch.tensor(1.0), # Weight
-                torch.tensor(0)    # Source
+                torch.tensor(i)    # Source
             ))
         # SQuAD (Source 1) - Higher weight for query focus [web:25]
         for i in range(len(sq_words) - seq_len):
@@ -89,7 +89,7 @@ class AlignedDataset(Dataset):
                 torch.tensor([w2i[w] for w in sq_words[i:i+seq_len]]),
                 torch.tensor(w2i[sq_words[i+seq_len]]),
                 torch.tensor(3.5), # Weight boost for persona scenarios
-                torch.tensor(1)    # Source
+                torch.tensor(i+1)    # Source
             ))
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
