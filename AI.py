@@ -21,11 +21,18 @@ def fetch_hf_corpus():
     """Fetches narrative and query data from Hugging Face [web:209][web:225]."""
     print("Fetching HF Datasets...")
     # 1. TinyStories (Narrative) - 5000 stories [web:211]
-    ts_ds = load_dataset('roneneldan/TinyStories', split='train[:5000]', trust_remote_code=True)
-    ts_words = " ".join(ts_ds['text']).lower().split()
+    try:
+        with open(input("Core Filename: "), "r", encoding="utf-8") as f:
+            ts_words = f.read().lower().split()
+    except:
+        try:
+            import requests
+            ts_words = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower().split()
+        except:
+            ts_words = ("hello world " * 1000).split()
     
     # 2. SQuAD (Query/Persona) - 3000 items [web:213]
-    squad_ds = load_dataset('squad', split='train[:3000]', trust_remote_code=True)
+    squad_ds = load_dataset('squad', split='train', trust_remote_code=True)
     sq_text = []
     for item in squad_ds:
         # Extract question and first answer for persona grounding [web:225]
