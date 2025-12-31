@@ -119,7 +119,7 @@ def generate(model, seed, w2i, i2w):
     print(f"\n>> Seed: {seed}")
     for i in range(600):
         ctx = torch.tensor([ids[-SEQ_LEN:]], device=device)
-        stretch = 1.3 if i % 10 == 0 else 1.0
+        stretch = 1.3 if i % ids[-SEQ_LEN:][min(i,SEQ_LEN-1)] >= 0.5 else i
         with torch.no_grad():
             logits = model(ctx, eye_offset=stretch)
             probs = F.softmax(logits, dim=-1).squeeze()
