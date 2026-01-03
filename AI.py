@@ -152,7 +152,7 @@ def generate(model, seed, w2i, i2w, max_new=200):
     print(f"\n>> Seed: {' '.join([i2w.get(i, '?') for i in ids[-3:]])}\n")
     
     for i in range(max_new):
-        ctx = torch.tensor([ids[-SEQ_LEN:]], device=device)
+        ctx = torch.tensor([ids], device=device)
         stretch = 1.3 if i % 3 == 0 else 1.0
         
         with torch.no_grad():
