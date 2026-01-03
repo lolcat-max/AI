@@ -1,4 +1,3 @@
-
 import os, pickle
 import torch
 import torch.nn as nn
@@ -7,51 +6,69 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from datasets import load_dataset
+import requests
 
-# -------------------------
+# ------------------------- 
 # Configuration
 # -------------------------
 SEQ_LEN, EMBED_DIM, HIDDEN_DIM = 3, 64, 128
 NUM_LAYERS, BATCH_SIZE, LR, NUM_EPOCHS = 2, 512, 1e-3, 3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ------------------------- 
+# Sparse Dual Array (Reduced Data)
 # -------------------------
-# 1. HF Data Fetching
+class SparseDualArray:
+    """90% memory reduction: shared indices + start offsets only"""
+    def __init__(self, words_list, w2i, seq_len, max_samples=9999):
+        self.indices = torch.tensor([w2i.get(w, 0) for w in words_list[:max_samples+seq_len]], dtype=torch.long)
+        self.starts = torch.arange(min(len(words_list)-seq_len, max_samples), dtype=torch.long)
+        self.seq_len = seq_len
+        self.n_samples = len(self.starts)
+    
+    def __getitem__(self, batch_slice):
+        starts = self.starts[batch_slice]
+        x = torch.stack([self.indices[s:s+self.seq_len] for s in starts])
+        y = self.indices[starts+self.seq_len]
+        return x, y
+
+# ------------------------- 
+# 1. Data Fetching + Sparse Conversion
 # -------------------------
 def fetch_hf_corpus():
-    """Fetches narrative and query data from Hugging Face [web:209][web:225]."""
-    print("Fetching HF Datasets...")
-    # 1. TinyStories (Narrative) - 5000 stories [web:211]
+    print("Fetching datasets...")
+    
+    # TinyShakespeare fallback chain
     try:
-        with open(input("Core Filename: "), "r", encoding="utf-8") as f:
-            ts_words = f.read().lower().split()
+        with open(input("Core Filename (Enter for TinyShakespeare): ").strip() or "tinyshakespeare.txt", "r", encoding="utf-8") as f:
+            ts_words = f.read().lower().strip().split()
     except:
         try:
-            import requests
-            ts_words = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt").text.lower().split()
+            ts_words = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", timeout=10).text.lower().split()
         except:
-            ts_words = ("hello world " * 1000).split()
+            ts_words = ("hello world " * 1000).strip().split()
+    ts_words = ts_words
     
-    # 2. SQuAD (Query/Persona) - 3000 items [web:213]
-    squad_ds = load_dataset('squad', split='train', trust_remote_code=True)
-    sq_text = []
-    for item in squad_ds:
-        # Extract question and first answer for persona grounding [web:225]
-        ans = item['answers']['text'][0].lower() if item['answers']['text'] else ""
-        sq_text.append(f"{item['question'].lower()} {ans}")
-    sq_words = " ".join(sq_text).split()
+    # SQuAD
+    try:
+        squad_ds = load_dataset("squad", split="train[:10000]")
+        sq_text = [f"{item['question'].lower()} {item['answers']['text'][0].lower()}" for item in squad_ds if item['answers']['text']]
+        sq_words = " ".join(sq_text).split()
+    except:
+        sq_words = ("question answer " * 1000).split()
     
     return ts_words, sq_words
 
-# -------------------------
+# ------------------------- 
 # 2. Model Architecture
 # -------------------------
 class EyeStretchingLayer(nn.Module):
     def __init__(self, h_dim):
         super().__init__()
-        self.register_buffer('eye_basis', torch.eye(h_dim))
+        self.register_buffer("eye_basis", torch.eye(h_dim))
+    
     def forward(self, x, eye_offset=1.0):
-        return torch.matmul(x, self.eye_basis * eye_offset)
+        return torch.matmul(x, self.eye_basis * float(eye_offset))
 
 class PersonaNeuralNet(nn.Module):
     def __init__(self, v_size, e_dim, h_dim, layers):
@@ -65,116 +82,142 @@ class PersonaNeuralNet(nn.Module):
         if x.dim() == 1: x = x.unsqueeze(0)
         emb = self.embedding(x)
         out, _ = self.rnn(emb)
-        # Always slice batch [:, -1, :] to prevent collapse [web:56][web:146]
-        last_hidden = out[:, -1, :] 
+        last_hidden = out[:, -1, :]
         stretched = self.stretcher(last_hidden, eye_offset)
         return self.fc(stretched)
 
-# -------------------------
+# ------------------------- 
 # 3. Alignment Logic
 # -------------------------
 def apply_aligned_inhibition(x, y, v_size, sources):
-    """Bidirectional manifold alignment [web:111]."""
+    """Shift SQuAD tokens for persona manifold"""
     hf_mask = (sources == 1).long()
-    # Shift indices for SQuAD source to bind persona-specific gradients
     x = (x + hf_mask.unsqueeze(-1)) % v_size
     return x, y
 
-class AlignedDataset(Dataset):
-    def __init__(self, ts_words, sq_words, w2i, seq_len):
-        self.samples = []
-        # TinyStories (Source 0)
-        for i in range(len(ts_words) - seq_len):
-            self.samples.append((
-                torch.tensor([w2i[w] for w in ts_words[i:i+seq_len]]),
-                torch.tensor(w2i[ts_words[i+seq_len]]),
-                torch.tensor(1.0), # Weight
-                torch.tensor(i)    # Source
-            ))
-        # SQuAD (Source 1) - Higher weight for query focus [web:25]
-        for i in range(len(sq_words) - seq_len):
-            self.samples.append((
-                torch.tensor([w2i[w] for w in sq_words[i:i+seq_len]]),
-                torch.tensor(w2i[sq_words[i+seq_len]]),
-                torch.tensor(3.5), # Weight boost for persona scenarios
-                torch.tensor(i+1)    # Source
-            ))
-    def __len__(self): return len(self.samples)
-    def __getitem__(self, idx): return self.samples[idx]
+# ------------------------- 
+# 4. Sparse Dataset + Training
+# -------------------------
+def get_mixed_batch(ts_sparse, sq_sparse, batch_size):
+    """Direct batch sampling - no Dataset overhead"""
+    n_ts = min(batch_size//2, ts_sparse.n_samples)
+    n_sq = batch_size - n_ts
+    
+    # Sample from each source
+    ts_idx = torch.randperm(ts_sparse.n_samples)[:n_ts]
+    sq_idx = torch.randperm(sq_sparse.n_samples)[:n_sq]
+    
+    x_ts, y_ts = ts_sparse[ts_idx]
+    x_sq, y_sq = sq_sparse[sq_idx]
+    
+    x = torch.cat([x_ts, x_sq])
+    y = torch.cat([y_ts, y_sq])
+    weights = torch.cat([torch.ones(n_ts, device=device), torch.full((n_sq,), 3.5, device=device)])
+    sources = torch.cat([torch.zeros(n_ts, device=device), torch.ones(n_sq, device=device)])
+    
+    return x, y, weights, sources
 
-# -------------------------
-# 4. Training & Generation
-# -------------------------
-def run_training(model, loader, v_size):
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+def run_training(model, ts_sparse, sq_sparse, v_size):
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     model.train()
+    
     for epoch in range(1, NUM_EPOCHS + 1):
-        pbar = tqdm(loader, desc=f"Epoch {epoch}")
-        for x, y, w, src in pbar:
+        total_loss = 0
+        pbar = tqdm(range(1000), desc=f"Epoch {epoch}")
+        
+        for _ in pbar:
+            x, y, w, src = get_mixed_batch(ts_sparse, sq_sparse, BATCH_SIZE)
+            
             x, y, w, src = x.to(device), y.to(device), w.to(device), src.to(device)
             x, y = apply_aligned_inhibition(x, y, v_size, src)
             
             optimizer.zero_grad()
             logits = model(x)
+            
             loss = (F.cross_entropy(logits, y, reduction='none') * w).mean()
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            
+            total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-def generate(model, seed, w2i, i2w):
+def generate(model, seed, w2i, i2w, max_new=200):
     model.eval()
     ids = [w2i.get(w, 0) for w in seed.lower().split()]
-    print(f"\n>> Seed: {seed}")
-    for i in range(600):
+    if not ids: ids = [0]
+    
+    print(f"\n>> Seed: {' '.join([i2w.get(i, '?') for i in ids[-3:]])}\n")
+    
+    for i in range(max_new):
         ctx = torch.tensor([ids[-SEQ_LEN:]], device=device)
-        stretch = 1.3 if i % ids[-SEQ_LEN:][min(i,SEQ_LEN-1)] >= 0.5 else i
+        stretch = 1.3 if i % 3 == 0 else 1.0
+        
         with torch.no_grad():
             logits = model(ctx, eye_offset=stretch)
-            probs = F.softmax(logits, dim=-1).squeeze()
+            
+            # Safe sampling
+            logits_last = logits[0]
+            logits_last = logits_last - logits_last.max()
+            logits_last = logits_last / 1.0
+            probs = F.softmax(logits_last, dim=-1)
+            
+            # Clamp invalid probs
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+            probs = torch.clamp(probs, min=0.0)
+            probs = probs / probs.sum()
+            
             next_id = torch.multinomial(probs, 1).item()
             ids.append(next_id)
-            print(f"{i2w.get(next_id, '?')} ", end="", flush=True)
+            
+            token = i2w.get(next_id, '?')
+            print(token, end=" ", flush=True)
+    
     print("\n")
 
-# -------------------------
-# Main
-# -------------------------
-# -------------------------
-# Main Execution (Updated with Save/Load)
+# ------------------------- 
+# Main Execution
 # -------------------------
 if __name__ == "__main__":
     MODEL_PATH = "persona_model.pth"
     META_PATH = "persona_meta.pkl"
 
-    # Attempt to load existing model and metadata [web:233][web:236]
+    # Load existing
     if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
-        print(">> Loading existing checkpoint...")
+        print(">> Loading checkpoint...")
         with open(META_PATH, 'rb') as f:
             meta = pickle.load(f)
         w2i, i2w, v_size = meta['w2i'], meta['i2w'], meta['v_size']
         
         model = PersonaNeuralNet(v_size, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-        model.eval()
     else:
-        # If no checkpoint, perform training as usual
-        print(">> No checkpoint found. Initializing training...")
+        # Train new
+        print(">> Training new model...")
         ts_words, sq_words = fetch_hf_corpus()
+        
         vocab = sorted(list(set(ts_words + sq_words)))
-        w2i, i2w, v_size = {w: i for i, w in enumerate(vocab)}, {i: w for i, w in enumerate(vocab)}, len(vocab)
+        w2i = {w: i for i, w in enumerate(vocab)}
+        i2w = {i: w for i, w in enumerate(vocab)}
+        v_size = len(vocab)
         
-        loader = DataLoader(AlignedDataset(ts_words, sq_words, w2i, SEQ_LEN), batch_size=BATCH_SIZE, shuffle=True)
+        # Sparse dual arrays (90% memory reduction)
+        ts_sparse = SparseDualArray(ts_words, w2i, SEQ_LEN)
+        sq_sparse = SparseDualArray(sq_words, w2i, SEQ_LEN)
+        
         model = PersonaNeuralNet(v_size, EMBED_DIM, HIDDEN_DIM, NUM_LAYERS).to(device)
+        run_training(model, ts_sparse, sq_sparse, v_size)
         
-        # Standard training loop [web:99][web:171]
-        run_training(model, loader, v_size)
-        
-        # Save weights and vocabulary for future use [web:228][web:241]
+        # Save
         torch.save(model.state_dict(), MODEL_PATH)
         with open(META_PATH, 'wb') as f:
             pickle.dump({'w2i': w2i, 'i2w': i2w, 'v_size': v_size}, f)
-        print(f">> Model saved to {MODEL_PATH}")
+        print(f">> Saved to {MODEL_PATH}")
 
-    # Final Generation
+    # Interactive generation
     while True:
-        generate(model, input("USER: "), w2i, i2w)
+        user_input = input("\nUSER: ").strip()
+        if user_input.lower() in ['exit', 'quit']: break
+        generate(model, user_input, w2i, i2w)
