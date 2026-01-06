@@ -4,6 +4,16 @@ from tqdm import tqdm
 SEQ_LEN, E, H, B, LR, EPOCHS = 3, 180, 1160, 1640, 1e-2, 1
 D = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+try:
+    with open(input("Core Filename (Enter for TinyShakespeare): ").strip() or "tinyshakespeare.txt", "r", encoding="utf-8") as f:
+        CORPUS = f.read().lower().strip().split()
+except:
+    try:
+        CORPUS = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", timeout=10).text.lower().split()
+    except:
+        CORPUS = ("hello world " * 1000).strip().split()
+VOCAB = sorted(set(CORPUS)); V = len(VOCAB)
+W2I = {w:i for i,w in enumerate(VOCAB)}; I2W = {i:w for i,w in enumerate(VOCAB)}
 
 class MicroData:
     def __init__(self): 
@@ -17,6 +27,7 @@ class MicroData:
         y = self.ids[idx + SEQ_LEN]
         return x, y, torch.ones(size, device=D)
 
+ts = MicroData(); sq = MicroData()
 
 class NanoNet(nn.Module):
     def __init__(self,v): 
@@ -79,19 +90,6 @@ if os.path.exists(P) and os.path.exists(M):
     print("🔥 LOADED!")
 else:
     print("⚡ TRAINING...")
-        
-    try:
-        with open(input("Core Filename (Enter for TinyShakespeare): ").strip() or "tinyshakespeare.txt", "r", encoding="utf-8") as f:
-            CORPUS = f.read().lower().strip().split()
-    except:
-        try:
-            CORPUS = requests.get("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", timeout=10).text.lower().split()
-        except:
-            CORPUS = ("hello world " * 1000).strip().split()
-    VOCAB = sorted(set(CORPUS)); V = len(VOCAB)
-    W2I = {w:i for i,w in enumerate(VOCAB)}; I2W = {i:w for i,w in enumerate(VOCAB)}
-    ts = MicroData(); sq = MicroData()
-
     m=NanoNet(V).to(D)
     train(m)
     meta={'v':V,'w2i':W2I,'i2w':I2W}
