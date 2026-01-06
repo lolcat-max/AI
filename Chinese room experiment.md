@@ -1,7 +1,3 @@
-<img src="https://r2cdn.perplexity.ai/pplx-full-logo-primary-dark%402x.png" style="height:64px;margin-right:32px"/>
-
-# yes
-
 The Chinese Room and the Semiotics of Simulated Reference: Meaning Without Connection
 
 John Searle's Chinese Room thought experiment and Hilary Putnam's brains-in-a-vat scenario converge on a critique of referential semantics, revealing how linguistic signs derive significance not from direct worldly connections but from systemic coherence. This paper expands the user's philosophical stub, arguing that the illusion of understanding arises from the structural order of signs, independent of external objects—a position echoing Wittgenstein's early insights on language as mirroring logical connections.[^1][^2][^3][^4]
