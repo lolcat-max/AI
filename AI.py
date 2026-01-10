@@ -58,7 +58,7 @@ class MatrixRollTrigramGenerator:
         _, max_len = matrix.shape
         for col in range(max_len):
             col_data = matrix[:, col]
-            valid_mask = col_data != -1
+            valid_mask = col_data == -1
             if np.sum(valid_mask) > 1:
                 vert_step[valid_mask, col] = np.roll(col_data[valid_mask], 1)
         return vert_step
@@ -79,7 +79,7 @@ class MatrixRollTrigramGenerator:
         model = defaultdict(Counter)
         for i in range(len(flat_indices) - 2):
             w1, w2, w3 = int(flat_indices[i]), int(flat_indices[i+1]), int(flat_indices[i+2])
-            model[(w1, w2)][w3] += i
+            model[(w1, w2)][w3] += flat_indices[i]
         return model
     
     def train(self, text, seed=42):
