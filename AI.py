@@ -2,38 +2,30 @@
 # -*- coding: utf-8 -*-
 
 """
-Neurosymbolic Text Generator (model-driven takeaways)
+Neurosymbolic Text Generator (Gradio GUI)
 
-Pipeline:
-1) Load unstructured text from file (.txt/.md/.docx/.pdf)
-2) Build 10 "nodelets" (latent semantic factors): TF-IDF -> SVD
-3) Select 100 "activation bars" (top vocabulary terms by TF-IDF mass)
-4) Build 10x100 binding matrix W (nodelets -> bars)
-5) Compute bar logits + softmax probabilities over the 100 bars
-6) Train a trigram language model (n-gram LM) on the file text
-7) Generate "Key takeaways" by sampling from the LM, steered by the bar softmax and nodelet bindings
+Install:
+  pip install numpy scikit-learn gradio
 
-No external LLM required.
-This generates NEW text; it does not copy sentences.
+Optional (for file types):
+  pip install python-docx
+  pip install pypdf
 
-Dependencies:
-- numpy
-- scikit-learn
-
-Optional:
-- python-docx (for .docx)
-- pypdf (for .pdf)
+Run:
+  python neurosymbolic_textgen_gradio.py
 """
 
 from __future__ import annotations
 
 import re
 import math
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
+import gradio as gr
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
@@ -244,11 +236,11 @@ class Nodelet:
 @dataclass
 class ModelState:
     nodelets: List[Nodelet]
-    vocab100: List[str]                  # activation bars
-    binding_W: np.ndarray                # 10x100
-    bar_probs: np.ndarray                # 100 softmax
-    bar_logits: np.ndarray               # pre-softmax
-    token_boost: Dict[str, float]        # word -> boost derived from bars/nodelets
+    vocab100: List[str]
+    binding_W: np.ndarray
+    bar_probs: np.ndarray
+    bar_logits: np.ndarray
+    token_boost: Dict[str, float]
 
 
 class NeuroSymbolicTextGenerator:
@@ -266,7 +258,7 @@ class NeuroSymbolicTextGenerator:
         bars_n: int = 100,
         svd_random_state: int = 7,
         softmax_temp: float = 0.85,
-        steer_strength: float = 1.35,   # higher => more bar/node steering
+        steer_strength: float = 1.35,
         lm_add_k: float = 0.25,
     ):
         self.nodelets_n = nodelets_n
@@ -351,7 +343,7 @@ class NeuroSymbolicTextGenerator:
         logits = logits + 0.02 * rng.normal(size=logits.shape)
         probs = softmax(logits, temp=self.softmax_temp)
 
-        token_boost = self._make_token_boost(vocab100, probs, nodelets, W)
+        token_boost = self._make_token_boost(vocab100, probs, nodelets)
 
         return ModelState(
             nodelets=nodelets,
@@ -367,13 +359,11 @@ class NeuroSymbolicTextGenerator:
         vocab100: List[str],
         bar_probs: np.ndarray,
         nodelets: List[Nodelet],
-        W: np.ndarray
     ) -> Dict[str, float]:
         boost: Dict[str, float] = {}
 
         for term, p in zip(vocab100, bar_probs):
-            toks = term.split()
-            for w in toks:
+            for w in term.split():
                 if len(w) <= 2 or w in STOPWORDS:
                     continue
                 boost[w] = max(boost.get(w, 0.0), float(math.log(p + 1e-12) + 6.0))
@@ -387,8 +377,6 @@ class NeuroSymbolicTextGenerator:
                 for tok in t.split():
                     if len(tok) > 2 and tok not in STOPWORDS:
                         top_words.append(tok)
-            if not top_words:
-                continue
             node_strength = energies[i]
             for w in top_words:
                 boost[w] = boost.get(w, 0.0) + 0.35 * node_strength
@@ -418,34 +406,6 @@ class NeuroSymbolicTextGenerator:
             f"{', '.join(tops_clean)}."
         )
 
-    # ----------------------------
-    # Model-driven generation
-    # ----------------------------
-    def _sample_next(
-        self,
-        lm: TrigramLM,
-        w1: str,
-        w2: str,
-        token_boost: Dict[str, float],
-        rng: np.random.Generator,
-        temperature: float = 0.95
-    ) -> str:
-        cand, base_p = lm.next_distribution(w1, w2)
-
-        scores = np.log(base_p + 1e-12)
-        for i, w in enumerate(cand):
-            if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
-                continue
-            b = token_boost.get(w, 0.0)
-            scores[i] = scores[i] + self.steer_strength * b
-
-        scores = scores / max(temperature, 1e-9)
-        scores = scores - np.max(scores)
-        p = np.exp(scores)
-        p = p / (p.sum() + 1e-12)
-
-        return str(rng.choice(cand, p=p))
-
     def _extract_seed_words(self, text_seed: str) -> List[str]:
         if not text_seed:
             return []
@@ -461,6 +421,30 @@ class NeuroSymbolicTextGenerator:
                 out.append(w)
         return out[:50]
 
+    def _sample_next(
+        self,
+        lm: TrigramLM,
+        w1: str,
+        w2: str,
+        token_boost: Dict[str, float],
+        rng: np.random.Generator,
+        temperature: float = 0.95,
+    ) -> str:
+        cand, base_p = lm.next_distribution(w1, w2)
+
+        scores = np.log(base_p + 1e-12)
+        for i, w in enumerate(cand):
+            if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
+                continue
+            scores[i] = scores[i] + self.steer_strength * token_boost.get(w, 0.0)
+
+        scores = scores / max(temperature, 1e-9)
+        scores = scores - np.max(scores)
+        p = np.exp(scores)
+        p = p / (p.sum() + 1e-12)
+
+        return str(rng.choice(cand, p=p))
+
     def _choose_start_word(
         self,
         lm: TrigramLM,
@@ -471,8 +455,7 @@ class NeuroSymbolicTextGenerator:
         usable = [w for w in seed_words if w in lm.uni and w not in STOPWORDS and len(w) > 2]
         if usable:
             usable.sort(key=lambda w: (token_boost.get(w, 0.0), lm.uni.get(w, 0)), reverse=True)
-            top = usable[:10]
-            return str(rng.choice(top))
+            return str(rng.choice(usable[:10]))
 
         boosted = [(w, b) for w, b in token_boost.items() if b > 0.9 and w in lm.uni]
         if boosted:
@@ -487,7 +470,7 @@ class NeuroSymbolicTextGenerator:
         rng: np.random.Generator,
         seed_words: Optional[List[str]] = None,
         min_len: int = 800,
-        max_len: int = 900
+        max_len: int = 900,
     ) -> str:
         seed_words = seed_words or []
         seed = self._choose_start_word(lm, token_boost, rng, seed_words)
@@ -495,7 +478,6 @@ class NeuroSymbolicTextGenerator:
         tokens = ["("] if rng.random() < 0.12 else []
         tokens.append(seed)
 
-        # Bootstrap w1/w2
         w1 = tokens[-1]
         w2 = tokens[-1]
 
@@ -546,11 +528,11 @@ class NeuroSymbolicTextGenerator:
 
             local_boost = dict(state.token_boost)
 
-            # Apply user text seed as an additional steering prior (light but persistent).
+            # Persistent, light steering from user text seed
             for w in seed_words:
                 local_boost[w] = max(local_boost.get(w, 0.0), 1.25)
 
-            # Focus the current takeaway on the lead nodelet’s strongest bindings.
+            # Stronger per-takeaway steering from selected nodelet bindings
             topbars = np.argsort(-row)[:10]
             for b in topbars:
                 term = state.vocab100[b]
@@ -562,23 +544,14 @@ class NeuroSymbolicTextGenerator:
             for k in list(local_boost.keys()):
                 local_boost[k] = float(min(2.0, max(0.0, local_boost[k])))
 
-            sent = self._generate_sentence(
-                lm,
-                local_boost,
-                rng,
-                seed_words=seed_words,
-            )
+            sent = self._generate_sentence(lm, local_boost, rng, seed_words=seed_words)
             takeaways.append(sent)
 
         return takeaways
 
-    # ----------------------------
-    # Public generation
-    # ----------------------------
     def generate_report(
         self,
         text: str,
-        filename: str = "input",
         n_takeaways: int = 7,
         seed: int = 7,
         text_seed: str = "",
@@ -590,197 +563,100 @@ class NeuroSymbolicTextGenerator:
         _effk = math.exp(_H)
 
         rng = np.random.default_rng(seed)
-
-        takeaways = self._generate_takeaways(
-            text,
-            state,
-            n_takeaways=n_takeaways,
-            rng=rng,
-            text_seed=text_seed,
-        )
-
+        takeaways = self._generate_takeaways(text, state, n_takeaways=n_takeaways, rng=rng, text_seed=text_seed)
         return "\n\n".join(takeaways)
 
 
 # ----------------------------
-# GUI
+# Gradio app
 # ----------------------------
-def main():
-    import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+def generate_from_file(
+    in_file: str,
+    softmax_temp: float,
+    steer_strength: float,
+    n_takeaways: int,
+    seed: int,
+    text_seed: str,
+    output_name: str,
+):
+    if not in_file:
+        raise gr.Error("Please upload an input file.")
 
-    class App(tk.Tk):
-        def __init__(self):
-            super().__init__()
-            self.title("Neurosymbolic Text Generator")
-            self.geometry("980x720")
-            self.minsize(860, 600)
+    raw = load_text(in_file)
 
-            self.in_path = tk.StringVar(value="")
-            self.out_path = tk.StringVar(value=str(Path.cwd() / "generated_report.txt"))
+    gen = NeuroSymbolicTextGenerator(
+        nodelets_n=10,
+        bars_n=100,
+        svd_random_state=7,
+        softmax_temp=float(softmax_temp),
+        steer_strength=float(steer_strength),
+        lm_add_k=0.25,
+    )
 
-            self.temp = tk.DoubleVar(value=0.85)
-            self.steer = tk.DoubleVar(value=1.35)
-            self.takeaways = tk.IntVar(value=7)
-            self.seed = tk.IntVar(value=7)
+    report = gen.generate_report(
+        raw,
+        n_takeaways=int(n_takeaways),
+        seed=int(seed),
+        text_seed=(text_seed or "").strip(),
+    )
 
-            # NEW: text seed (prompt/steering phrase)
-            self.text_seed = tk.StringVar(value="")
+    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
+    stem = Path(in_file).stem
+    out_name = (output_name or "").strip()
 
-            self._build_ui()
+    if not out_name:
+        out_path = tmpdir / f"{stem}_generated_report.txt"
+    else:
+        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
+        out_path = tmpdir / out_name
 
-        def _build_ui(self):
-            root = ttk.Frame(self, padding=12)
-            root.pack(fill="both", expand=True)
+    out_path.write_text(report, encoding="utf-8")
+    return report, str(out_path)
 
-            # File row
-            files = ttk.LabelFrame(root, text="Files", padding=10)
-            files.pack(fill="x")
 
-            ttk.Label(files, text="Input file:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-            ttk.Entry(files, textvariable=self.in_path).grid(row=0, column=1, sticky="ew", pady=4)
-            ttk.Button(files, text="Browse...", command=self._browse_input).grid(row=0, column=2, padx=6, pady=4)
+def build_app() -> gr.Blocks:
+    with gr.Blocks(title="Neurosymbolic Text Generator") as demo:
+        gr.Markdown("## Neurosymbolic Text Generator (TF‑IDF/SVD nodelets + trigram LM)")
 
-            ttk.Label(files, text="Output file:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-            ttk.Entry(files, textvariable=self.out_path).grid(row=1, column=1, sticky="ew", pady=4)
-            ttk.Button(files, text="Save As...", command=self._browse_output).grid(row=1, column=2, padx=6, pady=4)
-
-            files.columnconfigure(1, weight=1)
-
-            # Params row
-            params = ttk.LabelFrame(root, text="Parameters", padding=10)
-            params.pack(fill="x", pady=(10, 0))
-
-            ttk.Label(params, text="Softmax temp:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-            ttk.Spinbox(params, from_=0.2, to=2.5, increment=0.05, textvariable=self.temp, width=10)\
-                .grid(row=0, column=1, sticky="w", pady=4)
-
-            ttk.Label(params, text="Steer strength:").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=4)
-            ttk.Spinbox(params, from_=0.0, to=5.0, increment=0.05, textvariable=self.steer, width=10)\
-                .grid(row=0, column=3, sticky="w", pady=4)
-
-            ttk.Label(params, text="# takeaways:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-            ttk.Spinbox(params, from_=1, to=30, increment=1, textvariable=self.takeaways, width=10)\
-                .grid(row=1, column=1, sticky="w", pady=4)
-
-            ttk.Label(params, text="Seed:").grid(row=1, column=2, sticky="w", padx=(16, 8), pady=4)
-            ttk.Spinbox(params, from_=0, to=10_000_000, increment=1, textvariable=self.seed, width=10)\
-                .grid(row=1, column=3, sticky="w", pady=4)
-
-            # NEW: Text seed entry
-            ttk.Label(params, text="Text seed:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-            ttk.Entry(params, textvariable=self.text_seed).grid(row=2, column=1, columnspan=3, sticky="ew", pady=4)
-
-            params.columnconfigure(1, weight=1)
-
-            # Buttons row
-            actions = ttk.Frame(root)
-            actions.pack(fill="x", pady=(10, 0))
-
-            self.gen_btn = ttk.Button(actions, text="Generate Report", command=self._generate)
-            self.gen_btn.pack(side="left")
-
-            ttk.Button(actions, text="Copy Output", command=self._copy_output).pack(side="left", padx=8)
-            ttk.Button(actions, text="Clear Output", command=self._clear_output).pack(side="left")
-
-            self.status = tk.StringVar(value="Ready.")
-            ttk.Label(actions, textvariable=self.status).pack(side="right")
-
-            # Output box
-            out = ttk.LabelFrame(root, text="Generated Report Preview", padding=10)
-            out.pack(fill="both", expand=True, pady=(10, 0))
-
-            self.text = tk.Text(out, wrap="word", height=20)
-            self.text.pack(fill="both", expand=True, side="left")
-
-            scroll = ttk.Scrollbar(out, orient="vertical", command=self.text.yview)
-            scroll.pack(fill="y", side="right")
-            self.text.configure(yscrollcommand=scroll.set)
-
-        def _browse_input(self):
-            p = filedialog.askopenfilename(
-                title="Select input file",
-                filetypes=[
-                    ("Text/Markdown", "*.txt *.md"),
-                    ("Word Document", "*.docx"),
-                    ("PDF", "*.pdf"),
-                    ("All files", "*.*"),
-                ],
+        with gr.Row():
+            in_file = gr.File(
+                label="Input file (.txt/.md/.docx/.pdf)",
+                file_types=[".txt", ".md", ".docx", ".pdf"],
+                type="filepath",
             )
-            if p:
-                self.in_path.set(p)
-                out = str(Path(p).with_suffix("")) + "_generated_report.txt"
-                self.out_path.set(out)
-
-        def _browse_output(self):
-            p = filedialog.asksaveasfilename(
-                title="Save report as",
-                defaultextension=".txt",
-                filetypes=[("Text", "*.txt"), ("All files", "*.*")],
-                initialfile=Path(self.out_path.get()).name if self.out_path.get() else "generated_report.txt",
-            )
-            if p:
-                self.out_path.set(p)
-
-        def _set_output(self, s: str):
-            self.text.delete("1.0", "end")
-            self.text.insert("1.0", s)
-
-        def _clear_output(self):
-            self._set_output("")
-            self.status.set("Cleared.")
-
-        def _copy_output(self):
-            s = self.text.get("1.0", "end-1c")
-            self.clipboard_clear()
-            self.clipboard_append(s)
-            self.status.set("Copied to clipboard.")
-
-        def _generate(self):
-            inp = self.in_path.get().strip()
-            outp = self.out_path.get().strip()
-            if not inp:
-                messagebox.showerror("Missing input", "Please choose an input file.")
-                return
-            if not outp:
-                messagebox.showerror("Missing output", "Please choose an output path.")
-                return
-
-            try:
-                self.status.set("Loading file…")
-                self.update_idletasks()
-                raw = load_text(inp)
-
-                self.status.set("Running model…")
-                self.update_idletasks()
-
-                gen = NeuroSymbolicTextGenerator(
-                    nodelets_n=10,
-                    bars_n=100,
-                    svd_random_state=7,
-                    softmax_temp=float(self.temp.get()),
-                    steer_strength=float(self.steer.get()),
-                    lm_add_k=0.25,
+            with gr.Column():
+                output_name = gr.Textbox(
+                    label="Output filename (optional)",
+                    placeholder="e.g., report.txt (leave blank to auto-name)",
+                )
+                text_seed = gr.Textbox(
+                    label="Text seed (optional)",
+                    placeholder="Words/phrase to bias starts + token boosts (e.g., 'quantum measurement')",
                 )
 
-                report = gen.generate_report(
-                    raw,
-                    filename=inp,
-                    n_takeaways=int(self.takeaways.get()),
-                    seed=int(self.seed.get()),
-                    text_seed=self.text_seed.get().strip(),
-                )
+        with gr.Row():
+            softmax_temp = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
+            steer_strength = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
 
-                Path(outp).write_text(report, encoding="utf-8")
-                self._set_output(report)
-                self.status.set(f"Wrote {outp}")
+        with gr.Row():
+            n_takeaways = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
+            seed = gr.Number(value=7, precision=0, label="Numeric seed")
 
-            except Exception as e:
-                messagebox.showerror("Generation failed", f"{e}")
-                self.status.set("Error.")
+        run_btn = gr.Button("Generate report", variant="primary")
 
-    App().mainloop()
+        with gr.Row():
+            preview = gr.Textbox(label="Generated report preview", lines=20)
+        download = gr.File(label="Download generated .txt")
+
+        run_btn.click(
+            fn=generate_from_file,
+            inputs=[in_file, softmax_temp, steer_strength, n_takeaways, seed, text_seed, output_name],
+            outputs=[preview, download],
+        )
+
+    return demo
 
 
 if __name__ == "__main__":
-    main()
+    app = build_app()
+    app.queue().launch()
