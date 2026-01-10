@@ -1,226 +1,158 @@
-import os, pickle, torch, torch.nn as nn, torch.nn.functional as F, torch.optim as optim
-from tqdm import tqdm
-import requests
-import gradio as gr
+import numpy as np
+import random
+from collections import defaultdict, Counter
+import argparse
+import os
+import sys
 
-SEQ_LEN, E, H, B, LR, EPOCHS = 3, 180, 1160, 1640, 1e-2, 1
-D = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ---------------- Data ----------------
-class MicroData:
-    def __init__(self, ids_tensor):
-        self.ids = ids_tensor.to(D)
-        self.n_safe = min(5500, len(self.ids) - SEQ_LEN - 1)
-
-    def sample(self, size):
-        idx = torch.randint(0, self.n_safe, (size,), device=D)
-        positions = torch.stack([idx + i for i in range(SEQ_LEN)], dim=1)
-        x = torch.gather(self.ids, 0, positions.flatten()).reshape(size, SEQ_LEN)
-        y = self.ids[idx + SEQ_LEN]
-        return x, y, torch.ones(size, device=D)
-
-# ---------------- Model ----------------
-class NanoNet(nn.Module):
-    def __init__(self, v):
-        super().__init__()
-        self.e = nn.Embedding(v, E)
-        self.g = nn.GRU(E, H, 1, batch_first=True)
-        self.l = nn.Linear(H, v, bias=False)
-
-    def forward(self, x):
-        x = self.e(x)
-        o, _ = self.g(x)
-        return self.l(o[:, -1] * 1.1)
-
-def batch():
-    size = B // 2
-    x1, y1, w1 = ts.sample(size)
-    x2, y2, w2 = sq.sample(size)
-    return torch.cat([x1, x2]), torch.cat([y1, y2]), torch.cat([w1, w2 * 2.5])
-
-def train(m):
-    o = optim.Adam(m.parameters(), LR)
-    m.train()
-    for e in range(EPOCHS):
-        p = tqdm(range(300))
-        L = 0
-        for _ in p:
-            x, y, w = batch()
-            o.zero_grad()
-            logits = m(x)
-            loss = (F.cross_entropy(logits, y, reduction='none') * w).mean()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(m.parameters(), 1)
-            o.step()
-            L += loss.item()
-            p.set_postfix(loss=f"{loss.item():.3f}")
-        print(f"E{e+1}: {L/300:.3f}")
-
-# ---------------- Compendium Encoder (No Unknown Tokens) ----------------
-class CompendiumEncoder:
-    def __init__(self, vocab, w2i):
-        self.vocab = vocab
-        self.w2i = w2i
-        self.char_to_id = {}
-        for char_ord in range(256):
-            char = chr(char_ord)
-            min_dist, best_id = float('inf'), 0
-            for i, word in enumerate(vocab):
-                if len(word) == 1:
-                    dist = abs(ord(char) - ord(word))
-                    if dist < min_dist:
-                        min_dist, best_id = dist, i
-                elif char in word:
-                    dist = 0
-                    if dist < min_dist:
-                        min_dist, best_id = dist, i
-            self.char_to_id[char_ord] = best_id
-    
-    def encode_unknown(self, word):
-        ids = []
-        for c in word.lower():
-            char_ord = ord(c)
-            tid = self.char_to_id.get(char_ord, 0)
-            ids.append(tid)
-        return ids
-
-
-# ---------------- Enhanced Generation ----------------
-@torch.no_grad()
-def generate_text(m, seed, w2i, i2w, compendium, length=80, temp=0.8, top_p=0.9, grep_mode=False):
-    full_seed = seed
-    
-    # Compendium tokenization: known + char-fallback
-    ids = []
-    for w in full_seed.lower().split():
-        if w in w2i:
-            ids.append(w2i[w])
-        else:
-            ids.extend(compendium.encode_unknown(w))
-    ids = ids[-SEQ_LEN:]
-    if len(ids) < SEQ_LEN:
-        ids = [0] * (SEQ_LEN - len(ids)) + ids
-
-    out_words = []
-    for _ in range(length):
-        ctx = torch.tensor([ids[-SEQ_LEN:]], device=D)
-        logits = m(ctx)[0] / temp
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
-        logits = torch.clamp(logits, -20, 20)
-        sorted_l, sorted_i = torch.sort(logits, descending=True)
-        probs = F.softmax(sorted_l, dim=0)
-        probs = torch.nan_to_num(probs, nan=1.0 / len(w2i), posinf=0.0, neginf=0.0)
-        probs = torch.clamp(probs, min=1e-8)
-        probs = probs / probs.sum()
-        next_id = torch.multinomial(probs, 1).item()
-        token_id = sorted_i[next_id].item()
-        ids.append(token_id)
-        out_words.append(i2w.get(token_id, '?'))
-    return " ".join(out_words)
-
-# ---------------- Portable checkpoint ----------------
-CKPT_PATH = "nano_portable.pth"
-
-# ---------------- Portable checkpoint ----------------
-CKPT_PATH = "nano_portable.pth"
-
-if os.path.exists(CKPT_PATH):
-    print("🔥 LOADING PORTABLE CHECKPOINT...")
-    ckpt = torch.load(CKPT_PATH, map_location=D)
-    V = ckpt["v_size"]
-    
-    # Backward compatible vocab loading
-    if "vocab" in ckpt:
-        VOCAB = ckpt["vocab"]
-    else:
-        VOCAB = sorted([w for w in ckpt["w2i"]])
-        print("📚 Reconstructed VOCAB from legacy checkpoint")
-    
-    W2I = ckpt["w2i"]
-    I2W = ckpt["i2w"]
-    compendium_char_to_id = ckpt.get("compendium_char_to_id", {})
-    
-    m = NanoNet(V).to(D)
-    m.load_state_dict(ckpt["model_state_dict"])
-    
-    compendium = CompendiumEncoder(VOCAB, W2I)
-    compendium.char_to_id = compendium_char_to_id
-    print("✅ Loaded model + compendium (handles unknown words)")
-else:
-    print("⚡ TRAINING NEW MODEL...")
+def load_text_file(filepath):
+    """Load unstructured text file, split into sentences."""
+    if filepath is None or not os.path.exists(filepath):
+        print("No input file found, using sample data.")
+        return [
+            "The quick brown fox jumps over the lazy dog.",
+            "The dog sleeps peacefully in the warm sun.",
+            "The sun shines brightly on the green field.",
+            "Birds fly high in the clear blue sky above.",
+            "Children play happily in the park nearby."
+        ]
     try:
-        filename = input("Core Filename (Enter for TinyShakespeare): ").strip() or "tinyshakespeare.txt"
-        with open(filename, "r", encoding="utf-8") as f:
-            CORPUS = f.read().lower().strip().split()
-    except:
-        try:
-            CORPUS = requests.get(
-                "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
-                timeout=10
-            ).text.lower().split()
-        except:
-            CORPUS = ("hello world " * 1000).strip().split()
-    
-    VOCAB = sorted(set(CORPUS))
-    V = len(VOCAB)
-    W2I = {w: i for i, w in enumerate(VOCAB)}
-    I2W = {i: w for i, w in enumerate(VOCAB)}
-    ids_tensor = torch.tensor([W2I[w] for w in CORPUS], dtype=torch.long)
-    ts = MicroData(ids_tensor)
-    sq = MicroData(ids_tensor)
-    m = NanoNet(V).to(D)
-    train(m)
-    
-    compendium = CompendiumEncoder(VOCAB, W2I)
-    
-    ckpt = {
-        "v_size": V,
-        "vocab": VOCAB,
-        "w2i": W2I,
-        "i2w": I2W,
-        "compendium_char_to_id": compendium.char_to_id,
-        "model_state_dict": m.state_dict(),
-    }
-    torch.save(ckpt, CKPT_PATH)
-    print(f"💾 SAVED PORTABLE CHECKPOINT TO {CKPT_PATH}")
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        # Split into sentences by .!? + newline
+        sentences = [s.strip() for s in content.split('\n') if s.strip()]
+        if not sentences:
+            raise ValueError("No valid sentences found in file")
+        print(f"Loaded {len(sentences)} sentences from {filepath}")
+        return sentences
+    except Exception as e:
+        print(f"Error loading file {filepath}: {e}. Using sample data.")
+        return [
+            "The quick brown fox jumps over the lazy dog.",
+            "The dog sleeps peacefully in the warm sun."
+        ]
 
-print("🎯 NanoNet + Compendium + Grep UI")
+def build_word_matrix(sentences, seed=42):
+    """Build padded word index matrix aligned per sentence."""
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    tokenized = [s.split() for s in sentences if s]  # Safe split, skip empty
+    if not tokenized:
+        raise ValueError("No valid tokenized sentences")
+    
+    max_len = max(len(s) for s in tokenized)
+    all_words = [w.lower() for s in tokenized for w in s]
+    vocab = sorted(set(all_words))
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+    V = len(vocab)
+    idx_to_word = {i: w for w, i in word_to_idx.items()}
+    
+    matrix = np.full((len(tokenized), max_len), -1, dtype=int)
+    for i, sent in enumerate(tokenized):
+        for j, word in enumerate(sent):
+            matrix[i, j] = word_to_idx[word.lower()]
+    
+    return matrix, word_to_idx, idx_to_word, V
 
-# ---------------- Gradio UI ----------------
-def ui_generate(seed, temp, top_p, length, grep_mode):
-    if not seed.strip():
-        seed = "the"
-    text = generate_text(m, seed, W2I, I2W, compendium, 
-                        length=int(length), temp=float(temp), top_p=float(top_p), 
-                        grep_mode=grep_mode)
-    prefix = "grep → " if grep_mode else ""
-    return f"{prefix}'{seed}' → {text}"
+def apply_vertical_roll(matrix):
+    """Vertical step: roll down columns on valid elements."""
+    vert_step = matrix.copy()
+    _, max_len = matrix.shape
+    for col in range(max_len):
+        col_data = matrix[:, col]
+        valid_mask = col_data != -1
+        if np.sum(valid_mask) > 1:
+            vert_step[valid_mask, col] = np.roll(col_data[valid_mask], 1)
+    return vert_step
 
-with gr.Blocks(title="NanoNet Compendium") as demo:
-    gr.Markdown("# 🚀 NanoNet: Shakespeare + Unknown Words")
-    gr.Markdown("**Compendium**: Encodes ANY word via char→vocab-index mapping. No OOV!")
+def apply_horizontal_roll(matrix):
+    """Horizontal step: roll left across rows on valid lengths."""
+    horiz_step = matrix.copy()
+    num_rows, max_len = matrix.shape
+    for row in range(num_rows):
+        row_data = matrix[row, :]
+        valid_len = np.sum(row_data != -1)
+        if valid_len > 1:
+            horiz_step[row, :valid_len] = np.roll(row_data[:valid_len], row)
+    return horiz_step
+
+def build_trigram_model(flat_indices):
+    """Build trigram model: (w1,w2) -> Counter(w3)."""
+    model = defaultdict(Counter)
+    for i in range(len(flat_indices) - 2):
+        w1, w2, w3 = int(flat_indices[i]), int(flat_indices[i+1]), int(flat_indices[i+2])
+        model[(w1, w2)][w3] += i
+    return model
+
+def generate_natural_text(model, idx_to_word, V, seed_words, length=50, temp=1.0, seed=42):
+    """Probabilistic generation from trigram model."""
+    random.seed(seed)
+    words = list(seed_words)
+    word_to_idx = {v: k for k, v in idx_to_word.items()}
     
-    with gr.Row():
-        seed = gr.Textbox(label="Seed (try 'quantum🤖')", value="the", lines=1)
-    with gr.Row():
-        temp = gr.Slider(0.1, 2.0, value=0.8, step=0.05, label="Temperature")
-        top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="Top-p")
-        length = gr.Slider(10, 800, value=80, step=10, label="Length")
-        grep_mode = gr.Checkbox(label="🖥️ Grep Mode", value=False)
+    while len(words) < length:
+        if len(words) < 2:
+            words.append(random.choice(list(idx_to_word.values())))
+            continue
+        w1 = words[-2]
+        w2 = words[-1]
+        w1_idx = word_to_idx.get(w1.lower(), 0)
+        w2_idx = word_to_idx.get(w2.lower(), 0)
+        bigram = (w1_idx, w2_idx)
+        
+        if bigram not in model or not model[bigram]:
+            next_idx = random.randint(0, V-1)
+        else:
+            counts = model[bigram]
+            total = sum(counts.values())
+            probs = np.array([counts.get(i, 0) for i in range(V)], dtype=float) / total
+            probs = probs ** (1 / temp)
+            probs /= probs.sum()
+            next_idx = np.random.choice(V, p=probs)
+        
+        words.append(idx_to_word[next_idx])
     
-    out = gr.Textbox(label="Generation", lines=10, max_lines=15)
+    return ' '.join(words)
+
+def main(input_file=None, output_len=50, temp=0.8, seed=42, num_gens=1):
+    sentences = load_text_file(input_file)
+    matrix, word_to_idx, idx_to_word, V = build_word_matrix(sentences, seed)
     
-    # Live regeneration on ALL changes
-    seed.change(ui_generate, inputs=[seed, temp, top_p, length, grep_mode], outputs=out)
-    temp.change(ui_generate, inputs=[seed, temp, top_p, length, grep_mode], outputs=out)
-    top_p.change(ui_generate, inputs=[seed, temp, top_p, length, grep_mode], outputs=out)
-    length.change(ui_generate, inputs=[seed, temp, top_p, length, grep_mode], outputs=out)
-    grep_mode.change(ui_generate, inputs=[seed, temp, top_p, length, grep_mode], outputs=out)
+    print(f"🧬 Vocab size: {V} | Matrix: {matrix.shape}")
     
-    btn = gr.Button("🔥 Generate", variant="primary", size="lg")
-    btn.click(ui_generate, inputs=[seed, temp, top_p, length, grep_mode], outputs=out)
+    # Rolls
+    vert = apply_vertical_roll(matrix)
+    final_matrix = apply_horizontal_roll(vert)
     
-    gr.Markdown("**Tips**: `quantum foo🤖` (compendium)")
+    # Flatten
+    flat_indices = np.concatenate([row[row != -1] for row in final_matrix])
+    print(f"Flattened: {len(flat_indices)} indices")
+    
+    # Model
+    model = build_trigram_model(flat_indices)
+    print(f"📊 {len(model)} unique bigrams")
+    
+    # Seed
+    while True:
+        seed_words = input("USER: ").split()
+        print(f"🌱 Seed: {' '.join(seed_words)}")
+        
+        # Generate
+        for i in range(num_gens):
+            gen = generate_natural_text(model, idx_to_word, V, seed_words, 
+                                       length=output_len, temp=temp, seed=seed + i*10)
+            print(f"\n🌀 Gen {i+1} (temp={temp}): {gen}")
+        
+    return 0
 
 if __name__ == "__main__":
-    demo.launch(share=True, server_name="127.0.0.1", server_port=7860)
+    parser = argparse.ArgumentParser(description="🧬 Matrix Roll Trigram Text Gen")
+    parser.add_argument("--file", "-f", type=str, help="Input text file")
+    parser.add_argument("--length", "-l", type=int, default=50, help="Output length")
+    parser.add_argument("--temp", "-t", type=float, default=0.8, help="Temperature")
+    parser.add_argument("--seed", "-s", type=int, default=42, help="RNG seed")
+    parser.add_argument("--gens", "-n", type=int, default=1, help="Num generations")
+    args = parser.parse_args()
+    
+    sys.exit(main(args.file, args.length, args.temp, args.seed, args.gens))
