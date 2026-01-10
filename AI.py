@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import re
 import math
-import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -84,11 +83,13 @@ me my of on or our ours she so that the their them they this to was we were
 what when where which who will with you your yours
 """.split())
 
+
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     x = x.astype(float) / max(temp, 1e-12)
@@ -96,16 +97,14 @@ def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     ex = np.exp(x)
     return ex / (np.sum(ex) + 1e-12)
 
+
 def entropy(p: np.ndarray) -> float:
     p = np.asarray(p, dtype=float)
     return float(-np.sum(p * np.log(p + 1e-12)))
 
+
 def clip01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
-
-def squash(x: float) -> float:
-    # smooth 0..1 from arbitrary x
-    return float(1.0 / (1.0 + math.exp(-x)))
 
 
 # ----------------------------
@@ -118,9 +117,7 @@ def basic_tokenize(text: str) -> List[str]:
     - lowercases words
     """
     text = text.replace("\n", " ")
-    # Keep punctuation as tokens
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
-    # lowercase word tokens; keep punctuation as-is
     out = []
     for t in tokens:
         if re.match(r"[A-Za-z]", t):
@@ -129,38 +126,32 @@ def basic_tokenize(text: str) -> List[str]:
             out.append(t)
     return out
 
+
 def detokenize(tokens: List[str]) -> str:
-    """
-    Join tokens back into readable text.
-    """
     out = []
-    for i, t in enumerate(tokens):
+    for t in tokens:
         if t in [".", ",", ";", ":", "!", "?", ")", "("]:
             if t == "(":
-                # attach to next word with no preceding space
                 out.append(t)
             elif t == ")":
-                # attach directly
                 out.append(t)
             else:
-                # punctuation attaches to previous token
                 if out:
                     out[-1] = out[-1] + t
                 else:
                     out.append(t)
         else:
-            # regular word
             if out and out[-1].endswith("("):
                 out[-1] = out[-1] + t
             else:
                 out.append(t)
-    # Space-join, then fix spacing around parentheses slightly
+
     s = " ".join(out)
     s = re.sub(r"\(\s+", "(", s)
     s = re.sub(r"\s+\)", ")", s)
-    # Capitalize first letter of sentences
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
+
 
 class TrigramLM:
     """
@@ -169,11 +160,11 @@ class TrigramLM:
     """
     def __init__(self, add_k: float = 0.25):
         self.add_k = add_k
-        self.uni = {}
-        self.bi = {}
-        self.tri = {}
-        self.vocab = []
-        self.total = 0
+        self.uni: Dict[str, int] = {}
+        self.bi: Dict[Tuple[str, str], int] = {}
+        self.tri: Dict[Tuple[str, str, str], int] = {}
+        self.vocab: List[str] = []
+        self.total: int = 0
 
     def fit(self, tokens: List[str]) -> None:
         self.uni.clear()
@@ -189,10 +180,10 @@ class TrigramLM:
             self.total += 1
 
         for i in range(len(tokens) - 1):
-            inc(self.bi, (tokens[i], tokens[i+1]))
+            inc(self.bi, (tokens[i], tokens[i + 1]))
 
         for i in range(len(tokens) - 2):
-            inc(self.tri, (tokens[i], tokens[i+1], tokens[i+2]))
+            inc(self.tri, (tokens[i], tokens[i + 1], tokens[i + 2]))
 
         self.vocab = list(self.uni.keys())
 
@@ -213,29 +204,19 @@ class TrigramLM:
         return (c123 + self.add_k) / (c12 + self.add_k * V) if c12 > 0 else self._prob_bigram(w2, w3)
 
     def next_distribution(self, w1: str, w2: str) -> Tuple[List[str], np.ndarray]:
-        """
-        Return candidate vocab and probs for next token given (w1, w2).
-        For efficiency, we only score a subset:
-        - trigram continuations seen in training for (w1,w2)
-        - plus a small unigram fallback shortlist
-        """
-        # collect trigram continuations
-        cont = []
-        for (a, b, c), count in self.tri.items():
+        cont: List[str] = []
+        for (a, b, c), _count in self.tri.items():
             if a == w1 and b == w2:
                 cont.append(c)
 
-        # if none, use bigram continuations
         if not cont:
-            for (a, b), count in self.bi.items():
+            for (a, b), _count in self.bi.items():
                 if a == w2:
                     cont.append(b)
 
-        # still none -> fallback to frequent unigrams
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
-        # dedupe while preserving order
         seen = set()
         cand = []
         for w in cont:
@@ -243,9 +224,7 @@ class TrigramLM:
                 seen.add(w)
                 cand.append(w)
 
-        # cap candidates
         cand = cand[:500]
-
         probs = np.array([self._prob_trigram(w1, w2, w) for w in cand], dtype=float)
         probs = probs / (probs.sum() + 1e-12)
         return cand, probs
@@ -260,6 +239,7 @@ class Nodelet:
     top_terms: List[Tuple[str, float]]   # (term, weight)
     energy: float                        # node strength
     narrative: str                       # human-readable description
+
 
 @dataclass
 class ModelState:
@@ -300,14 +280,13 @@ class NeuroSymbolicTextGenerator:
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 120]
         if len(paras) >= 6:
             return paras[:500]
-        # fallback: split into ~200-400 char blocks
         text2 = re.sub(r"\s+", " ", text).strip()
         if len(text2) < 400:
             return [text2]
         blocks = []
         step = 320
-        for i in range(0, min(len(text2), 320*600), step):
-            blk = text2[i:i+step]
+        for i in range(0, min(len(text2), 320 * 600), step):
+            blk = text2[i:i + step]
             if len(blk) >= 150:
                 blocks.append(blk)
         return blocks or [text2[:800]]
@@ -319,7 +298,6 @@ class NeuroSymbolicTextGenerator:
         if not chunks or len(" ".join(chunks).strip()) < 250:
             raise ValueError("Not enough readable text. Provide a longer unstructured file.")
 
-        # Vectorize
         vec = TfidfVectorizer(
             lowercase=True,
             stop_words="english",
@@ -329,16 +307,14 @@ class NeuroSymbolicTextGenerator:
         X = vec.fit_transform(chunks)
         vocab = np.array(vec.get_feature_names_out())
 
-        # Bars vocabulary by global tf-idf mass
         global_mass = np.asarray(X.sum(axis=0)).ravel()
         top_idx = np.argsort(-global_mass)[: self.bars_n]
         vocab100 = vocab[top_idx].tolist()
 
-        # Nodelets via SVD
         k = min(self.nodelets_n, max(2, X.shape[0] - 1), max(2, X.shape[1] - 1))
         svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
         svd.fit(X)
-        components = svd.components_  # k x features
+        components = svd.components_
 
         nodelets: List[Nodelet] = []
         for i in range(k):
@@ -349,14 +325,12 @@ class NeuroSymbolicTextGenerator:
             narrative = self._nodelet_narrative(i, terms, energy)
             nodelets.append(Nodelet(idx=i, top_terms=terms, energy=energy, narrative=narrative))
 
-        # Binding matrix W (k x 100)
         W = np.zeros((k, self.bars_n), dtype=float)
         for i in range(k):
             weights = {t: abs(w) for t, w in nodelets[i].top_terms}
             for b, term in enumerate(vocab100):
                 base = weights.get(term, 0.0)
                 if base == 0.0:
-                    # token overlap for bigrams/unigrams
                     toks = set(term.split())
                     near = 0.0
                     for tt, ww in weights.items():
@@ -369,7 +343,6 @@ class NeuroSymbolicTextGenerator:
             if mx > 1e-12:
                 W[i] /= mx
 
-        # Bar logits from node energies
         energies = np.array([n.energy for n in nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
         logits = (energies.reshape(-1, 1) * W).sum(axis=0)
@@ -378,7 +351,6 @@ class NeuroSymbolicTextGenerator:
         logits = logits + 0.02 * rng.normal(size=logits.shape)
         probs = softmax(logits, temp=self.softmax_temp)
 
-        # Token boost map derived from bars + nodelets
         token_boost = self._make_token_boost(vocab100, probs, nodelets, W)
 
         return ModelState(
@@ -397,29 +369,21 @@ class NeuroSymbolicTextGenerator:
         nodelets: List[Nodelet],
         W: np.ndarray
     ) -> Dict[str, float]:
-        """
-        Convert bar softmax + nodelet bindings into a per-token steering boost.
-        We boost *words* (unigrams) more than full bigrams, because trigram LM tokens are word-based.
-        """
         boost: Dict[str, float] = {}
 
-        # Base boost from bar probabilities
-        # Convert prob to a gentle log-scale preference
         for term, p in zip(vocab100, bar_probs):
             toks = term.split()
-            # distribute boost across words
             for w in toks:
                 if len(w) <= 2 or w in STOPWORDS:
                     continue
-                boost[w] = max(boost.get(w, 0.0), float(math.log(p + 1e-12) + 6.0))  # shift to mostly positive
+                boost[w] = max(boost.get(w, 0.0), float(math.log(p + 1e-12) + 6.0))
 
-        # Add nodelet-specific bump: if a word appears in many strong nodelets, boost it
         energies = np.array([n.energy for n in nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
 
         for i, n in enumerate(nodelets):
             top_words = []
-            for t, w in n.top_terms[:12]:
+            for t, _w in n.top_terms[:12]:
                 for tok in t.split():
                     if len(tok) > 2 and tok not in STOPWORDS:
                         top_words.append(tok)
@@ -429,7 +393,6 @@ class NeuroSymbolicTextGenerator:
             for w in top_words:
                 boost[w] = boost.get(w, 0.0) + 0.35 * node_strength
 
-        # Normalize boosts to ~[0, 1.5]
         if boost:
             vals = np.array(list(boost.values()), dtype=float)
             lo, hi = float(np.percentile(vals, 10)), float(np.percentile(vals, 95))
@@ -456,7 +419,7 @@ class NeuroSymbolicTextGenerator:
         )
 
     # ----------------------------
-    # Model-driven generation (this is the important part)
+    # Model-driven generation
     # ----------------------------
     def _sample_next(
         self,
@@ -469,18 +432,13 @@ class NeuroSymbolicTextGenerator:
     ) -> str:
         cand, base_p = lm.next_distribution(w1, w2)
 
-        # apply steering boost (multiplicative in log-space)
-        # score = log(p) + steer_strength * boost(word)
         scores = np.log(base_p + 1e-12)
-
         for i, w in enumerate(cand):
-            # do not over-steer punctuation
             if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
                 continue
             b = token_boost.get(w, 0.0)
             scores[i] = scores[i] + self.steer_strength * b
 
-        # temperature sampling
         scores = scores / max(temperature, 1e-9)
         scores = scores - np.max(scores)
         p = np.exp(scores)
@@ -488,55 +446,76 @@ class NeuroSymbolicTextGenerator:
 
         return str(rng.choice(cand, p=p))
 
+    def _extract_seed_words(self, text_seed: str) -> List[str]:
+        if not text_seed:
+            return []
+        toks = basic_tokenize(text_seed)
+        words = [t for t in toks if re.match(r"[a-z]", t)]
+        out = []
+        seen = set()
+        for w in words:
+            if len(w) <= 2 or w in STOPWORDS:
+                continue
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+        return out[:50]
+
+    def _choose_start_word(
+        self,
+        lm: TrigramLM,
+        token_boost: Dict[str, float],
+        rng: np.random.Generator,
+        seed_words: List[str],
+    ) -> str:
+        usable = [w for w in seed_words if w in lm.uni and w not in STOPWORDS and len(w) > 2]
+        if usable:
+            usable.sort(key=lambda w: (token_boost.get(w, 0.0), lm.uni.get(w, 0)), reverse=True)
+            top = usable[:10]
+            return str(rng.choice(top))
+
+        boosted = [(w, b) for w, b in token_boost.items() if b > 0.9 and w in lm.uni]
+        if boosted:
+            return max(boosted, key=lambda x: x[1])[0]
+
+        return max(lm.uni.items(), key=lambda x: x[1])[0]
+
     def _generate_sentence(
         self,
         lm: TrigramLM,
         token_boost: Dict[str, float],
         rng: np.random.Generator,
+        seed_words: Optional[List[str]] = None,
         min_len: int = 800,
         max_len: int = 900
     ) -> str:
-        # Choose a seed word that is boosted (if available), else common token
-        boosted = [(w, b) for w, b in token_boost.items() if b > 0.9]
-        if boosted:
-            seed = max(boosted, key=lambda x: x[1])[0]
-            start = [seed]
-        else:
-            # frequent unigram
-            start = [max(lm.uni.items(), key=lambda x: x[1])[0]]
+        seed_words = seed_words or []
+        seed = self._choose_start_word(lm, token_boost, rng, seed_words)
 
         tokens = ["("] if rng.random() < 0.12 else []
-        tokens += start
+        tokens.append(seed)
 
-        # Bootstrap second token
-        w1 = tokens[-1] if len(tokens) >= 1 else start[0]
+        # Bootstrap w1/w2
+        w1 = tokens[-1]
         w2 = tokens[-1]
-        # if we only have one token, treat w1/w2 same
-        if len(tokens) == 1:
-            w1 = w2
 
-        # Generate
         target_len = int(rng.integers(min_len, max_len + 1))
         for _ in range(target_len):
             nxt = self._sample_next(lm, w1, w2, token_boost, rng)
             tokens.append(nxt)
             w1, w2 = w2, nxt
 
-            # early stop at sentence end punctuation
             if nxt in [".", "!", "?"] and len([t for t in tokens if re.match(r"[a-z]", t)]) >= min_len:
                 break
 
-        # Ensure termination punctuation
         if tokens and tokens[-1] not in [".", "!", "?"]:
             tokens.append(".")
 
-        # Clean up parentheses occasionally
         if tokens and tokens[0] == "(" and ")" not in tokens:
-            # try to close
             if rng.random() < 0.6:
                 tokens.insert(min(len(tokens), 6), ")")
             else:
-                tokens = tokens[1:]  # drop '('
+                tokens = tokens[1:]
 
         return detokenize(tokens)
 
@@ -545,29 +524,33 @@ class NeuroSymbolicTextGenerator:
         text: str,
         state: ModelState,
         n_takeaways: int,
-        rng: np.random.Generator
+        rng: np.random.Generator,
+        text_seed: str = "",
     ) -> List[str]:
-        # Train LM on the file text tokens
         tokens = basic_tokenize(text)
         if len(tokens) < 600:
-            # if too short, duplicate slightly to stabilize counts
             tokens = tokens * 2
 
         lm = TrigramLM(add_k=self.lm_add_k)
         lm.fit(tokens)
 
+        seed_words = self._extract_seed_words(text_seed)
+
         takeaways = []
-        # For each takeaway, slightly reweight boosts toward a different nodelet
         energies = np.array([n.energy for n in state.nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
 
-        for i in range(n_takeaways):
-            # pick a nodelet to "lead" this takeaway
+        for _i in range(n_takeaways):
             lead = int(rng.choice(len(state.nodelets), p=softmax(energies, temp=0.9)))
             row = state.binding_W[lead]
-            # build a temporary boost focusing on that nodelet’s strongest bindings
+
             local_boost = dict(state.token_boost)
 
+            # Apply user text seed as an additional steering prior (light but persistent).
+            for w in seed_words:
+                local_boost[w] = max(local_boost.get(w, 0.0), 1.25)
+
+            # Focus the current takeaway on the lead nodelet’s strongest bindings.
             topbars = np.argsort(-row)[:10]
             for b in topbars:
                 term = state.vocab100[b]
@@ -576,13 +559,15 @@ class NeuroSymbolicTextGenerator:
                     if len(w) > 2 and w not in STOPWORDS:
                         local_boost[w] = max(local_boost.get(w, 0.0), 1.0 + 0.6 * strength)
 
-            # normalize local boosts a bit
-            # keep within 0..2.0
             for k in list(local_boost.keys()):
                 local_boost[k] = float(min(2.0, max(0.0, local_boost[k])))
 
-            sent = self._generate_sentence(lm, local_boost, rng)
-            
+            sent = self._generate_sentence(
+                lm,
+                local_boost,
+                rng,
+                seed_words=seed_words,
+            )
             takeaways.append(sent)
 
         return takeaways
@@ -595,27 +580,30 @@ class NeuroSymbolicTextGenerator:
         text: str,
         filename: str = "input",
         n_takeaways: int = 7,
-        seed: int = 7
+        seed: int = 7,
+        text_seed: str = "",
     ) -> str:
         text = normalize(text)
         state = self.fit(text)
 
-        H = entropy(state.bar_probs)
-        effk = math.exp(H)
+        _H = entropy(state.bar_probs)
+        _effk = math.exp(_H)
 
         rng = np.random.default_rng(seed)
 
-        # Model-driven takeaways (THIS uses the model; not extraction)
-        takeaways = self._generate_takeaways(text, state, n_takeaways=n_takeaways, rng=rng)
+        takeaways = self._generate_takeaways(
+            text,
+            state,
+            n_takeaways=n_takeaways,
+            rng=rng,
+            text_seed=text_seed,
+        )
 
         return "\n\n".join(takeaways)
 
 
 # ----------------------------
-# CLI
-# ----------------------------
-# ----------------------------
-# GUI (replaces CLI)
+# GUI
 # ----------------------------
 def main():
     import tkinter as tk
@@ -635,6 +623,9 @@ def main():
             self.steer = tk.DoubleVar(value=1.35)
             self.takeaways = tk.IntVar(value=7)
             self.seed = tk.IntVar(value=7)
+
+            # NEW: text seed (prompt/steering phrase)
+            self.text_seed = tk.StringVar(value="")
 
             self._build_ui()
 
@@ -676,6 +667,12 @@ def main():
             ttk.Spinbox(params, from_=0, to=10_000_000, increment=1, textvariable=self.seed, width=10)\
                 .grid(row=1, column=3, sticky="w", pady=4)
 
+            # NEW: Text seed entry
+            ttk.Label(params, text="Text seed:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Entry(params, textvariable=self.text_seed).grid(row=2, column=1, columnspan=3, sticky="ew", pady=4)
+
+            params.columnconfigure(1, weight=1)
+
             # Buttons row
             actions = ttk.Frame(root)
             actions.pack(fill="x", pady=(10, 0))
@@ -712,7 +709,6 @@ def main():
             )
             if p:
                 self.in_path.set(p)
-                # suggest output next to input
                 out = str(Path(p).with_suffix("")) + "_generated_report.txt"
                 self.out_path.set(out)
 
@@ -772,6 +768,7 @@ def main():
                     filename=inp,
                     n_takeaways=int(self.takeaways.get()),
                     seed=int(self.seed.get()),
+                    text_seed=self.text_seed.get().strip(),
                 )
 
                 Path(outp).write_text(report, encoding="utf-8")
