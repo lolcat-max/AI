@@ -1,236 +1,788 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Automated demonstration of Matrix Roll Trigram Text Generator
+Neurosymbolic Text Generator (model-driven takeaways)
+
+Pipeline:
+1) Load unstructured text from file (.txt/.md/.docx/.pdf)
+2) Build 10 "nodelets" (latent semantic factors): TF-IDF -> SVD
+3) Select 100 "activation bars" (top vocabulary terms by TF-IDF mass)
+4) Build 10x100 binding matrix W (nodelets -> bars)
+5) Compute bar logits + softmax probabilities over the 100 bars
+6) Train a trigram language model (n-gram LM) on the file text
+7) Generate "Key takeaways" by sampling from the LM, steered by the bar softmax and nodelet bindings
+
+No external LLM required.
+This generates NEW text; it does not copy sentences.
+
+Dependencies:
+- numpy
+- scikit-learn
+
+Optional:
+- python-docx (for .docx)
+- pypdf (for .pdf)
 """
+
+from __future__ import annotations
+
+import re
+import math
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
-import random
-from collections import defaultdict, Counter
-import os
-class MatrixRollTrigramGenerator:
-    """Matrix-based trigram text generator with vertical/horizontal rolling."""
-    
-    def __init__(self):
-        self.matrix = None
-        self.word_to_idx = {}
-        self.idx_to_word = {}
-        self.V = 0
-        self.model = None
-        self.is_trained = False
-        self.training_sentences = []
-        
-    def load_text(self, text):
-        """Load unstructured text and split into sentences."""
-        sentences = []
-        for line in text:
-            line = line.strip()
-            if line:
-                if '.' in line:
-                    parts = [s.strip() + '.' for s in line.split('.') if s.strip()]
-                    sentences.extend(parts)
-                else:
-                    sentences.append(line)
-        return sentences if sentences else ["Sample text."]
-    
-    def build_word_matrix(self, sentences, seed=42):
-        """Build padded word index matrix aligned per sentence."""
-        random.seed(seed)
-        np.random.seed(seed)
-        
-        tokenized = [s.split() for s in sentences if s]
-        max_len = max(len(s) for s in tokenized)
-        all_words = [w.lower() for s in tokenized for w in s]
-        vocab = sorted(set(all_words))
-        word_to_idx = {w: i for i, w in enumerate(vocab)}
-        V = len(vocab)
-        idx_to_word = {i: w for w, i in word_to_idx.items()}
-        
-        matrix = np.full((len(tokenized), max_len), -1, dtype=int)
-        for i, sent in enumerate(tokenized):
-            for j, word in enumerate(sent):
-                matrix[i, j] = word_to_idx[word.lower()]
-        
-        return matrix, word_to_idx, idx_to_word, V
-    
-    def apply_vertical_roll(self, matrix):
-        """Vertical step: roll down columns on valid elements."""
-        vert_step = matrix.copy()
-        _, max_len = matrix.shape
-        for col in range(max_len):
-            col_data = matrix[:, col]
-            valid_mask = col_data == -1
-            if np.sum(valid_mask) > 1:
-                vert_step[valid_mask, col] = np.roll(col_data[valid_mask], 1)
-        return vert_step
-    
-    def apply_horizontal_roll(self, matrix):
-        """Horizontal step: roll left across rows on valid lengths."""
-        horiz_step = matrix.copy()
-        num_rows, max_len = matrix.shape
-        for row in range(num_rows):
-            row_data = matrix[row, :]
-            valid_len = np.sum(row_data != -1)
-            if valid_len > 1:
-                horiz_step[row, :valid_len] = np.roll(row_data[:valid_len], row)
-        return horiz_step
-    
-    def build_trigram_model(self, flat_indices):
-        """Build trigram model: (w1,w2) -> Counter(w3)."""
-        model = defaultdict(Counter)
-        for i in range(len(flat_indices) - 2):
-            w1, w2, w3 = int(flat_indices[i]), int(flat_indices[i+1]), int(flat_indices[i+2])
-            model[(w1, w2)][w3] += flat_indices[i]
-        return model
-    
-    def train(self, text, seed=42):
-        """Train the model on input text."""
-        self.training_sentences = self.load_text(text)
-        self.matrix, self.word_to_idx, self.idx_to_word, self.V = \
-            self.build_word_matrix(self.training_sentences, seed)
-        
-        # Apply rolls
-        vert = self.apply_vertical_roll(self.matrix)
-        final_matrix = self.apply_horizontal_roll(vert)
-        
-        # Flatten
-        flat_indices = np.concatenate([row[row != -1] for row in final_matrix])
-        
-        # Build model
-        self.model = self.build_trigram_model(flat_indices)
-        self.is_trained = True
-        
-        return {
-            'vocab_size': self.V,
-            'num_sentences': len(self.training_sentences),
-            'matrix_shape': self.matrix.shape,
-            'flat_length': len(flat_indices),
-            'num_bigrams': len(self.model)
-        }
-    
-    def generate_text(self, seed_words, length=50, temp=1.0, seed=42):
-        """Generate text using the trigram model."""
-        random.seed(seed)
-        np.random.seed(seed)
-        
-        words = seed_words.split() if seed_words else []
-        
-        while len(words) < length:
-            if len(words) < 2:
-                words.append(random.choice(list(self.idx_to_word.values())))
-                continue
-            
-            w1 = words[-2]
-            w2 = words[-1]
-            w1_idx = self.word_to_idx.get(w1.lower(), 0)
-            w2_idx = self.word_to_idx.get(w2.lower(), 0)
-            bigram = (w1_idx, w2_idx)
-            
-            if bigram not in self.model or not self.model[bigram]:
-                next_idx = random.randint(0, self.V - 1)
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+
+
+# ----------------------------
+# File loading
+# ----------------------------
+def load_text(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+
+    ext = p.suffix.lower()
+
+    if ext in [".txt", ".md"]:
+        return p.read_text(encoding="utf-8", errors="replace")
+
+    if ext == ".docx":
+        try:
+            import docx  # python-docx
+        except Exception as e:
+            raise RuntimeError("Reading .docx requires: pip install python-docx") from e
+        d = docx.Document(str(p))
+        return "\n".join([para.text for para in d.paragraphs])
+
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except Exception as e:
+            raise RuntimeError("Reading .pdf requires: pip install pypdf") from e
+        reader = PdfReader(str(p))
+        parts = []
+        for page in reader.pages:
+            parts.append(page.extract_text() or "")
+        return "\n".join(parts)
+
+    raise ValueError(f"Unsupported file extension: {ext}")
+
+
+# ----------------------------
+# Text utilities
+# ----------------------------
+STOPWORDS = set("""
+a an and are as at be by for from has have he her hers him his i in is it its
+me my of on or our ours she so that the their them they this to was we were
+what when where which who will with you your yours
+""".split())
+
+def normalize(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
+    x = x.astype(float) / max(temp, 1e-12)
+    x = x - np.max(x)
+    ex = np.exp(x)
+    return ex / (np.sum(ex) + 1e-12)
+
+def entropy(p: np.ndarray) -> float:
+    p = np.asarray(p, dtype=float)
+    return float(-np.sum(p * np.log(p + 1e-12)))
+
+def clip01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+def squash(x: float) -> float:
+    # smooth 0..1 from arbitrary x
+    return float(1.0 / (1.0 + math.exp(-x)))
+
+
+# ----------------------------
+# Tokenization + simple trigram LM
+# ----------------------------
+def basic_tokenize(text: str) -> List[str]:
+    """
+    Tokenizer designed for unstructured text:
+    - keeps words and a small set of punctuation tokens
+    - lowercases words
+    """
+    text = text.replace("\n", " ")
+    # Keep punctuation as tokens
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
+    # lowercase word tokens; keep punctuation as-is
+    out = []
+    for t in tokens:
+        if re.match(r"[A-Za-z]", t):
+            out.append(t.lower())
+        else:
+            out.append(t)
+    return out
+
+def detokenize(tokens: List[str]) -> str:
+    """
+    Join tokens back into readable text.
+    """
+    out = []
+    for i, t in enumerate(tokens):
+        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
+            if t == "(":
+                # attach to next word with no preceding space
+                out.append(t)
+            elif t == ")":
+                # attach directly
+                out.append(t)
             else:
-                counts = self.model[bigram]
-                total = sum(counts.values())
-                probs = np.array([counts.get(i, 0) for i in range(self.V)], dtype=float) / total
-                probs = probs ** (1 / temp)
-                probs /= probs.sum()
-                next_idx = np.random.choice(self.V, p=probs)
-            
-            words.append(self.idx_to_word[next_idx])
-        
-        return ' '.join(words)
-    
-    def get_vocab_stats(self):
-        """Get vocabulary statistics."""
-        word_counts = Counter()
-        for sent in self.training_sentences:
-            for word in sent.split():
-                word_counts[word.lower()] += 1
-        return word_counts
-def load_text_file(filepath):
-    """Load unstructured text file, split into sentences."""
-    if filepath is None or not os.path.exists(filepath):
-        print("No input file found, using sample data.")
-        return [
-            "The quick brown fox jumps over the lazy dog.",
-            "The dog sleeps peacefully in the warm sun.",
-            "The sun shines brightly on the green field.",
-            "Birds fly high in the clear blue sky above.",
-            "Children play happily in the park nearby."
-        ]
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        # Split into sentences by .!? + newline
-        sentences = [s.strip() for s in content.split('\n') if s.strip()]
-        if not sentences:
-            raise ValueError("No valid sentences found in file")
-        print(f"Loaded {len(sentences)} sentences from {filepath}")
-        return sentences
-    except Exception as e:
-        print(f"Error loading file {filepath}: {e}. Using sample data.")
-        return [
-            "The quick brown fox jumps over the lazy dog.",
-            "The dog sleeps peacefully in the warm sun."
-        ]
+                # punctuation attaches to previous token
+                if out:
+                    out[-1] = out[-1] + t
+                else:
+                    out.append(t)
+        else:
+            # regular word
+            if out and out[-1].endswith("("):
+                out[-1] = out[-1] + t
+            else:
+                out.append(t)
+    # Space-join, then fix spacing around parentheses slightly
+    s = " ".join(out)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    # Capitalize first letter of sentences
+    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
+    return s
 
-def main():
-    print("="*80)
-    print("🧬 MATRIX ROLL TRIGRAM TEXT GENERATOR - AUTOMATED DEMO")
-    print("Context-Free Neural LLM with Top-K Symmetry via Matrix Rolling")
-    print("="*80)
-    
-    # Sample training data
-    training_text = load_text_file(input("Filename: "))
-    
-    # Initialize and train
-    generator = MatrixRollTrigramGenerator()
-    
-    print("\n🔄 TRAINING MODEL...")
-    print("-"*80)
-    stats = generator.train(training_text, seed=42)
-    
-    print(f"✅ Training complete!")
-    print(f"\n📊 Model Statistics:")
-    print(f"  • Vocabulary size: {stats['vocab_size']} unique words")
-    print(f"  • Sentences processed: {stats['num_sentences']}")
-    print(f"  • Matrix dimensions: {stats['matrix_shape']}")
-    print(f"  • Flattened sequence: {stats['flat_length']} tokens")
-    print(f"  • Unique bigrams: {stats['num_bigrams']}")
-  
- 
-    # Generation examples
-    print("\n" + "="*80)
-    print("🎯 GENERATION EXAMPLES")
-    print("="*80)
+class TrigramLM:
+    """
+    Trigram LM with add-k smoothing and backoff to bigram/unigram.
+    Stored as counters.
+    """
+    def __init__(self, add_k: float = 0.25):
+        self.add_k = add_k
+        self.uni = {}
+        self.bi = {}
+        self.tri = {}
+        self.vocab = []
+        self.total = 0
 
-    
-    # Batch generations with same seed
-    print("\n" + "="*80)
-    print("🔁 BATCH GENERATION COMPARISON (same seed, different random seeds)")
-    print("="*80)
-    while True:
-        seed_text = input("USER: ")
-        print(f"\nSeed: '{seed_text}' | Length: 30 words | Temperature: 0.8\n")
+    def fit(self, tokens: List[str]) -> None:
+        self.uni.clear()
+        self.bi.clear()
+        self.tri.clear()
+        self.total = 0
 
-        gen = generator.generate_text(
-            seed_words=seed_text,
-            length=800,
-            temp=0.7,
-            seed=100
+        def inc(d, key, val=1):
+            d[key] = d.get(key, 0) + val
+
+        for t in tokens:
+            inc(self.uni, t)
+            self.total += 1
+
+        for i in range(len(tokens) - 1):
+            inc(self.bi, (tokens[i], tokens[i+1]))
+
+        for i in range(len(tokens) - 2):
+            inc(self.tri, (tokens[i], tokens[i+1], tokens[i+2]))
+
+        self.vocab = list(self.uni.keys())
+
+    def _prob_unigram(self, w: str) -> float:
+        V = len(self.vocab) + 1
+        return (self.uni.get(w, 0) + self.add_k) / (self.total + self.add_k * V)
+
+    def _prob_bigram(self, w1: str, w2: str) -> float:
+        V = len(self.vocab) + 1
+        c1 = self.uni.get(w1, 0)
+        c12 = self.bi.get((w1, w2), 0)
+        return (c12 + self.add_k) / (c1 + self.add_k * V) if c1 > 0 else self._prob_unigram(w2)
+
+    def _prob_trigram(self, w1: str, w2: str, w3: str) -> float:
+        V = len(self.vocab) + 1
+        c12 = self.bi.get((w1, w2), 0)
+        c123 = self.tri.get((w1, w2, w3), 0)
+        return (c123 + self.add_k) / (c12 + self.add_k * V) if c12 > 0 else self._prob_bigram(w2, w3)
+
+    def next_distribution(self, w1: str, w2: str) -> Tuple[List[str], np.ndarray]:
+        """
+        Return candidate vocab and probs for next token given (w1, w2).
+        For efficiency, we only score a subset:
+        - trigram continuations seen in training for (w1,w2)
+        - plus a small unigram fallback shortlist
+        """
+        # collect trigram continuations
+        cont = []
+        for (a, b, c), count in self.tri.items():
+            if a == w1 and b == w2:
+                cont.append(c)
+
+        # if none, use bigram continuations
+        if not cont:
+            for (a, b), count in self.bi.items():
+                if a == w2:
+                    cont.append(b)
+
+        # still none -> fallback to frequent unigrams
+        if not cont:
+            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
+
+        # dedupe while preserving order
+        seen = set()
+        cand = []
+        for w in cont:
+            if w not in seen:
+                seen.add(w)
+                cand.append(w)
+
+        # cap candidates
+        cand = cand[:500]
+
+        probs = np.array([self._prob_trigram(w1, w2, w) for w in cand], dtype=float)
+        probs = probs / (probs.sum() + 1e-12)
+        return cand, probs
+
+
+# ----------------------------
+# Neurosymbolic model pieces
+# ----------------------------
+@dataclass
+class Nodelet:
+    idx: int
+    top_terms: List[Tuple[str, float]]   # (term, weight)
+    energy: float                        # node strength
+    narrative: str                       # human-readable description
+
+@dataclass
+class ModelState:
+    nodelets: List[Nodelet]
+    vocab100: List[str]                  # activation bars
+    binding_W: np.ndarray                # 10x100
+    bar_probs: np.ndarray                # 100 softmax
+    bar_logits: np.ndarray               # pre-softmax
+    token_boost: Dict[str, float]        # word -> boost derived from bars/nodelets
+
+
+class NeuroSymbolicTextGenerator:
+    """
+    Interpretable neurosymbolic generator:
+    - Nodelets: latent semantic factors (TF-IDF->SVD)
+    - Bars: top 100 vocab items
+    - W: bindings nodelets->bars
+    - Takeaways generated by a trigram LM trained on the file, steered by bar_probs and nodelet bindings
+    """
+
+    def __init__(
+        self,
+        nodelets_n: int = 10,
+        bars_n: int = 100,
+        svd_random_state: int = 7,
+        softmax_temp: float = 0.85,
+        steer_strength: float = 1.35,   # higher => more bar/node steering
+        lm_add_k: float = 0.25,
+    ):
+        self.nodelets_n = nodelets_n
+        self.bars_n = bars_n
+        self.svd_random_state = svd_random_state
+        self.softmax_temp = softmax_temp
+        self.steer_strength = steer_strength
+        self.lm_add_k = lm_add_k
+
+    def _chunk_text(self, text: str) -> List[str]:
+        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 120]
+        if len(paras) >= 6:
+            return paras[:500]
+        # fallback: split into ~200-400 char blocks
+        text2 = re.sub(r"\s+", " ", text).strip()
+        if len(text2) < 400:
+            return [text2]
+        blocks = []
+        step = 320
+        for i in range(0, min(len(text2), 320*600), step):
+            blk = text2[i:i+step]
+            if len(blk) >= 150:
+                blocks.append(blk)
+        return blocks or [text2[:800]]
+
+    def fit(self, text: str) -> ModelState:
+        text = normalize(text)
+        chunks = self._chunk_text(text)
+
+        if not chunks or len(" ".join(chunks).strip()) < 250:
+            raise ValueError("Not enough readable text. Provide a longer unstructured file.")
+
+        # Vectorize
+        vec = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            max_features=8000,
+            ngram_range=(1, 2),
         )
-        print(f"  {gen}\n")
-        
-    print("="*80)
-    print("✨ DEMO COMPLETE")
-    print("="*80)
-    
-    print("\n💡 Key Insights:")
-    print("  • Matrix rolling creates novel word combinations")
-    print("  • Trigram model learns probabilistic patterns")
-    print("  • Temperature controls creativity vs coherence")
-    print("  • Context-free approach is efficient but limited to 2-word context")
-    print("  • The rolling operation provides a form of 'symmetry' transformation")
-    print("\n" + "="*80)
+        X = vec.fit_transform(chunks)
+        vocab = np.array(vec.get_feature_names_out())
+
+        # Bars vocabulary by global tf-idf mass
+        global_mass = np.asarray(X.sum(axis=0)).ravel()
+        top_idx = np.argsort(-global_mass)[: self.bars_n]
+        vocab100 = vocab[top_idx].tolist()
+
+        # Nodelets via SVD
+        k = min(self.nodelets_n, max(2, X.shape[0] - 1), max(2, X.shape[1] - 1))
+        svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
+        svd.fit(X)
+        components = svd.components_  # k x features
+
+        nodelets: List[Nodelet] = []
+        for i in range(k):
+            comp = components[i]
+            term_idx = np.argsort(-np.abs(comp))[:20]
+            terms = [(vocab[j], float(comp[j])) for j in term_idx]
+            energy = float(np.linalg.norm(comp))
+            narrative = self._nodelet_narrative(i, terms, energy)
+            nodelets.append(Nodelet(idx=i, top_terms=terms, energy=energy, narrative=narrative))
+
+        # Binding matrix W (k x 100)
+        W = np.zeros((k, self.bars_n), dtype=float)
+        for i in range(k):
+            weights = {t: abs(w) for t, w in nodelets[i].top_terms}
+            for b, term in enumerate(vocab100):
+                base = weights.get(term, 0.0)
+                if base == 0.0:
+                    # token overlap for bigrams/unigrams
+                    toks = set(term.split())
+                    near = 0.0
+                    for tt, ww in weights.items():
+                        if toks & set(tt.split()):
+                            near = max(near, 0.35 * ww)
+                    base = near
+                W[i, b] = base
+
+            mx = W[i].max()
+            if mx > 1e-12:
+                W[i] /= mx
+
+        # Bar logits from node energies
+        energies = np.array([n.energy for n in nodelets], dtype=float)
+        energies = energies / (energies.max() + 1e-12)
+        logits = (energies.reshape(-1, 1) * W).sum(axis=0)
+
+        rng = np.random.default_rng(self.svd_random_state)
+        logits = logits + 0.02 * rng.normal(size=logits.shape)
+        probs = softmax(logits, temp=self.softmax_temp)
+
+        # Token boost map derived from bars + nodelets
+        token_boost = self._make_token_boost(vocab100, probs, nodelets, W)
+
+        return ModelState(
+            nodelets=nodelets,
+            vocab100=vocab100,
+            binding_W=W,
+            bar_probs=probs,
+            bar_logits=logits,
+            token_boost=token_boost,
+        )
+
+    def _make_token_boost(
+        self,
+        vocab100: List[str],
+        bar_probs: np.ndarray,
+        nodelets: List[Nodelet],
+        W: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        Convert bar softmax + nodelet bindings into a per-token steering boost.
+        We boost *words* (unigrams) more than full bigrams, because trigram LM tokens are word-based.
+        """
+        boost: Dict[str, float] = {}
+
+        # Base boost from bar probabilities
+        # Convert prob to a gentle log-scale preference
+        for term, p in zip(vocab100, bar_probs):
+            toks = term.split()
+            # distribute boost across words
+            for w in toks:
+                if len(w) <= 2 or w in STOPWORDS:
+                    continue
+                boost[w] = max(boost.get(w, 0.0), float(math.log(p + 1e-12) + 6.0))  # shift to mostly positive
+
+        # Add nodelet-specific bump: if a word appears in many strong nodelets, boost it
+        energies = np.array([n.energy for n in nodelets], dtype=float)
+        energies = energies / (energies.max() + 1e-12)
+
+        for i, n in enumerate(nodelets):
+            top_words = []
+            for t, w in n.top_terms[:12]:
+                for tok in t.split():
+                    if len(tok) > 2 and tok not in STOPWORDS:
+                        top_words.append(tok)
+            if not top_words:
+                continue
+            node_strength = energies[i]
+            for w in top_words:
+                boost[w] = boost.get(w, 0.0) + 0.35 * node_strength
+
+        # Normalize boosts to ~[0, 1.5]
+        if boost:
+            vals = np.array(list(boost.values()), dtype=float)
+            lo, hi = float(np.percentile(vals, 10)), float(np.percentile(vals, 95))
+            if hi - lo < 1e-9:
+                hi = lo + 1.0
+            for k in list(boost.keys()):
+                boost[k] = 1.5 * clip01((boost[k] - lo) / (hi - lo))
+
+        return boost
+
+    def _nodelet_narrative(self, i: int, terms: List[Tuple[str, float]], energy: float) -> str:
+        tops = [t for t, _ in terms[:8]]
+        tops_clean = []
+        for t in tops:
+            if len(tops_clean) >= 6:
+                break
+            if t not in tops_clean:
+                tops_clean.append(t)
+
+        strength = "high" if energy > 2.2 else "moderate" if energy > 1.4 else "light"
+        return (
+            f"Nodelet {i} carries a {strength}-intensity semantic current, orbiting around "
+            f"{', '.join(tops_clean)}."
+        )
+
+    # ----------------------------
+    # Model-driven generation (this is the important part)
+    # ----------------------------
+    def _sample_next(
+        self,
+        lm: TrigramLM,
+        w1: str,
+        w2: str,
+        token_boost: Dict[str, float],
+        rng: np.random.Generator,
+        temperature: float = 0.95
+    ) -> str:
+        cand, base_p = lm.next_distribution(w1, w2)
+
+        # apply steering boost (multiplicative in log-space)
+        # score = log(p) + steer_strength * boost(word)
+        scores = np.log(base_p + 1e-12)
+
+        for i, w in enumerate(cand):
+            # do not over-steer punctuation
+            if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
+                continue
+            b = token_boost.get(w, 0.0)
+            scores[i] = scores[i] + self.steer_strength * b
+
+        # temperature sampling
+        scores = scores / max(temperature, 1e-9)
+        scores = scores - np.max(scores)
+        p = np.exp(scores)
+        p = p / (p.sum() + 1e-12)
+
+        return str(rng.choice(cand, p=p))
+
+    def _generate_sentence(
+        self,
+        lm: TrigramLM,
+        token_boost: Dict[str, float],
+        rng: np.random.Generator,
+        min_len: int = 800,
+        max_len: int = 900
+    ) -> str:
+        # Choose a seed word that is boosted (if available), else common token
+        boosted = [(w, b) for w, b in token_boost.items() if b > 0.9]
+        if boosted:
+            seed = max(boosted, key=lambda x: x[1])[0]
+            start = [seed]
+        else:
+            # frequent unigram
+            start = [max(lm.uni.items(), key=lambda x: x[1])[0]]
+
+        tokens = ["("] if rng.random() < 0.12 else []
+        tokens += start
+
+        # Bootstrap second token
+        w1 = tokens[-1] if len(tokens) >= 1 else start[0]
+        w2 = tokens[-1]
+        # if we only have one token, treat w1/w2 same
+        if len(tokens) == 1:
+            w1 = w2
+
+        # Generate
+        target_len = int(rng.integers(min_len, max_len + 1))
+        for _ in range(target_len):
+            nxt = self._sample_next(lm, w1, w2, token_boost, rng)
+            tokens.append(nxt)
+            w1, w2 = w2, nxt
+
+            # early stop at sentence end punctuation
+            if nxt in [".", "!", "?"] and len([t for t in tokens if re.match(r"[a-z]", t)]) >= min_len:
+                break
+
+        # Ensure termination punctuation
+        if tokens and tokens[-1] not in [".", "!", "?"]:
+            tokens.append(".")
+
+        # Clean up parentheses occasionally
+        if tokens and tokens[0] == "(" and ")" not in tokens:
+            # try to close
+            if rng.random() < 0.6:
+                tokens.insert(min(len(tokens), 6), ")")
+            else:
+                tokens = tokens[1:]  # drop '('
+
+        return detokenize(tokens)
+
+    def _generate_takeaways(
+        self,
+        text: str,
+        state: ModelState,
+        n_takeaways: int,
+        rng: np.random.Generator
+    ) -> List[str]:
+        # Train LM on the file text tokens
+        tokens = basic_tokenize(text)
+        if len(tokens) < 600:
+            # if too short, duplicate slightly to stabilize counts
+            tokens = tokens * 2
+
+        lm = TrigramLM(add_k=self.lm_add_k)
+        lm.fit(tokens)
+
+        takeaways = []
+        # For each takeaway, slightly reweight boosts toward a different nodelet
+        energies = np.array([n.energy for n in state.nodelets], dtype=float)
+        energies = energies / (energies.max() + 1e-12)
+
+        for i in range(n_takeaways):
+            # pick a nodelet to "lead" this takeaway
+            lead = int(rng.choice(len(state.nodelets), p=softmax(energies, temp=0.9)))
+            row = state.binding_W[lead]
+            # build a temporary boost focusing on that nodelet’s strongest bindings
+            local_boost = dict(state.token_boost)
+
+            topbars = np.argsort(-row)[:10]
+            for b in topbars:
+                term = state.vocab100[b]
+                strength = float(row[b])  # 0..1
+                for w in term.split():
+                    if len(w) > 2 and w not in STOPWORDS:
+                        local_boost[w] = max(local_boost.get(w, 0.0), 1.0 + 0.6 * strength)
+
+            # normalize local boosts a bit
+            # keep within 0..2.0
+            for k in list(local_boost.keys()):
+                local_boost[k] = float(min(2.0, max(0.0, local_boost[k])))
+
+            sent = self._generate_sentence(lm, local_boost, rng)
+            
+            takeaways.append(sent)
+
+        return takeaways
+
+    # ----------------------------
+    # Public generation
+    # ----------------------------
+    def generate_report(
+        self,
+        text: str,
+        filename: str = "input",
+        n_takeaways: int = 7,
+        seed: int = 7
+    ) -> str:
+        text = normalize(text)
+        state = self.fit(text)
+
+        H = entropy(state.bar_probs)
+        effk = math.exp(H)
+
+        rng = np.random.default_rng(seed)
+
+        # Model-driven takeaways (THIS uses the model; not extraction)
+        takeaways = self._generate_takeaways(text, state, n_takeaways=n_takeaways, rng=rng)
+
+        return "\n\n".join(takeaways)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+# ----------------------------
+# GUI (replaces CLI)
+# ----------------------------
+def main():
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("Neurosymbolic Text Generator")
+            self.geometry("980x720")
+            self.minsize(860, 600)
+
+            self.in_path = tk.StringVar(value="")
+            self.out_path = tk.StringVar(value=str(Path.cwd() / "generated_report.txt"))
+
+            self.temp = tk.DoubleVar(value=0.85)
+            self.steer = tk.DoubleVar(value=1.35)
+            self.takeaways = tk.IntVar(value=7)
+            self.seed = tk.IntVar(value=7)
+
+            self._build_ui()
+
+        def _build_ui(self):
+            root = ttk.Frame(self, padding=12)
+            root.pack(fill="both", expand=True)
+
+            # File row
+            files = ttk.LabelFrame(root, text="Files", padding=10)
+            files.pack(fill="x")
+
+            ttk.Label(files, text="Input file:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Entry(files, textvariable=self.in_path).grid(row=0, column=1, sticky="ew", pady=4)
+            ttk.Button(files, text="Browse...", command=self._browse_input).grid(row=0, column=2, padx=6, pady=4)
+
+            ttk.Label(files, text="Output file:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Entry(files, textvariable=self.out_path).grid(row=1, column=1, sticky="ew", pady=4)
+            ttk.Button(files, text="Save As...", command=self._browse_output).grid(row=1, column=2, padx=6, pady=4)
+
+            files.columnconfigure(1, weight=1)
+
+            # Params row
+            params = ttk.LabelFrame(root, text="Parameters", padding=10)
+            params.pack(fill="x", pady=(10, 0))
+
+            ttk.Label(params, text="Softmax temp:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Spinbox(params, from_=0.2, to=2.5, increment=0.05, textvariable=self.temp, width=10)\
+                .grid(row=0, column=1, sticky="w", pady=4)
+
+            ttk.Label(params, text="Steer strength:").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=4)
+            ttk.Spinbox(params, from_=0.0, to=5.0, increment=0.05, textvariable=self.steer, width=10)\
+                .grid(row=0, column=3, sticky="w", pady=4)
+
+            ttk.Label(params, text="# takeaways:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+            ttk.Spinbox(params, from_=1, to=30, increment=1, textvariable=self.takeaways, width=10)\
+                .grid(row=1, column=1, sticky="w", pady=4)
+
+            ttk.Label(params, text="Seed:").grid(row=1, column=2, sticky="w", padx=(16, 8), pady=4)
+            ttk.Spinbox(params, from_=0, to=10_000_000, increment=1, textvariable=self.seed, width=10)\
+                .grid(row=1, column=3, sticky="w", pady=4)
+
+            # Buttons row
+            actions = ttk.Frame(root)
+            actions.pack(fill="x", pady=(10, 0))
+
+            self.gen_btn = ttk.Button(actions, text="Generate Report", command=self._generate)
+            self.gen_btn.pack(side="left")
+
+            ttk.Button(actions, text="Copy Output", command=self._copy_output).pack(side="left", padx=8)
+            ttk.Button(actions, text="Clear Output", command=self._clear_output).pack(side="left")
+
+            self.status = tk.StringVar(value="Ready.")
+            ttk.Label(actions, textvariable=self.status).pack(side="right")
+
+            # Output box
+            out = ttk.LabelFrame(root, text="Generated Report Preview", padding=10)
+            out.pack(fill="both", expand=True, pady=(10, 0))
+
+            self.text = tk.Text(out, wrap="word", height=20)
+            self.text.pack(fill="both", expand=True, side="left")
+
+            scroll = ttk.Scrollbar(out, orient="vertical", command=self.text.yview)
+            scroll.pack(fill="y", side="right")
+            self.text.configure(yscrollcommand=scroll.set)
+
+        def _browse_input(self):
+            p = filedialog.askopenfilename(
+                title="Select input file",
+                filetypes=[
+                    ("Text/Markdown", "*.txt *.md"),
+                    ("Word Document", "*.docx"),
+                    ("PDF", "*.pdf"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if p:
+                self.in_path.set(p)
+                # suggest output next to input
+                out = str(Path(p).with_suffix("")) + "_generated_report.txt"
+                self.out_path.set(out)
+
+        def _browse_output(self):
+            p = filedialog.asksaveasfilename(
+                title="Save report as",
+                defaultextension=".txt",
+                filetypes=[("Text", "*.txt"), ("All files", "*.*")],
+                initialfile=Path(self.out_path.get()).name if self.out_path.get() else "generated_report.txt",
+            )
+            if p:
+                self.out_path.set(p)
+
+        def _set_output(self, s: str):
+            self.text.delete("1.0", "end")
+            self.text.insert("1.0", s)
+
+        def _clear_output(self):
+            self._set_output("")
+            self.status.set("Cleared.")
+
+        def _copy_output(self):
+            s = self.text.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(s)
+            self.status.set("Copied to clipboard.")
+
+        def _generate(self):
+            inp = self.in_path.get().strip()
+            outp = self.out_path.get().strip()
+            if not inp:
+                messagebox.showerror("Missing input", "Please choose an input file.")
+                return
+            if not outp:
+                messagebox.showerror("Missing output", "Please choose an output path.")
+                return
+
+            try:
+                self.status.set("Loading file…")
+                self.update_idletasks()
+                raw = load_text(inp)
+
+                self.status.set("Running model…")
+                self.update_idletasks()
+
+                gen = NeuroSymbolicTextGenerator(
+                    nodelets_n=10,
+                    bars_n=100,
+                    svd_random_state=7,
+                    softmax_temp=float(self.temp.get()),
+                    steer_strength=float(self.steer.get()),
+                    lm_add_k=0.25,
+                )
+
+                report = gen.generate_report(
+                    raw,
+                    filename=inp,
+                    n_takeaways=int(self.takeaways.get()),
+                    seed=int(self.seed.get()),
+                )
+
+                Path(outp).write_text(report, encoding="utf-8")
+                self._set_output(report)
+                self.status.set(f"Wrote {outp}")
+
+            except Exception as e:
+                messagebox.showerror("Generation failed", f"{e}")
+                self.status.set("Error.")
+
+    App().mainloop()
 
 
 if __name__ == "__main__":
