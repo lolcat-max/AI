@@ -3,6 +3,7 @@
 
 """
 Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
++ Vertical Pillars (Diagonal Top-Prob Weighting)
 
 Install:
   pip install numpy scikit-learn gradio datasets tqdm
@@ -77,27 +78,15 @@ def load_hf_dataset(
 ) -> str:
     """
     Load text from a Hugging Face dataset.
-    
-    Args:
-        dataset_name: HF dataset identifier (e.g., 'wikitext', 'imdb')
-        config_name: Dataset configuration/subset (e.g., '3.0.0' for cnn_dailymail)
-        split: Dataset split to load (e.g., 'train', 'test', 'validation')
-        text_column: Column name containing text (auto-detected if None)
-        max_samples: Maximum number of samples to load (None = all)
-        progress: Gradio progress tracker
-        
-    Returns:
-        Concatenated text from the dataset
     """
     try:
         from datasets import load_dataset
     except ImportError as e:
         raise RuntimeError("Loading HF datasets requires: pip install datasets") from e
-    
+
     if progress:
         progress(0, desc=f"Loading dataset: {dataset_name}")
-    
-    # Load dataset
+
     try:
         if config_name and config_name.strip():
             dataset = load_dataset(dataset_name, config_name.strip(), split=split, trust_remote_code=True)
@@ -111,53 +100,51 @@ def load_hf_dataset(
                 f"Please specify a config in the 'Config/Subset' field."
             ) from e
         raise RuntimeError(f"Failed to load dataset '{dataset_name}': {error_msg}") from e
-    
+
     # Auto-detect text column if not specified
     if text_column is None:
-        common_text_columns = ['text', 'content', 'article', 'document', 'passage', 'sentence']
+        common_text_columns = ["text", "content", "article", "document", "passage", "sentence"]
         for col in common_text_columns:
             if col in dataset.column_names:
                 text_column = col
                 break
-        
+
         if text_column is None:
-            # Use first string column
             for col in dataset.column_names:
-                if dataset.features[col].dtype == 'string':
+                feat = dataset.features.get(col)
+                if hasattr(feat, "dtype") and feat.dtype == "string":
                     text_column = col
                     break
-        
+
         if text_column is None:
             raise ValueError(f"Could not auto-detect text column. Available columns: {dataset.column_names}")
-    
+
     if text_column not in dataset.column_names:
         raise ValueError(f"Column '{text_column}' not found. Available: {dataset.column_names}")
-    
-    # Extract text with progress bar
+
     num_samples = len(dataset) if max_samples is None else min(max_samples, len(dataset))
     texts = []
-    
+
     if progress:
         progress(0.1, desc=f"Extracting {num_samples} samples")
-    
+
     for i in tqdm(range(num_samples), desc=f"Loading {dataset_name}", disable=progress is None):
         sample = dataset[i]
         text = sample.get(text_column, "")
         if text and isinstance(text, str):
             texts.append(text.strip())
-        
-        # Update progress periodically
+
         if progress and i % max(1, num_samples // 20) == 0:
             progress(0.1 + 0.5 * (i / num_samples), desc=f"Loaded {i}/{num_samples} samples")
-    
+
     if progress:
         progress(0.7, desc="Concatenating text")
-    
+
     combined_text = "\n\n".join(texts)
-    
+
     if progress:
         progress(1.0, desc="Dataset loaded successfully")
-    
+
     return combined_text
 
 
@@ -198,11 +185,6 @@ def clip01(x: float) -> float:
 # Tokenization + simple trigram LM
 # ----------------------------
 def basic_tokenize(text: str) -> List[str]:
-    """
-    Tokenizer designed for unstructured text:
-    - keeps words and a small set of punctuation tokens
-    - lowercases words
-    """
     text = text.replace("\n", " ")
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
     out = []
@@ -241,10 +223,6 @@ def detokenize(tokens: List[str]) -> str:
 
 
 class TrigramLM:
-    """
-    Trigram LM with add-k smoothing and backoff to bigram/unigram.
-    Stored as counters.
-    """
     def __init__(self, add_k: float = 0.25):
         self.add_k = add_k
         self.uni: Dict[str, int] = {}
@@ -323,9 +301,9 @@ class TrigramLM:
 @dataclass
 class Nodelet:
     idx: int
-    top_terms: List[Tuple[str, float]]   # (term, weight)
-    energy: float                        # node strength
-    narrative: str                       # human-readable description
+    top_terms: List[Tuple[str, float]]
+    energy: float
+    narrative: str
 
 
 @dataclass
@@ -336,15 +314,17 @@ class ModelState:
     bar_probs: np.ndarray
     bar_logits: np.ndarray
     token_boost: Dict[str, float]
+    pillar_weights: np.ndarray
 
 
 class NeuroSymbolicTextGenerator:
     """
     Interpretable neurosymbolic generator:
     - Nodelets: latent semantic factors (TF-IDF->SVD)
-    - Bars: top 100 vocab items
+    - Bars: top N vocab items
     - W: bindings nodelets->bars
-    - Takeaways generated by a trigram LM trained on the file, steered by bar_probs and nodelet bindings
+    - Vertical pillars: diagonal top-prob weighting applied to W columns (feature-wise reinforcement)
+    - Takeaways: trigram LM steered by token boosts
     """
 
     def __init__(
@@ -355,6 +335,9 @@ class NeuroSymbolicTextGenerator:
         softmax_temp: float = 0.85,
         steer_strength: float = 1.35,
         lm_add_k: float = 0.25,
+        # Pillars (subversive by default; set pillar_strength=0.0 to disable)
+        pillar_strength: float = 0.85,
+        pillar_floor: float = 0.25,
     ):
         self.nodelets_n = nodelets_n
         self.bars_n = bars_n
@@ -362,6 +345,9 @@ class NeuroSymbolicTextGenerator:
         self.softmax_temp = softmax_temp
         self.steer_strength = steer_strength
         self.lm_add_k = lm_add_k
+
+        self.pillar_strength = float(pillar_strength)
+        self.pillar_floor = float(pillar_floor)
 
     def _chunk_text(self, text: str) -> List[str]:
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 120]
@@ -381,15 +367,13 @@ class NeuroSymbolicTextGenerator:
     def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
         if progress:
             progress(0, desc="Normalizing text")
-        
+
         text = normalize(text)
-        
-        # Calculate text statistics
+
         text_len = len(text)
         word_count = len(text.split())
-        
-        chunks = self._chunk_text(text)
 
+        chunks = self._chunk_text(text)
         if not chunks or len(" ".join(chunks).strip()) < 250:
             raise ValueError(
                 f"Not enough readable text to analyze.\n"
@@ -457,16 +441,35 @@ class NeuroSymbolicTextGenerator:
 
         energies = np.array([n.energy for n in nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
-        logits = (energies.reshape(-1, 1) * W).sum(axis=0)
+
+        # ---- Base logits/probs (before pillars)
+        base_logits = (energies.reshape(-1, 1) * W).sum(axis=0)
 
         rng = np.random.default_rng(self.svd_random_state)
+        base_logits = base_logits + 0.02 * rng.normal(size=base_logits.shape)
+        base_probs = softmax(base_logits, temp=self.softmax_temp)
+
+        # ---- Vertical pillars: diagonal top-prob weighting applied to columns
+        # pillar_weights acts like diag(pillar_weights) multiplying bar features.
+        # Efficient implementation: column-wise scaling of W.
+        if self.pillar_strength > 0.0:
+            pnorm = base_probs / (base_probs.max() + 1e-12)
+            pillar_weights = self.pillar_floor + self.pillar_strength * pnorm
+            pillar_weights = np.clip(pillar_weights, 0.0, 3.0)
+        else:
+            pillar_weights = np.ones_like(base_probs, dtype=float)
+
+        W_pillared = W * pillar_weights.reshape(1, -1)
+
+        # ---- Final logits/probs (after pillars)
+        logits = (energies.reshape(-1, 1) * W_pillared).sum(axis=0)
         logits = logits + 0.02 * rng.normal(size=logits.shape)
         probs = softmax(logits, temp=self.softmax_temp)
 
         if progress:
             progress(0.9, desc="Computing token boosts")
 
-        token_boost = self._make_token_boost(vocab100, probs, nodelets)
+        token_boost = self._make_token_boost(vocab100, probs, nodelets, pillar_weights)
 
         if progress:
             progress(1.0, desc="Model fitted")
@@ -474,10 +477,11 @@ class NeuroSymbolicTextGenerator:
         return ModelState(
             nodelets=nodelets,
             vocab100=vocab100,
-            binding_W=W,
+            binding_W=W_pillared,
             bar_probs=probs,
             bar_logits=logits,
             token_boost=token_boost,
+            pillar_weights=pillar_weights,
         )
 
     def _make_token_boost(
@@ -485,14 +489,19 @@ class NeuroSymbolicTextGenerator:
         vocab100: List[str],
         bar_probs: np.ndarray,
         nodelets: List[Nodelet],
+        pillar_weights: np.ndarray,
     ) -> Dict[str, float]:
         boost: Dict[str, float] = {}
 
-        for term, p in zip(vocab100, bar_probs):
+        # Base boost from bars + pillar emphasis
+        for idx, (term, p) in enumerate(zip(vocab100, bar_probs)):
+            pw = float(pillar_weights[idx]) if idx < len(pillar_weights) else 1.0
             for w in term.split():
                 if len(w) <= 2 or w in STOPWORDS:
                     continue
-                boost[w] = max(boost.get(w, 0.0), float(math.log(p + 1e-12) + 6.0))
+                # Pillar weighting “subversively” amplifies token boosts for strong bars
+                val = float(math.log(p + 1e-12) + 6.0) + 0.35 * float(np.log(pw + 1e-12) + 1.0)
+                boost[w] = max(boost.get(w, 0.0), val)
 
         energies = np.array([n.energy for n in nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
@@ -638,7 +647,7 @@ class NeuroSymbolicTextGenerator:
     ) -> List[str]:
         if progress:
             progress(0, desc="Training language model")
-        
+
         tokens = basic_tokenize(text)
         if len(tokens) < 600:
             tokens = tokens * 2
@@ -655,21 +664,19 @@ class NeuroSymbolicTextGenerator:
         for i in range(n_takeaways):
             if progress:
                 progress(i / n_takeaways, desc=f"Generating takeaway {i+1}/{n_takeaways}")
-            
+
             lead = int(rng.choice(len(state.nodelets), p=softmax(energies, temp=0.9)))
             row = state.binding_W[lead]
 
             local_boost = dict(state.token_boost)
 
-            # Persistent, light steering from user text seed
             for w in seed_words:
                 local_boost[w] = max(local_boost.get(w, 0.0), 1.25)
 
-            # Stronger per-takeaway steering from selected nodelet bindings
             topbars = np.argsort(-row)[:10]
             for b in topbars:
                 term = state.vocab100[b]
-                strength = float(row[b])  # 0..1
+                strength = float(row[b])
                 for w in term.split():
                     if len(w) > 2 and w not in STOPWORDS:
                         local_boost[w] = max(local_boost.get(w, 0.0), 1.0 + 0.6 * strength)
@@ -695,9 +702,6 @@ class NeuroSymbolicTextGenerator:
     ) -> str:
         text = normalize(text)
         state = self.fit(text, progress=progress)
-
-        _H = entropy(state.bar_probs)
-        _effk = math.exp(_H)
 
         rng = np.random.default_rng(seed)
         takeaways = self._generate_takeaways(
@@ -732,6 +736,8 @@ def generate_from_file(
         softmax_temp=float(softmax_temp),
         steer_strength=float(steer_strength),
         lm_add_k=0.25,
+        pillar_strength=0.85,  # set 0.0 to disable pillars
+        pillar_floor=0.25,
     )
 
     report = gen.generate_report(
@@ -774,7 +780,6 @@ def generate_from_hf_dataset(
     if not dataset_name or not dataset_name.strip():
         raise gr.Error("Please enter a dataset name.")
 
-    # Load HF dataset
     raw = load_hf_dataset(
         dataset_name=dataset_name.strip(),
         config_name=config_name.strip() if config_name and config_name.strip() else None,
@@ -791,6 +796,8 @@ def generate_from_hf_dataset(
         softmax_temp=float(softmax_temp),
         steer_strength=float(steer_strength),
         lm_add_k=0.25,
+        pillar_strength=0.85,  # set 0.0 to disable pillars
+        pillar_floor=0.25,
     )
 
     report = gen.generate_report(
@@ -817,12 +824,11 @@ def generate_from_hf_dataset(
 
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# 🧠 Neurosymbolic Text Generator")
+        gr.Markdown("# Neurosymbolic Text Generator")
         gr.Markdown("*TF‑IDF/SVD nodelets + trigram LM with Hugging Face dataset support*")
 
         with gr.Tabs() as tabs:
-            # Tab 1: File Upload
-            with gr.Tab("📁 Upload File"):
+            with gr.Tab("Upload File"):
                 with gr.Row():
                     in_file = gr.File(
                         label="Input file (.txt/.md/.docx/.pdf)",
@@ -847,27 +853,18 @@ def build_app() -> gr.Blocks:
                     n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
                     seed_file = gr.Number(value=7, precision=0, label="Numeric seed")
 
-                run_btn_file = gr.Button("🚀 Generate from file", variant="primary", size="lg")
+                run_btn_file = gr.Button("Generate from file", variant="primary", size="lg")
 
                 with gr.Row():
                     preview_file = gr.Textbox(label="Generated report preview", lines=20)
-                download_file = gr.File(label="📥 Download generated .txt")
+                download_file = gr.File(label="Download generated .txt")
 
-            # Tab 2: Hugging Face Dataset
-            with gr.Tab("🤗 Hugging Face Dataset"):
+            with gr.Tab("Hugging Face Dataset"):
                 gr.Markdown("""
                 ### Load data from Hugging Face datasets
-                
-                Browse datasets at: [huggingface.co/datasets](https://huggingface.co/datasets)
-                
-                **Quick Examples:**
-                - `imdb` - Movie reviews (no config needed)
-                - `ag_news` - News articles (no config needed)
-                - `cnn_dailymail` + config `3.0.0` - CNN/DailyMail articles
-                - `wikitext` + config `wikitext-2-raw-v1` - Wikipedia text
-                - `squad` - Question answering contexts
+                Browse datasets at: https://huggingface.co/datasets
                 """)
-                
+
                 with gr.Row():
                     with gr.Column():
                         dataset_name = gr.Textbox(
@@ -918,13 +915,12 @@ def build_app() -> gr.Blocks:
                     n_takeaways_hf = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
                     seed_hf = gr.Number(value=7, precision=0, label="Numeric seed")
 
-                run_btn_hf = gr.Button("🚀 Generate from dataset", variant="primary", size="lg")
+                run_btn_hf = gr.Button("Generate from dataset", variant="primary", size="lg")
 
                 with gr.Row():
                     preview_hf = gr.Textbox(label="Generated report preview", lines=20)
-                download_hf = gr.File(label="📥 Download generated .txt")
+                download_hf = gr.File(label="Download generated .txt")
 
-        # Wire up event handlers
         run_btn_file.click(
             fn=generate_from_file,
             inputs=[
