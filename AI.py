@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Neurosymbolic Text Generator (Gradio GUI)
+Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
 
 Install:
-  pip install numpy scikit-learn gradio
+  pip install numpy scikit-learn gradio datasets tqdm
 
 Optional (for file types):
   pip install python-docx
   pip install pypdf
 
 Run:
-  python neurosymbolic_textgen_gradio.py
+  python neurosymbolic_textgen_hf.py
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import gradio as gr
+from tqdm.auto import tqdm
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
@@ -64,6 +65,100 @@ def load_text(path: str) -> str:
         return "\n".join(parts)
 
     raise ValueError(f"Unsupported file extension: {ext}")
+
+
+def load_hf_dataset(
+    dataset_name: str,
+    config_name: Optional[str] = None,
+    split: str = "train",
+    text_column: Optional[str] = None,
+    max_samples: Optional[int] = None,
+    progress: Optional[gr.Progress] = None,
+) -> str:
+    """
+    Load text from a Hugging Face dataset.
+    
+    Args:
+        dataset_name: HF dataset identifier (e.g., 'wikitext', 'imdb')
+        config_name: Dataset configuration/subset (e.g., '3.0.0' for cnn_dailymail)
+        split: Dataset split to load (e.g., 'train', 'test', 'validation')
+        text_column: Column name containing text (auto-detected if None)
+        max_samples: Maximum number of samples to load (None = all)
+        progress: Gradio progress tracker
+        
+    Returns:
+        Concatenated text from the dataset
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise RuntimeError("Loading HF datasets requires: pip install datasets") from e
+    
+    if progress:
+        progress(0, desc=f"Loading dataset: {dataset_name}")
+    
+    # Load dataset
+    try:
+        if config_name and config_name.strip():
+            dataset = load_dataset(dataset_name, config_name.strip(), split=split, trust_remote_code=True)
+        else:
+            dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
+    except Exception as e:
+        error_msg = str(e)
+        if "Config name is missing" in error_msg or "available configs" in error_msg:
+            raise RuntimeError(
+                f"Dataset '{dataset_name}' requires a config name. {error_msg}\n"
+                f"Please specify a config in the 'Config/Subset' field."
+            ) from e
+        raise RuntimeError(f"Failed to load dataset '{dataset_name}': {error_msg}") from e
+    
+    # Auto-detect text column if not specified
+    if text_column is None:
+        common_text_columns = ['text', 'content', 'article', 'document', 'passage', 'sentence']
+        for col in common_text_columns:
+            if col in dataset.column_names:
+                text_column = col
+                break
+        
+        if text_column is None:
+            # Use first string column
+            for col in dataset.column_names:
+                if dataset.features[col].dtype == 'string':
+                    text_column = col
+                    break
+        
+        if text_column is None:
+            raise ValueError(f"Could not auto-detect text column. Available columns: {dataset.column_names}")
+    
+    if text_column not in dataset.column_names:
+        raise ValueError(f"Column '{text_column}' not found. Available: {dataset.column_names}")
+    
+    # Extract text with progress bar
+    num_samples = len(dataset) if max_samples is None else min(max_samples, len(dataset))
+    texts = []
+    
+    if progress:
+        progress(0.1, desc=f"Extracting {num_samples} samples")
+    
+    for i in tqdm(range(num_samples), desc=f"Loading {dataset_name}", disable=progress is None):
+        sample = dataset[i]
+        text = sample.get(text_column, "")
+        if text and isinstance(text, str):
+            texts.append(text.strip())
+        
+        # Update progress periodically
+        if progress and i % max(1, num_samples // 20) == 0:
+            progress(0.1 + 0.5 * (i / num_samples), desc=f"Loaded {i}/{num_samples} samples")
+    
+    if progress:
+        progress(0.7, desc="Concatenating text")
+    
+    combined_text = "\n\n".join(texts)
+    
+    if progress:
+        progress(1.0, desc="Dataset loaded successfully")
+    
+    return combined_text
 
 
 # ----------------------------
@@ -283,12 +378,28 @@ class NeuroSymbolicTextGenerator:
                 blocks.append(blk)
         return blocks or [text2[:800]]
 
-    def fit(self, text: str) -> ModelState:
+    def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
+        if progress:
+            progress(0, desc="Normalizing text")
+        
         text = normalize(text)
+        
+        # Calculate text statistics
+        text_len = len(text)
+        word_count = len(text.split())
+        
         chunks = self._chunk_text(text)
 
         if not chunks or len(" ".join(chunks).strip()) < 250:
-            raise ValueError("Not enough readable text. Provide a longer unstructured file.")
+            raise ValueError(
+                f"Not enough readable text to analyze.\n"
+                f"Text length: {text_len} characters, ~{word_count} words\n"
+                f"Required: At least 250 characters of substantive text.\n"
+                f"Suggestion: Load more samples or choose a different dataset/text column."
+            )
+
+        if progress:
+            progress(0.2, desc="Computing TF-IDF vectors")
 
         vec = TfidfVectorizer(
             lowercase=True,
@@ -303,10 +414,16 @@ class NeuroSymbolicTextGenerator:
         top_idx = np.argsort(-global_mass)[: self.bars_n]
         vocab100 = vocab[top_idx].tolist()
 
+        if progress:
+            progress(0.4, desc="Performing SVD decomposition")
+
         k = min(self.nodelets_n, max(2, X.shape[0] - 1), max(2, X.shape[1] - 1))
         svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
         svd.fit(X)
         components = svd.components_
+
+        if progress:
+            progress(0.6, desc="Creating nodelets")
 
         nodelets: List[Nodelet] = []
         for i in range(k):
@@ -316,6 +433,9 @@ class NeuroSymbolicTextGenerator:
             energy = float(np.linalg.norm(comp))
             narrative = self._nodelet_narrative(i, terms, energy)
             nodelets.append(Nodelet(idx=i, top_terms=terms, energy=energy, narrative=narrative))
+
+        if progress:
+            progress(0.8, desc="Building bindings matrix")
 
         W = np.zeros((k, self.bars_n), dtype=float)
         for i in range(k):
@@ -343,7 +463,13 @@ class NeuroSymbolicTextGenerator:
         logits = logits + 0.02 * rng.normal(size=logits.shape)
         probs = softmax(logits, temp=self.softmax_temp)
 
+        if progress:
+            progress(0.9, desc="Computing token boosts")
+
         token_boost = self._make_token_boost(vocab100, probs, nodelets)
+
+        if progress:
+            progress(1.0, desc="Model fitted")
 
         return ModelState(
             nodelets=nodelets,
@@ -508,7 +634,11 @@ class NeuroSymbolicTextGenerator:
         n_takeaways: int,
         rng: np.random.Generator,
         text_seed: str = "",
+        progress: Optional[gr.Progress] = None,
     ) -> List[str]:
+        if progress:
+            progress(0, desc="Training language model")
+        
         tokens = basic_tokenize(text)
         if len(tokens) < 600:
             tokens = tokens * 2
@@ -522,7 +652,10 @@ class NeuroSymbolicTextGenerator:
         energies = np.array([n.energy for n in state.nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
 
-        for _i in range(n_takeaways):
+        for i in range(n_takeaways):
+            if progress:
+                progress(i / n_takeaways, desc=f"Generating takeaway {i+1}/{n_takeaways}")
+            
             lead = int(rng.choice(len(state.nodelets), p=softmax(energies, temp=0.9)))
             row = state.binding_W[lead]
 
@@ -547,6 +680,9 @@ class NeuroSymbolicTextGenerator:
             sent = self._generate_sentence(lm, local_boost, rng, seed_words=seed_words)
             takeaways.append(sent)
 
+        if progress:
+            progress(1.0, desc="Generation complete")
+
         return takeaways
 
     def generate_report(
@@ -555,15 +691,18 @@ class NeuroSymbolicTextGenerator:
         n_takeaways: int = 7,
         seed: int = 7,
         text_seed: str = "",
+        progress: Optional[gr.Progress] = None,
     ) -> str:
         text = normalize(text)
-        state = self.fit(text)
+        state = self.fit(text, progress=progress)
 
         _H = entropy(state.bar_probs)
         _effk = math.exp(_H)
 
         rng = np.random.default_rng(seed)
-        takeaways = self._generate_takeaways(text, state, n_takeaways=n_takeaways, rng=rng, text_seed=text_seed)
+        takeaways = self._generate_takeaways(
+            text, state, n_takeaways=n_takeaways, rng=rng, text_seed=text_seed, progress=progress
+        )
         return "\n\n".join(takeaways)
 
 
@@ -578,10 +717,12 @@ def generate_from_file(
     seed: int,
     text_seed: str,
     output_name: str,
+    progress: gr.Progress = gr.Progress(),
 ):
     if not in_file:
         raise gr.Error("Please upload an input file.")
 
+    progress(0, desc="Loading file")
     raw = load_text(in_file)
 
     gen = NeuroSymbolicTextGenerator(
@@ -598,8 +739,10 @@ def generate_from_file(
         n_takeaways=int(n_takeaways),
         seed=int(seed),
         text_seed=(text_seed or "").strip(),
+        progress=progress,
     )
 
+    progress(0, desc="Saving output file")
     tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
     stem = Path(in_file).stem
     out_name = (output_name or "").strip()
@@ -614,44 +757,191 @@ def generate_from_file(
     return report, str(out_path)
 
 
+def generate_from_hf_dataset(
+    dataset_name: str,
+    config_name: str,
+    split: str,
+    text_column: str,
+    max_samples: int,
+    softmax_temp: float,
+    steer_strength: float,
+    n_takeaways: int,
+    seed: int,
+    text_seed: str,
+    output_name: str,
+    progress: gr.Progress = gr.Progress(),
+):
+    if not dataset_name or not dataset_name.strip():
+        raise gr.Error("Please enter a dataset name.")
+
+    # Load HF dataset
+    raw = load_hf_dataset(
+        dataset_name=dataset_name.strip(),
+        config_name=config_name.strip() if config_name and config_name.strip() else None,
+        split=split,
+        text_column=text_column.strip() if text_column and text_column.strip() else None,
+        max_samples=int(max_samples) if max_samples and max_samples > 0 else None,
+        progress=progress,
+    )
+
+    gen = NeuroSymbolicTextGenerator(
+        nodelets_n=10,
+        bars_n=100,
+        svd_random_state=7,
+        softmax_temp=float(softmax_temp),
+        steer_strength=float(steer_strength),
+        lm_add_k=0.25,
+    )
+
+    report = gen.generate_report(
+        raw,
+        n_takeaways=int(n_takeaways),
+        seed=int(seed),
+        text_seed=(text_seed or "").strip(),
+        progress=progress,
+    )
+
+    progress(0, desc="Saving output file")
+    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
+    out_name = (output_name or "").strip()
+
+    if not out_name:
+        out_path = tmpdir / f"{dataset_name.replace('/', '_')}_generated_report.txt"
+    else:
+        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
+        out_path = tmpdir / out_name
+
+    out_path.write_text(report, encoding="utf-8")
+    return report, str(out_path)
+
+
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="Neurosymbolic Text Generator") as demo:
-        gr.Markdown("## Neurosymbolic Text Generator (TF‑IDF/SVD nodelets + trigram LM)")
+    with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🧠 Neurosymbolic Text Generator")
+        gr.Markdown("*TF‑IDF/SVD nodelets + trigram LM with Hugging Face dataset support*")
 
-        with gr.Row():
-            in_file = gr.File(
-                label="Input file (.txt/.md/.docx/.pdf)",
-                file_types=[".txt", ".md", ".docx", ".pdf"],
-                type="filepath",
-            )
-            with gr.Column():
-                output_name = gr.Textbox(
-                    label="Output filename (optional)",
-                    placeholder="e.g., report.txt (leave blank to auto-name)",
-                )
-                text_seed = gr.Textbox(
-                    label="Text seed (optional)",
-                    placeholder="Words/phrase to bias starts + token boosts (e.g., 'quantum measurement')",
-                )
+        with gr.Tabs() as tabs:
+            # Tab 1: File Upload
+            with gr.Tab("📁 Upload File"):
+                with gr.Row():
+                    in_file = gr.File(
+                        label="Input file (.txt/.md/.docx/.pdf)",
+                        file_types=[".txt", ".md", ".docx", ".pdf"],
+                        type="filepath",
+                    )
+                    with gr.Column():
+                        output_name_file = gr.Textbox(
+                            label="Output filename (optional)",
+                            placeholder="e.g., report.txt (leave blank to auto-name)",
+                        )
+                        text_seed_file = gr.Textbox(
+                            label="Text seed (optional)",
+                            placeholder="Words/phrase to bias generation (e.g., 'quantum measurement')",
+                        )
 
-        with gr.Row():
-            softmax_temp = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
-            steer_strength = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
+                with gr.Row():
+                    softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
+                    steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
 
-        with gr.Row():
-            n_takeaways = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
-            seed = gr.Number(value=7, precision=0, label="Numeric seed")
+                with gr.Row():
+                    n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
+                    seed_file = gr.Number(value=7, precision=0, label="Numeric seed")
 
-        run_btn = gr.Button("Generate report", variant="primary")
+                run_btn_file = gr.Button("🚀 Generate from file", variant="primary", size="lg")
 
-        with gr.Row():
-            preview = gr.Textbox(label="Generated report preview", lines=20)
-        download = gr.File(label="Download generated .txt")
+                with gr.Row():
+                    preview_file = gr.Textbox(label="Generated report preview", lines=20)
+                download_file = gr.File(label="📥 Download generated .txt")
 
-        run_btn.click(
+            # Tab 2: Hugging Face Dataset
+            with gr.Tab("🤗 Hugging Face Dataset"):
+                gr.Markdown("""
+                ### Load data from Hugging Face datasets
+                
+                Browse datasets at: [huggingface.co/datasets](https://huggingface.co/datasets)
+                
+                **Quick Examples:**
+                - `imdb` - Movie reviews (no config needed)
+                - `ag_news` - News articles (no config needed)
+                - `cnn_dailymail` + config `3.0.0` - CNN/DailyMail articles
+                - `wikitext` + config `wikitext-2-raw-v1` - Wikipedia text
+                - `squad` - Question answering contexts
+                """)
+                
+                with gr.Row():
+                    with gr.Column():
+                        dataset_name = gr.Textbox(
+                            label="Dataset name",
+                            placeholder="e.g., imdb, ag_news, cnn_dailymail",
+                            value="",
+                        )
+                        config_name = gr.Textbox(
+                            label="Config/Subset (if required)",
+                            placeholder="e.g., 3.0.0 for cnn_dailymail, wikitext-2-raw-v1 for wikitext",
+                            value="",
+                        )
+                    with gr.Column():
+                        split = gr.Textbox(
+                            label="Split",
+                            placeholder="train, test, validation, etc.",
+                            value="train",
+                        )
+                        text_column = gr.Textbox(
+                            label="Text column (leave empty for auto-detect)",
+                            placeholder="e.g., text, article, context",
+                            value="",
+                        )
+
+                with gr.Row():
+                    max_samples = gr.Number(
+                        label="Max samples (0 = all, recommended: 1000-5000)",
+                        value=2000,
+                        precision=0,
+                    )
+                    output_name_hf = gr.Textbox(
+                        label="Output filename (optional)",
+                        placeholder="e.g., report.txt",
+                    )
+
+                with gr.Row():
+                    text_seed_hf = gr.Textbox(
+                        label="Text seed (optional)",
+                        placeholder="Words/phrase to bias generation",
+                        scale=2,
+                    )
+
+                with gr.Row():
+                    softmax_temp_hf = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
+                    steer_strength_hf = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
+
+                with gr.Row():
+                    n_takeaways_hf = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
+                    seed_hf = gr.Number(value=7, precision=0, label="Numeric seed")
+
+                run_btn_hf = gr.Button("🚀 Generate from dataset", variant="primary", size="lg")
+
+                with gr.Row():
+                    preview_hf = gr.Textbox(label="Generated report preview", lines=20)
+                download_hf = gr.File(label="📥 Download generated .txt")
+
+        # Wire up event handlers
+        run_btn_file.click(
             fn=generate_from_file,
-            inputs=[in_file, softmax_temp, steer_strength, n_takeaways, seed, text_seed, output_name],
-            outputs=[preview, download],
+            inputs=[
+                in_file, softmax_temp_file, steer_strength_file,
+                n_takeaways_file, seed_file, text_seed_file, output_name_file
+            ],
+            outputs=[preview_file, download_file],
+        )
+
+        run_btn_hf.click(
+            fn=generate_from_hf_dataset,
+            inputs=[
+                dataset_name, config_name, split, text_column, max_samples,
+                softmax_temp_hf, steer_strength_hf, n_takeaways_hf, seed_hf,
+                text_seed_hf, output_name_hf
+            ],
+            outputs=[preview_hf, download_hf],
         )
 
     return demo
