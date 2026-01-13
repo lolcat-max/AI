@@ -2,22 +2,28 @@
 # -*- coding: utf-8 -*-
 """
 Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
-+ Vertical Pillars (ADDITIVE logit-level bias, original code retained)
++ Vertical Pillars (ADDITIVE logit-level bias)
 + Geometric Distance & Angle Modulation
 + Quad-gram Language Model (4-gram)
++ Cosine similarity edit->retrieve context->generate workflow
++ Regen uses edited text as prompt (prefix continuation) AND mixes edit into LM corpus
 """
+
 from __future__ import annotations
+
 import re
 import math
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
+
 import numpy as np
 import gradio as gr
-from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
+
 
 # ----------------------------
 # File loading
@@ -39,6 +45,7 @@ def load_text(path: str) -> str:
         return "\n".join(page.extract_text() or "" for page in reader.pages)
     raise ValueError(f"Unsupported file extension: {ext}")
 
+
 def load_hf_dataset(
     dataset_name: str,
     config_name: Optional[str] = None,
@@ -52,17 +59,15 @@ def load_hf_dataset(
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
-    
+
     if progress:
         progress(0, desc=f"Loading dataset: {dataset_name}")
-    
-    # Load dataset
+
     if config_name:
         ds = load_dataset(dataset_name, config_name, split=split)
     else:
         ds = load_dataset(dataset_name, split=split)
-    
-    # Auto-detect text column if not specified
+
     if text_column is None:
         text_candidates = ["text", "article", "content", "document", "context", "sentence"]
         for candidate in text_candidates:
@@ -71,29 +76,29 @@ def load_hf_dataset(
                 break
         if text_column is None:
             text_column = ds.column_names[0]
-    
+
     if text_column not in ds.column_names:
         raise ValueError(f"Column '{text_column}' not found. Available: {ds.column_names}")
-    
-    # Extract text
+
     if max_samples and max_samples > 0:
         ds = ds.select(range(min(max_samples, len(ds))))
-    
+
     if progress:
         progress(0.5, desc="Extracting text from dataset")
-    
+
     texts = []
     for item in ds:
         text = item[text_column]
         if isinstance(text, str) and text.strip():
             texts.append(text.strip())
-    
+
     combined = "\n\n".join(texts)
-    
+
     if progress:
         progress(1.0, desc="Dataset loaded successfully")
-    
+
     return combined
+
 
 # ----------------------------
 # Text utilities
@@ -104,11 +109,13 @@ of on or our ours she so that the their them they this to was we were what when 
 which who will with you your yours
 """.split())
 
+
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     x = x.astype(float) / max(temp, 1e-12)
@@ -116,15 +123,13 @@ def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     ex = np.exp(x)
     return ex / (np.sum(ex) + 1e-12)
 
-def entropy(p: np.ndarray) -> float:
-    p = np.asarray(p, dtype=float)
-    return float(-np.sum(p * np.log(p + 1e-12)))
 
 def clip01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
+
 # ----------------------------
-# Tokenization + simple trigram LM
+# Tokenization + detokenization
 # ----------------------------
 def basic_tokenize(text: str) -> List[str]:
     text = text.replace("\n", " ")
@@ -136,6 +141,7 @@ def basic_tokenize(text: str) -> List[str]:
         else:
             out.append(t)
     return out
+
 
 def detokenize(tokens: List[str]) -> str:
     out = []
@@ -161,6 +167,7 @@ def detokenize(tokens: List[str]) -> str:
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
 
+
 # ----------------------------
 # Neurosymbolic model pieces
 # ----------------------------
@@ -171,6 +178,7 @@ class Nodelet:
     energy: float
     narrative: str
 
+
 @dataclass
 class ModelState:
     nodelets: List[Nodelet]
@@ -180,7 +188,13 @@ class ModelState:
     bar_logits: np.ndarray
     token_boost: Dict[str, float]
     pillar_weights: np.ndarray
-    geometric_bias: np.ndarray  # NEW: geometric modulation
+    geometric_bias: np.ndarray
+
+    # Retrieval index (kept per session in a global dict; includes non-deepcopyable objects)
+    chunks: List[str]
+    tfidf_vec: TfidfVectorizer
+    chunk_tfidf: Any  # sparse matrix
+
 
 class NeuroSymbolicTextGenerator:
     """
@@ -203,7 +217,7 @@ class NeuroSymbolicTextGenerator:
         lm_add_k: float = 0.25,
         pillar_strength: float = 0.85,
         pillar_floor: float = 0.25,
-        geometric_strength: float = 0.3,  # NEW: control geometric modulation
+        geometric_strength: float = 0.3,
     ):
         self.nodelets_n = nodelets_n
         self.bars_n = bars_n
@@ -213,7 +227,7 @@ class NeuroSymbolicTextGenerator:
         self.lm_add_k = lm_add_k
         self.pillar_strength = float(pillar_strength)
         self.pillar_floor = float(pillar_floor)
-        self.geometric_strength = float(geometric_strength)  # NEW
+        self.geometric_strength = float(geometric_strength)
 
     def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
         if progress:
@@ -263,7 +277,6 @@ class NeuroSymbolicTextGenerator:
         energies = np.array([n.energy for n in nodelets])
         energies /= energies.max() + 1e-12
 
-        # ---- Base logits
         rng = np.random.default_rng(self.svd_random_state)
         base_logits = (energies[:, None] * W).sum(axis=0)
         base_logits += 0.02 * rng.normal(size=base_logits.shape)
@@ -277,39 +290,23 @@ class NeuroSymbolicTextGenerator:
             pillar_bias = np.zeros_like(base_probs)
 
         # ---- GEOMETRIC DISTANCE & ANGLE MODULATION
-        # Treat probabilities as vectors in high-dimensional space
-        # Compute distance from each probability to the first word's probability
         if len(base_probs) > 1 and self.geometric_strength > 0.0:
-            # Create position vectors (using index as spatial coordinate)
             positions = np.arange(len(base_probs)).astype(float)
-            
-            # Distance from first word (index 0)
             distances = np.abs(positions - positions[0])
-            # Normalize distances to [0, 1]
             max_dist = distances.max()
             if max_dist > 1e-12:
                 norm_distances = distances / max_dist
             else:
                 norm_distances = distances
-            
-            # Compute angle-like features based on probability magnitude differences
-            # Vector from first prob to each prob
+
             prob_vectors = base_probs - base_probs[0]
-            
-            # Compute angles using arctan2-style computation
-            # Using position as x-axis and probability difference as y-axis
             angles = np.arctan2(prob_vectors, norm_distances + 1e-12)
-            
-            # Normalize angles to [0, 1] range
             angle_norm = (angles - angles.min()) / (angles.max() - angles.min() + 1e-12)
-            
-            # Combine distance and angle information
-            # This creates a spatial modulation of probabilities
+
             geometric_bias = self.geometric_strength * (norm_distances + angle_norm)
         else:
             geometric_bias = np.zeros_like(base_probs)
 
-        # ---- Final logits/probs with geometric modulation
         logits = base_logits + pillar_bias + geometric_bias
         probs = softmax(logits, temp=self.softmax_temp)
 
@@ -323,8 +320,34 @@ class NeuroSymbolicTextGenerator:
             bar_logits=logits,
             token_boost=token_boost,
             pillar_weights=pillar_bias,
-            geometric_bias=geometric_bias,  # NEW
+            geometric_bias=geometric_bias,
+            chunks=chunks,
+            tfidf_vec=vec,
+            chunk_tfidf=X,
         )
+
+    def generate_report_from_state(
+        self,
+        lm_text: str,
+        state: ModelState,
+        n_takeaways: int = 7,
+        seed: int = 7,
+        text_seed: str = "",
+        prompt_text: str = "",
+        progress: Optional[gr.Progress] = None,
+    ) -> str:
+        lm_text = normalize(lm_text)
+        rng = np.random.default_rng(seed)
+        takeaways = self._generate_takeaways(
+            lm_text,
+            state,
+            n_takeaways=n_takeaways,
+            rng=rng,
+            text_seed=text_seed,
+            prompt_text=prompt_text,
+            progress=progress,
+        )
+        return "\n\n".join(takeaways)
 
     def _chunk_text(self, text: str) -> List[str]:
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 120]
@@ -349,13 +372,11 @@ class NeuroSymbolicTextGenerator:
         pillar_weights: np.ndarray,
     ) -> Dict[str, float]:
         boost: Dict[str, float] = {}
-        # Base boost from bars + pillar emphasis
         for idx, (term, p) in enumerate(zip(vocab100, bar_probs)):
             pw = float(pillar_weights[idx]) if idx < len(pillar_weights) else 1.0
             for w in term.split():
                 if len(w) <= 2 or w in STOPWORDS:
                     continue
-                # Pillar weighting "subversively" amplifies token boosts for strong bars
                 val = float(math.log(p + 1e-12) + 6.0) + 0.35 * float(np.log(pw + 1e-12) + 1.0)
                 boost[w] = max(boost.get(w, 0.0), val)
 
@@ -453,27 +474,43 @@ class NeuroSymbolicTextGenerator:
         token_boost: Dict[str, float],
         rng: np.random.Generator,
         seed_words: Optional[List[str]] = None,
+        prompt_text: str = "",
         min_len: int = 800,
         max_len: int = 900,
     ) -> str:
         seed_words = seed_words or []
-        seed = self._choose_start_word(lm, token_boost, rng, seed_words)
-        tokens = ["("] if rng.random() < 0.12 else []
-        tokens.append(seed)
-        
-        # Initialize 3-word context for quad-grams
-        w1 = tokens[-1]
-        w2 = tokens[-1]
-        w3 = tokens[-1]
-        
+
+        prompt_tokens = basic_tokenize(prompt_text) if (prompt_text and prompt_text.strip()) else []
+        if prompt_tokens and prompt_tokens[-1] in [".", "!", "?"]:
+            prompt_tokens = prompt_tokens[:-1]
+
+        tokens: List[str] = []
+
+        if not prompt_tokens and rng.random() < 0.12:
+            tokens.append("(")
+
+        if prompt_tokens:
+            tokens.extend(prompt_tokens)
+        else:
+            seed = self._choose_start_word(lm, token_boost, rng, seed_words)
+            tokens.append(seed)
+
+        if len(tokens) >= 3:
+            w1, w2, w3 = tokens[-3], tokens[-2], tokens[-1]
+        else:
+            last = tokens[-1]
+            w1 = w2 = w3 = last
+
         target_len = int(rng.integers(min_len, max_len + 1))
-        for _ in range(target_len):
+        remaining = max(0, target_len - len(tokens))
+
+        for _ in range(remaining):
             nxt = self._sample_next(lm, w1, w2, w3, token_boost, rng)
             tokens.append(nxt)
-            # Shift context window
             w1, w2, w3 = w2, w3, nxt
             if nxt in [".", "!", "?"] and len([t for t in tokens if re.match(r"[a-z]", t)]) >= min_len:
                 break
+
         if tokens and tokens[-1] not in [".", "!", "?"]:
             tokens.append(".")
         if tokens and tokens[0] == "(" and ")" not in tokens:
@@ -490,6 +527,7 @@ class NeuroSymbolicTextGenerator:
         n_takeaways: int,
         rng: np.random.Generator,
         text_seed: str = "",
+        prompt_text: str = "",
         progress: Optional[gr.Progress] = None,
     ) -> List[str]:
         if progress:
@@ -526,28 +564,18 @@ class NeuroSymbolicTextGenerator:
             for k in list(local_boost.keys()):
                 local_boost[k] = float(min(2.0, max(0.0, local_boost[k])))
 
-            sent = self._generate_sentence(lm, local_boost, rng, seed_words=seed_words)
+            sent = self._generate_sentence(
+                lm,
+                local_boost,
+                rng,
+                seed_words=seed_words,
+                prompt_text=(prompt_text if i == 0 else ""),
+            )
             takeaways.append(sent)
 
         if progress:
             progress(1.0, desc="Generation complete")
         return takeaways
-
-    def generate_report(
-        self,
-        text: str,
-        n_takeaways: int = 7,
-        seed: int = 7,
-        text_seed: str = "",
-        progress: Optional[gr.Progress] = None,
-    ) -> str:
-        text = normalize(text)
-        state = self.fit(text, progress=progress)
-        rng = np.random.default_rng(seed)
-        takeaways = self._generate_takeaways(
-            text, state, n_takeaways=n_takeaways, rng=rng, text_seed=text_seed, progress=progress
-        )
-        return "\n\n".join(takeaways)
 
 
 class QuadgramLM:
@@ -605,30 +633,25 @@ class QuadgramLM:
         return (c1234 + self.add_k) / (c123 + self.add_k * V) if c123 > 0 else self._prob_trigram(w2, w3, w4)
 
     def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], np.ndarray]:
-        """Get next word distribution given 3-word context (for 4-gram model)"""
         cont: List[str] = []
-        
-        # Try quad-grams first
+
         for (a, b, c, d), _count in self.quad.items():
             if a == w1 and b == w2 and c == w3:
                 cont.append(d)
-        
-        # Fall back to trigrams
+
         if not cont:
             for (a, b, c), _count in self.tri.items():
                 if a == w2 and b == w3:
                     cont.append(c)
-        
-        # Fall back to bigrams
+
         if not cont:
             for (a, b), _count in self.bi.items():
                 if a == w3:
                     cont.append(b)
-        
-        # Fall back to most common words
+
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
-        
+
         seen = set()
         cand = []
         for w in cont:
@@ -636,14 +659,83 @@ class QuadgramLM:
                 seen.add(w)
                 cand.append(w)
         cand = cand[:500]
-        
+
         probs = np.array([self._prob_quadgram(w1, w2, w3, w) for w in cand], dtype=float)
         probs = probs / (probs.sum() + 1e-12)
         return cand, probs
 
 
 # ----------------------------
-# Gradio app
+# Cosine-similarity retrieval
+# ----------------------------
+def retrieve_topk_chunks(
+    state: ModelState,
+    query_text: str,
+    k: int = 12,
+) -> Tuple[str, List[List[Any]]]:
+    q = normalize(query_text or "")
+    if not q.strip():
+        k2 = min(k, len(state.chunks))
+        ctx = "\n\n".join(state.chunks[:k2])
+        rows = [
+            [i + 1, None, state.chunks[i][:220].replace("\n", " ") + ("..." if len(state.chunks[i]) > 220 else "")]
+            for i in range(k2)
+        ]
+        return ctx, rows
+
+    qv = state.tfidf_vec.transform([q])
+    sims = cosine_similarity(qv, state.chunk_tfidf).ravel()
+    idx = np.argsort(-sims)[: min(k, len(sims))]
+
+    ctx = "\n\n".join(state.chunks[i] for i in idx)
+    rows = []
+    for rank, i in enumerate(idx, start=1):
+        snippet = state.chunks[i][:220].replace("\n", " ")
+        if len(state.chunks[i]) > 220:
+            snippet += "..."
+        rows.append([rank, float(sims[i]), snippet])
+    return ctx, rows
+
+
+def save_report_to_tmp(report: str, default_stem: str, output_name: str) -> str:
+    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
+    out_name = (output_name or "").strip()
+    if not out_name:
+        out_path = tmpdir / f"{default_stem}_generated_report.txt"
+    else:
+        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
+        out_path = tmpdir / out_name
+    out_path.write_text(report, encoding="utf-8")
+    return str(out_path)
+
+
+# ----------------------------
+# Per-session storage (for non-deepcopyable objects)
+# ----------------------------
+@dataclass
+class SessionData:
+    raw_text: str = ""
+    state: Optional[ModelState] = None
+    gen_kwargs: Dict[str, Any] = field(default_factory=dict)
+    last_context: str = ""
+
+
+SESSIONS: Dict[str, SessionData] = {}
+
+
+def _sid(request: Optional[gr.Request]) -> str:
+    return request.session_hash if request and getattr(request, "session_hash", None) else "global"
+
+
+def get_session(request: Optional[gr.Request]) -> SessionData:
+    sid = _sid(request)
+    if sid not in SESSIONS:
+        SESSIONS[sid] = SessionData()
+    return SESSIONS[sid]
+
+
+# ----------------------------
+# Generation functions
 # ----------------------------
 def generate_from_file(
     in_file: str,
@@ -655,6 +747,7 @@ def generate_from_file(
     text_seed: str,
     output_name: str,
     progress: gr.Progress = gr.Progress(),
+    request: gr.Request | None = None,
 ):
     if not in_file:
         raise gr.Error("Please upload an input file.")
@@ -673,25 +766,33 @@ def generate_from_file(
         geometric_strength=float(geometric_strength),
     )
 
-    report = gen.generate_report(
-        raw,
+    state = gen.fit(raw, progress=progress)
+    report = gen.generate_report_from_state(
+        lm_text=raw,
+        state=state,
         n_takeaways=int(n_takeaways),
         seed=int(seed),
         text_seed=(text_seed or "").strip(),
+        prompt_text="",  # initial generation doesn't need a hard prefix prompt
         progress=progress,
     )
 
+    sess = get_session(request)
+    sess.raw_text = raw
+    sess.state = state
+    sess.gen_kwargs = dict(
+        softmax_temp=float(softmax_temp),
+        steer_strength=float(steer_strength),
+        geometric_strength=float(geometric_strength),
+    )
+    sess.last_context = raw
+
     progress(0, desc="Saving output file")
-    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
     stem = Path(in_file).stem
-    out_name = (output_name or "").strip()
-    if not out_name:
-        out_path = tmpdir / f"{stem}_generated_report.txt"
-    else:
-        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
-        out_path = tmpdir / out_name
-    out_path.write_text(report, encoding="utf-8")
-    return report, str(out_path)
+    out_path = save_report_to_tmp(report, default_stem=stem, output_name=output_name)
+
+    # also prime editor with the report
+    return report, str(out_path), report
 
 
 def generate_from_hf_dataset(
@@ -708,6 +809,7 @@ def generate_from_hf_dataset(
     text_seed: str,
     output_name: str,
     progress: gr.Progress = gr.Progress(),
+    request: gr.Request | None = None,
 ):
     if not dataset_name or not dataset_name.strip():
         raise gr.Error("Please enter a dataset name.")
@@ -733,32 +835,114 @@ def generate_from_hf_dataset(
         geometric_strength=float(geometric_strength),
     )
 
-    report = gen.generate_report(
-        raw,
+    state = gen.fit(raw, progress=progress)
+    report = gen.generate_report_from_state(
+        lm_text=raw,
+        state=state,
         n_takeaways=int(n_takeaways),
         seed=int(seed),
         text_seed=(text_seed or "").strip(),
+        prompt_text="",
         progress=progress,
     )
 
+    sess = get_session(request)
+    sess.raw_text = raw
+    sess.state = state
+    sess.gen_kwargs = dict(
+        softmax_temp=float(softmax_temp),
+        steer_strength=float(steer_strength),
+        geometric_strength=float(geometric_strength),
+    )
+    sess.last_context = raw
+
     progress(0, desc="Saving output file")
-    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
-    out_name = (output_name or "").strip()
-    if not out_name:
-        out_path = tmpdir / f"{dataset_name.replace('/', '_')}_generated_report.txt"
+    default_stem = dataset_name.replace("/", "_")
+    out_path = save_report_to_tmp(report, default_stem=default_stem, output_name=output_name)
+
+    return report, str(out_path), report
+
+
+def find_similar_context(
+    edited_text: str,
+    top_k: int,
+    request: gr.Request | None = None,
+):
+    sess = get_session(request)
+    if not sess.state:
+        raise gr.Error("No fitted model in this session yet. Generate from a file or dataset first.")
+
+    ctx, rows = retrieve_topk_chunks(sess.state, edited_text, k=int(top_k))
+    sess.last_context = ctx
+    return ctx, rows
+
+
+def generate_from_edit(
+    edited_text: str,
+    context_text: str,
+    use_context_only: bool,
+    softmax_temp: float,
+    steer_strength: float,
+    geometric_strength: float,
+    n_takeaways: int,
+    seed: int,
+    output_name: str,
+    progress: gr.Progress = gr.Progress(),
+    request: gr.Request | None = None,
+):
+    sess = get_session(request)
+    if not sess.state:
+        raise gr.Error("No fitted model in this session yet. Generate from a file or dataset first.")
+
+    gen = NeuroSymbolicTextGenerator(
+        nodelets_n=10,
+        bars_n=100,
+        svd_random_state=7,
+        softmax_temp=float(softmax_temp),
+        steer_strength=float(steer_strength),
+        lm_add_k=0.25,
+        pillar_strength=0.85,
+        pillar_floor=0.25,
+        geometric_strength=float(geometric_strength),
+    )
+
+    edited = (edited_text or "").strip()
+
+    # LM training corpus: base/context + edited text (so edit affects phrase stats)
+    if use_context_only:
+        base = (context_text or "").strip() or (sess.last_context or "").strip()
+        if not base:
+            base = sess.raw_text
     else:
-        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
-        out_path = tmpdir / out_name
-    out_path.write_text(report, encoding="utf-8")
+        base = "\n\n".join([sess.raw_text, (context_text or "").strip()]).strip()
+
+    lm_text = (base + ("\n\n" + edited if edited else "")).strip()
+
+    report = gen.generate_report_from_state(
+        lm_text=lm_text,
+        state=sess.state,          # keep the fitted neurosymbolic steering
+        n_takeaways=int(n_takeaways),
+        seed=int(seed),
+        text_seed=edited,          # soft steering
+        prompt_text=edited,        # hard prefix continuation (first takeaway)
+        progress=progress,
+    )
+
+    out_path = save_report_to_tmp(report, default_stem="edited_regen", output_name=output_name)
     return report, str(out_path)
 
 
+# ----------------------------
+# Gradio app
+# ----------------------------
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# Neurosymbolic Text Generator")
-        gr.Markdown("*TF‑IDF/SVD nodelets + quad-gram LM + geometric distance/angle modulation + Hugging Face dataset support*")
+        gr.Markdown(
+            "*TF‑IDF/SVD nodelets + quad-gram LM + geometric distance/angle modulation + HF dataset support + cosine-sim edit/generate (prompt + corpus mix)*"
+        )
 
-        with gr.Tabs() as tabs:
+        with gr.Tabs():
             with gr.Tab("Upload File"):
                 with gr.Row():
                     in_file = gr.File(
@@ -785,17 +969,20 @@ def build_app() -> gr.Blocks:
                     n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
                     seed_file = gr.Number(value=7, precision=0, label="Numeric seed")
 
-                run_btn_file = gr.Button("Generate from file", variant="primary", size="lg")
+                run_btn_file = gr.Button("Generate sample from file", variant="primary", size="lg")
 
                 with gr.Row():
-                    preview_file = gr.Textbox(label="Generated report preview", lines=20)
+                    preview_file = gr.Textbox(label="Generated report preview", lines=16)
                     download_file = gr.File(label="Download generated .txt")
 
+                edited_text_file = gr.Textbox(
+                    label="Edit text (optional) - used for cosine retrieval and regeneration prompt",
+                    lines=8,
+                    placeholder="Edit the generated report or paste a paragraph to steer regeneration.",
+                )
+
             with gr.Tab("Hugging Face Dataset"):
-                gr.Markdown("""
-                ### Load data from Hugging Face datasets
-                Browse datasets at: https://huggingface.co/datasets
-                """)
+                gr.Markdown("### Load data from Hugging Face datasets\nBrowse datasets at: https://huggingface.co/datasets")
 
                 with gr.Row():
                     with gr.Column():
@@ -851,9 +1038,67 @@ def build_app() -> gr.Blocks:
                 run_btn_hf = gr.Button("Generate from dataset", variant="primary", size="lg")
 
                 with gr.Row():
-                    preview_hf = gr.Textbox(label="Generated report preview", lines=20)
+                    preview_hf = gr.Textbox(label="Generated report preview", lines=16)
                     download_hf = gr.File(label="Download generated .txt")
 
+                edited_text_hf = gr.Textbox(
+                    label="Edit text (optional) - used for cosine retrieval and regeneration prompt",
+                    lines=8,
+                    placeholder="Edit the generated report or paste a paragraph to steer regeneration.",
+                )
+
+            with gr.Tab("Edit & Generate"):
+                gr.Markdown(
+                    "Paste a prompt, retrieve similar chunks (cosine similarity), then generate.\n"
+                    "Regeneration both (1) continues from your edit as a prompt and (2) includes the edit in the LM training corpus."
+                )
+
+                edited_text = gr.Textbox(
+                    label="Edited text / query",
+                    lines=10,
+                    placeholder="Paste your edited paragraph here (or copy from the other tabs).",
+                )
+
+                with gr.Row():
+                    top_k = gr.Slider(1, 50, value=12, step=1, label="Top-k chunks")
+                    find_btn = gr.Button("Find similar context", variant="secondary")
+
+                context_text = gr.Textbox(
+                    label="Retrieved context (top-k chunks concatenated)",
+                    lines=12,
+                )
+
+                matches = gr.Dataframe(
+                    headers=["rank", "cosine_sim", "snippet"],
+                    datatype=["number", "number", "str"],
+                    row_count=12,
+                    col_count=(3, "fixed"),
+                    label="Top matches",
+                )
+
+                with gr.Row():
+                    use_context_only = gr.Checkbox(value=True, label="Use retrieved context only (recommended)")
+                    regen_output_name = gr.Textbox(
+                        label="Output filename (optional)",
+                        placeholder="e.g., regen.txt",
+                    )
+
+                with gr.Row():
+                    softmax_temp_regen = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
+                    steer_strength_regen = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
+                    geometric_strength_regen = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
+
+                with gr.Row():
+                    n_takeaways_regen = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
+                    seed_regen = gr.Number(value=7, precision=0, label="Numeric seed")
+
+                regen_btn = gr.Button("generate", variant="primary", size="lg")
+
+                with gr.Row():
+                    regen_preview = gr.Textbox(label="generated report preview", lines=16)
+                    regen_download = gr.File(label="Download generated .txt")
+
+        # Wiring
         run_btn_file.click(
             fn=generate_from_file,
             inputs=[
@@ -864,9 +1109,9 @@ def build_app() -> gr.Blocks:
                 n_takeaways_file,
                 seed_file,
                 text_seed_file,
-                output_name_file
+                output_name_file,
             ],
-            outputs=[preview_file, download_file],
+            outputs=[preview_file, download_file, edited_text_file],
         )
 
         run_btn_hf.click(
@@ -883,9 +1128,35 @@ def build_app() -> gr.Blocks:
                 n_takeaways_hf,
                 seed_hf,
                 text_seed_hf,
-                output_name_hf
+                output_name_hf,
             ],
-            outputs=[preview_hf, download_hf],
+            outputs=[preview_hf, download_hf, edited_text_hf],
+        )
+
+        # Convenience: push edits into Edit & generate tab
+        edited_text_file.change(lambda x: x, edited_text_file, edited_text)
+        edited_text_hf.change(lambda x: x, edited_text_hf, edited_text)
+
+        find_btn.click(
+            fn=find_similar_context,
+            inputs=[edited_text, top_k],
+            outputs=[context_text, matches],
+        )
+
+        regen_btn.click(
+            fn=generate_from_edit,
+            inputs=[
+                edited_text,
+                context_text,
+                use_context_only,
+                softmax_temp_regen,
+                steer_strength_regen,
+                geometric_strength_regen,
+                n_takeaways_regen,
+                seed_regen,
+                regen_output_name,
+            ],
+            outputs=[regen_preview, regen_download],
         )
 
     return demo
