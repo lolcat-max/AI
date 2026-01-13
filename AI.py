@@ -5,6 +5,7 @@ Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
 + Vertical Pillars (ADDITIVE logit-level bias, original code retained)
 + Geometric Distance & Angle Modulation
 + Quad-gram Language Model (4-gram)
++ Recursive Feature Elimination (RFE)
 """
 from __future__ import annotations
 import re
@@ -160,6 +161,7 @@ def detokenize(tokens: List[str]) -> str:
     s = re.sub(r"\s+\)", ")", s)
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
+
 # ----------------------------
 # Neurosymbolic model pieces
 # ----------------------------
@@ -187,6 +189,7 @@ class NeuroSymbolicTextGenerator:
     - Nodelets: latent semantic factors (TF-IDF->SVD)
     - Bars: top N vocab items
     - W: bindings nodelets->bars
+    - RFE: recursive feature elimination to refine semantic space
     - Vertical pillars: ADDITIVE logit-level bias
     - Geometric modulation: distance & angle from first word
     - Takeaways: quad-gram LM steered by token boosts
@@ -203,6 +206,9 @@ class NeuroSymbolicTextGenerator:
         pillar_strength: float = 0.85,
         pillar_floor: float = 0.25,
         geometric_strength: float = 0.3,  # NEW: control geometric modulation
+        rfe_enabled: bool = True,  # NEW: enable recursive feature elimination
+        rfe_iterations: int = 3,  # NEW: number of RFE iterations
+        rfe_removal_rate: float = 0.15,  # NEW: fraction of features to remove per iteration
     ):
         self.nodelets_n = nodelets_n
         self.bars_n = bars_n
@@ -213,71 +219,78 @@ class NeuroSymbolicTextGenerator:
         self.pillar_strength = float(pillar_strength)
         self.pillar_floor = float(pillar_floor)
         self.geometric_strength = float(geometric_strength)  # NEW
-    def _quadreplex_geometric_bias(
+        self.rfe_enabled = bool(rfe_enabled)
+        self.rfe_iterations = int(rfe_iterations)
+        self.rfe_removal_rate = float(rfe_removal_rate)
+
+    def _recursive_feature_elimination(
         self,
-        W: np.ndarray,              # shape (k, bars_n)
-        energies: np.ndarray,        # shape (k,)
-        base_probs: np.ndarray,      # shape (bars_n,)
+        W: np.ndarray,
+        energies: np.ndarray,
         vocab100: List[str],
-        text_seed: str = "",
-    ) -> np.ndarray:
+        progress: Optional[gr.Progress] = None,
+    ) -> Tuple[np.ndarray, List[str], List[int]]:
         """
-        Build a 4D semantic space for bars and compute distance+angle modulation.
-        Returns geometric_bias (shape bars_n) to be added to logits.
+        Recursively eliminate the least important bars based on their contribution
+        to the overall semantic space.
+        
+        Returns:
+            - Refined W matrix with selected features
+            - Refined vocab100 list
+            - Indices of kept features (for mapping back)
         """
-
-        if self.geometric_strength <= 0.0 or len(base_probs) < 2:
-            return np.zeros_like(base_probs)
-
-        # ---- 4D "quadreplex" embedding for each bar
-        # Bar j vector in nodelet-space: v_j = energies * W[:, j]
-        # Then compress to 4 dims via top-4 nodelets (fast, stable, no extra SVD needed)
+        if not self.rfe_enabled or self.rfe_iterations <= 0:
+            return W, vocab100, list(range(len(vocab100)))
+        
         k, bars_n = W.shape
-        d = min(4, k)
-        # pick top-d energetic nodelets to define the 4D axes
-        top_axes = np.argsort(-energies)[:d]
-        V = (energies[:, None] * W)              # (k, bars_n)
-        E4 = V[top_axes, :].T                    # (bars_n, d)
-
-        # If k<4, pad to 4 for consistency (optional)
-        if d < 4:
-            pad = np.zeros((E4.shape[0], 4 - d), dtype=E4.dtype)
-            E4 = np.hstack([E4, pad])
-
-        # ---- choose reference bar (anchor)
-        # Prefer first seed word that appears inside a vocab100 phrase; otherwise use max-prob bar
-        seed_words = self._extract_seed_words(text_seed)
-        anchor_idx = int(np.argmax(base_probs))
-        if seed_words:
-            for sw in seed_words:
-                for j, term in enumerate(vocab100):
-                    if sw in term.split():
-                        anchor_idx = j
-                        break
-                else:
-                    continue
+        kept_indices = np.arange(bars_n)
+        W_current = W.copy()
+        vocab_current = list(vocab100)
+        
+        for iteration in range(self.rfe_iterations):
+            if progress:
+                progress(
+                    0.8 + 0.05 * (iteration / self.rfe_iterations),
+                    desc=f"RFE iteration {iteration + 1}/{self.rfe_iterations}"
+                )
+            
+            # Calculate feature importance scores
+            # Importance = weighted contribution across all nodelets
+            importance = np.zeros(W_current.shape[1])
+            
+            for i in range(k):
+                # Weight by nodelet energy
+                importance += energies[i] * np.abs(W_current[i, :])
+            
+            # Add variance-based importance (features with high variance are important)
+            variance_score = np.var(W_current, axis=0)
+            importance = 0.7 * importance + 0.3 * variance_score
+            
+            # Normalize importance scores
+            importance = importance / (importance.max() + 1e-12)
+            
+            # Determine how many features to remove
+            n_current = W_current.shape[1]
+            n_to_remove = max(1, int(n_current * self.rfe_removal_rate))
+            n_to_keep = n_current - n_to_remove
+            
+            # Don't eliminate too many features
+            if n_to_keep < max(10, self.bars_n // 3):
                 break
-
-        a = E4[anchor_idx]  # anchor vector (4,)
-
-        # ---- distance in 4D
-        diff = E4 - a[None, :]
-        dist = np.linalg.norm(diff, axis=1)  # (bars_n,)
-        dist = dist / (dist.max() + 1e-12)   # normalize to [0, 1]
-
-        # ---- angle in 4D (cosine similarity)
-        a_norm = np.linalg.norm(a) + 1e-12
-        e_norm = np.linalg.norm(E4, axis=1) + 1e-12
-        cos = (E4 @ a) / (e_norm * a_norm)   # [-1, 1]
-        cos01 = (cos + 1.0) * 0.5            # [0, 1]
-
-        # ---- combine into a bias (you can swap signs depending on the effect you want)
-        # Here: closer + more aligned => larger bias
-        closeness = 1.0 - dist               # [0, 1], bigger means closer
-        geom = 0.55 * closeness + 0.45 * cos01
-
-        # scale
-        return self.geometric_strength * geom
+            
+            # Select top features to keep
+            top_features = np.argsort(-importance)[:n_to_keep]
+            top_features = np.sort(top_features)  # Keep original order
+            
+            # Update matrices and vocabulary
+            W_current = W_current[:, top_features]
+            vocab_current = [vocab_current[i] for i in top_features]
+            kept_indices = kept_indices[top_features]
+        
+        if progress:
+            progress(0.85, desc=f"RFE complete: {len(vocab_current)}/{bars_n} features retained")
+        
+        return W_current, vocab_current, kept_indices.tolist()
 
 
     def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
@@ -328,6 +341,16 @@ class NeuroSymbolicTextGenerator:
         energies = np.array([n.energy for n in nodelets])
         energies /= energies.max() + 1e-12
 
+        # ---- RECURSIVE FEATURE ELIMINATION
+        W, vocab100, kept_indices = self._recursive_feature_elimination(
+            W=W,
+            energies=energies,
+            vocab100=vocab100,
+            progress=progress,
+        )
+        # Update bars_n to reflect actual number after RFE
+        actual_bars_n = W.shape[1]
+
         # ---- Base logits
         rng = np.random.default_rng(self.svd_random_state)
         base_logits = (energies[:, None] * W).sum(axis=0)
@@ -370,13 +393,10 @@ class NeuroSymbolicTextGenerator:
             
             # Combine distance and angle information
             # This creates a spatial modulation of probabilities
-            geometric_bias = self._quadreplex_geometric_bias(
-                W=W,
-                energies=energies,
-                base_probs=base_probs,
-                vocab100=vocab100,
-                text_seed="",   # you can thread text_seed into fit() if you want seed-aware geometry here
-            )
+            geometric_bias = self.geometric_strength * (norm_distances + angle_norm)
+        else:
+            geometric_bias = np.zeros_like(base_probs)
+
         # ---- Final logits/probs with geometric modulation
         logits = base_logits + pillar_bias + geometric_bias
         probs = softmax(logits, temp=self.softmax_temp)
@@ -718,6 +738,9 @@ def generate_from_file(
     softmax_temp: float,
     steer_strength: float,
     geometric_strength: float,
+    rfe_enabled: bool,
+    rfe_iterations: int,
+    rfe_removal_rate: float,
     n_takeaways: int,
     seed: int,
     text_seed: str,
@@ -739,6 +762,9 @@ def generate_from_file(
         pillar_strength=0.85,
         pillar_floor=0.25,
         geometric_strength=float(geometric_strength),
+        rfe_enabled=bool(rfe_enabled),
+        rfe_iterations=int(rfe_iterations),
+        rfe_removal_rate=float(rfe_removal_rate),
     )
 
     report = gen.generate_report(
@@ -771,6 +797,9 @@ def generate_from_hf_dataset(
     softmax_temp: float,
     steer_strength: float,
     geometric_strength: float,
+    rfe_enabled: bool,
+    rfe_iterations: int,
+    rfe_removal_rate: float,
     n_takeaways: int,
     seed: int,
     text_seed: str,
@@ -799,6 +828,9 @@ def generate_from_hf_dataset(
         pillar_strength=0.85,
         pillar_floor=0.25,
         geometric_strength=float(geometric_strength),
+        rfe_enabled=bool(rfe_enabled),
+        rfe_iterations=int(rfe_iterations),
+        rfe_removal_rate=float(rfe_removal_rate),
     )
 
     report = gen.generate_report(
@@ -824,7 +856,7 @@ def generate_from_hf_dataset(
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# Neurosymbolic Text Generator")
-        gr.Markdown("*TF‑IDF/SVD nodelets + quad-gram LM + geometric distance/angle modulation + Hugging Face dataset support*")
+        gr.Markdown("*TF‑IDF/SVD nodelets + RFE + quad-gram LM + geometric distance/angle modulation + Hugging Face dataset support*")
 
         with gr.Tabs() as tabs:
             with gr.Tab("Upload File"):
@@ -848,6 +880,11 @@ def build_app() -> gr.Blocks:
                     softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
                     geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
+
+                with gr.Row():
+                    rfe_enabled_file = gr.Checkbox(value=True, label="Enable RFE")
+                    rfe_iterations_file = gr.Slider(1, 10, value=3, step=1, label="RFE iterations")
+                    rfe_removal_rate_file = gr.Slider(0.05, 0.5, value=0.15, step=0.05, label="RFE removal rate")
 
                 with gr.Row():
                     n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
@@ -913,6 +950,11 @@ def build_app() -> gr.Blocks:
                     geometric_strength_hf = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
 
                 with gr.Row():
+                    rfe_enabled_hf = gr.Checkbox(value=True, label="Enable RFE")
+                    rfe_iterations_hf = gr.Slider(1, 10, value=3, step=1, label="RFE iterations")
+                    rfe_removal_rate_hf = gr.Slider(0.05, 0.5, value=0.15, step=0.05, label="RFE removal rate")
+
+                with gr.Row():
                     n_takeaways_hf = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
                     seed_hf = gr.Number(value=7, precision=0, label="Numeric seed")
 
@@ -929,6 +971,9 @@ def build_app() -> gr.Blocks:
                 softmax_temp_file,
                 steer_strength_file,
                 geometric_strength_file,
+                rfe_enabled_file,
+                rfe_iterations_file,
+                rfe_removal_rate_file,
                 n_takeaways_file,
                 seed_file,
                 text_seed_file,
@@ -948,6 +993,9 @@ def build_app() -> gr.Blocks:
                 softmax_temp_hf,
                 steer_strength_hf,
                 geometric_strength_hf,
+                rfe_enabled_hf,
+                rfe_iterations_hf,
+                rfe_removal_rate_hf,
                 n_takeaways_hf,
                 seed_hf,
                 text_seed_hf,
