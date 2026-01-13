@@ -4,6 +4,7 @@
 Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
 + Vertical Pillars (ADDITIVE logit-level bias, original code retained)
 + Geometric Distance & Angle Modulation
++ Quad-gram Language Model (4-gram)
 """
 from __future__ import annotations
 import re
@@ -189,7 +190,7 @@ class NeuroSymbolicTextGenerator:
     - W: bindings nodelets->bars
     - Vertical pillars: ADDITIVE logit-level bias
     - Geometric modulation: distance & angle from first word
-    - Takeaways: trigram LM steered by token boosts
+    - Takeaways: quad-gram LM steered by token boosts
     """
 
     def __init__(
@@ -201,8 +202,8 @@ class NeuroSymbolicTextGenerator:
         steer_strength: float = 1.35,
         lm_add_k: float = 0.25,
         pillar_strength: float = 0.85,
-        pillar_floor: float = 0.15,
-        geometric_strength: float = 0.9,  # NEW: control geometric modulation
+        pillar_floor: float = 0.25,
+        geometric_strength: float = 0.3,  # NEW: control geometric modulation
     ):
         self.nodelets_n = nodelets_n
         self.bars_n = bars_n
@@ -410,14 +411,15 @@ class NeuroSymbolicTextGenerator:
 
     def _sample_next(
         self,
-        lm: 'TrigramLM',
+        lm: 'QuadgramLM',
         w1: str,
         w2: str,
+        w3: str,
         token_boost: Dict[str, float],
         rng: np.random.Generator,
         temperature: float = 0.95,
     ) -> str:
-        cand, base_p = lm.next_distribution(w1, w2)
+        cand, base_p = lm.next_distribution(w1, w2, w3)
         scores = np.log(base_p + 1e-12)
         for i, w in enumerate(cand):
             if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
@@ -431,7 +433,7 @@ class NeuroSymbolicTextGenerator:
 
     def _choose_start_word(
         self,
-        lm: 'TrigramLM',
+        lm: 'QuadgramLM',
         token_boost: Dict[str, float],
         rng: np.random.Generator,
         seed_words: List[str],
@@ -447,7 +449,7 @@ class NeuroSymbolicTextGenerator:
 
     def _generate_sentence(
         self,
-        lm: 'TrigramLM',
+        lm: 'QuadgramLM',
         token_boost: Dict[str, float],
         rng: np.random.Generator,
         seed_words: Optional[List[str]] = None,
@@ -458,13 +460,18 @@ class NeuroSymbolicTextGenerator:
         seed = self._choose_start_word(lm, token_boost, rng, seed_words)
         tokens = ["("] if rng.random() < 0.12 else []
         tokens.append(seed)
+        
+        # Initialize 3-word context for quad-grams
         w1 = tokens[-1]
         w2 = tokens[-1]
+        w3 = tokens[-1]
+        
         target_len = int(rng.integers(min_len, max_len + 1))
         for _ in range(target_len):
-            nxt = self._sample_next(lm, w1, w2, token_boost, rng)
+            nxt = self._sample_next(lm, w1, w2, w3, token_boost, rng)
             tokens.append(nxt)
-            w1, w2 = w2, nxt
+            # Shift context window
+            w1, w2, w3 = w2, w3, nxt
             if nxt in [".", "!", "?"] and len([t for t in tokens if re.match(r"[a-z]", t)]) >= min_len:
                 break
         if tokens and tokens[-1] not in [".", "!", "?"]:
@@ -490,7 +497,7 @@ class NeuroSymbolicTextGenerator:
         tokens = basic_tokenize(text)
         if len(tokens) < 600:
             tokens = tokens * 2
-        lm = TrigramLM(add_k=self.lm_add_k)
+        lm = QuadgramLM(add_k=self.lm_add_k)
         lm.fit(tokens)
 
         seed_words = self._extract_seed_words(text_seed)
@@ -543,12 +550,14 @@ class NeuroSymbolicTextGenerator:
         return "\n\n".join(takeaways)
 
 
-class TrigramLM:
+class QuadgramLM:
+    """4-gram language model with add-k smoothing"""
     def __init__(self, add_k: float = 0.25):
         self.add_k = add_k
         self.uni: Dict[str, int] = {}
         self.bi: Dict[Tuple[str, str], int] = {}
         self.tri: Dict[Tuple[str, str, str], int] = {}
+        self.quad: Dict[Tuple[str, str, str, str], int] = {}
         self.vocab: List[str] = []
         self.total: int = 0
 
@@ -556,6 +565,7 @@ class TrigramLM:
         self.uni.clear()
         self.bi.clear()
         self.tri.clear()
+        self.quad.clear()
         self.total = 0
 
         def inc(d, key, val=1):
@@ -568,6 +578,8 @@ class TrigramLM:
             inc(self.bi, (tokens[i], tokens[i + 1]))
         for i in range(len(tokens) - 2):
             inc(self.tri, (tokens[i], tokens[i + 1], tokens[i + 2]))
+        for i in range(len(tokens) - 3):
+            inc(self.quad, (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3]))
         self.vocab = list(self.uni.keys())
 
     def _prob_unigram(self, w: str) -> float:
@@ -586,17 +598,37 @@ class TrigramLM:
         c123 = self.tri.get((w1, w2, w3), 0)
         return (c123 + self.add_k) / (c12 + self.add_k * V) if c12 > 0 else self._prob_bigram(w2, w3)
 
-    def next_distribution(self, w1: str, w2: str) -> Tuple[List[str], np.ndarray]:
+    def _prob_quadgram(self, w1: str, w2: str, w3: str, w4: str) -> float:
+        V = len(self.vocab) + 1
+        c123 = self.tri.get((w1, w2, w3), 0)
+        c1234 = self.quad.get((w1, w2, w3, w4), 0)
+        return (c1234 + self.add_k) / (c123 + self.add_k * V) if c123 > 0 else self._prob_trigram(w2, w3, w4)
+
+    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], np.ndarray]:
+        """Get next word distribution given 3-word context (for 4-gram model)"""
         cont: List[str] = []
-        for (a, b, c), _count in self.tri.items():
-            if a == w1 and b == w2:
-                cont.append(c)
+        
+        # Try quad-grams first
+        for (a, b, c, d), _count in self.quad.items():
+            if a == w1 and b == w2 and c == w3:
+                cont.append(d)
+        
+        # Fall back to trigrams
+        if not cont:
+            for (a, b, c), _count in self.tri.items():
+                if a == w2 and b == w3:
+                    cont.append(c)
+        
+        # Fall back to bigrams
         if not cont:
             for (a, b), _count in self.bi.items():
-                if a == w2:
+                if a == w3:
                     cont.append(b)
+        
+        # Fall back to most common words
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
+        
         seen = set()
         cand = []
         for w in cont:
@@ -604,7 +636,8 @@ class TrigramLM:
                 seen.add(w)
                 cand.append(w)
         cand = cand[:500]
-        probs = np.array([self._prob_trigram(w1, w2, w) for w in cand], dtype=float)
+        
+        probs = np.array([self._prob_quadgram(w1, w2, w3, w) for w in cand], dtype=float)
         probs = probs / (probs.sum() + 1e-12)
         return cand, probs
 
@@ -723,7 +756,7 @@ def generate_from_hf_dataset(
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# Neurosymbolic Text Generator")
-        gr.Markdown("*TF‑IDF/SVD nodelets + trigram LM + geometric distance/angle modulation + Hugging Face dataset support*")
+        gr.Markdown("*TF‑IDF/SVD nodelets + quad-gram LM + geometric distance/angle modulation + Hugging Face dataset support*")
 
         with gr.Tabs() as tabs:
             with gr.Tab("Upload File"):
@@ -746,7 +779,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
-                    geometric_strength_file = gr.Slider(0.0, 2.0, value=0.9, step=0.05, label="Geometric strength")
+                    geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
 
                 with gr.Row():
                     n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
