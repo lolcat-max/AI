@@ -160,7 +160,6 @@ def detokenize(tokens: List[str]) -> str:
     s = re.sub(r"\s+\)", ")", s)
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
-
 # ----------------------------
 # Neurosymbolic model pieces
 # ----------------------------
@@ -214,6 +213,72 @@ class NeuroSymbolicTextGenerator:
         self.pillar_strength = float(pillar_strength)
         self.pillar_floor = float(pillar_floor)
         self.geometric_strength = float(geometric_strength)  # NEW
+    def _quadreplex_geometric_bias(
+        self,
+        W: np.ndarray,              # shape (k, bars_n)
+        energies: np.ndarray,        # shape (k,)
+        base_probs: np.ndarray,      # shape (bars_n,)
+        vocab100: List[str],
+        text_seed: str = "",
+    ) -> np.ndarray:
+        """
+        Build a 4D semantic space for bars and compute distance+angle modulation.
+        Returns geometric_bias (shape bars_n) to be added to logits.
+        """
+
+        if self.geometric_strength <= 0.0 or len(base_probs) < 2:
+            return np.zeros_like(base_probs)
+
+        # ---- 4D "quadreplex" embedding for each bar
+        # Bar j vector in nodelet-space: v_j = energies * W[:, j]
+        # Then compress to 4 dims via top-4 nodelets (fast, stable, no extra SVD needed)
+        k, bars_n = W.shape
+        d = min(4, k)
+        # pick top-d energetic nodelets to define the 4D axes
+        top_axes = np.argsort(-energies)[:d]
+        V = (energies[:, None] * W)              # (k, bars_n)
+        E4 = V[top_axes, :].T                    # (bars_n, d)
+
+        # If k<4, pad to 4 for consistency (optional)
+        if d < 4:
+            pad = np.zeros((E4.shape[0], 4 - d), dtype=E4.dtype)
+            E4 = np.hstack([E4, pad])
+
+        # ---- choose reference bar (anchor)
+        # Prefer first seed word that appears inside a vocab100 phrase; otherwise use max-prob bar
+        seed_words = self._extract_seed_words(text_seed)
+        anchor_idx = int(np.argmax(base_probs))
+        if seed_words:
+            for sw in seed_words:
+                for j, term in enumerate(vocab100):
+                    if sw in term.split():
+                        anchor_idx = j
+                        break
+                else:
+                    continue
+                break
+
+        a = E4[anchor_idx]  # anchor vector (4,)
+
+        # ---- distance in 4D
+        diff = E4 - a[None, :]
+        dist = np.linalg.norm(diff, axis=1)  # (bars_n,)
+        dist = dist / (dist.max() + 1e-12)   # normalize to [0, 1]
+
+        # ---- angle in 4D (cosine similarity)
+        a_norm = np.linalg.norm(a) + 1e-12
+        e_norm = np.linalg.norm(E4, axis=1) + 1e-12
+        cos = (E4 @ a) / (e_norm * a_norm)   # [-1, 1]
+        cos01 = (cos + 1.0) * 0.5            # [0, 1]
+
+        # ---- combine into a bias (you can swap signs depending on the effect you want)
+        # Here: closer + more aligned => larger bias
+        closeness = 1.0 - dist               # [0, 1], bigger means closer
+        geom = 0.55 * closeness + 0.45 * cos01
+
+        # scale
+        return self.geometric_strength * geom
+
 
     def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
         if progress:
@@ -305,10 +370,13 @@ class NeuroSymbolicTextGenerator:
             
             # Combine distance and angle information
             # This creates a spatial modulation of probabilities
-            geometric_bias = self.geometric_strength * (norm_distances + angle_norm)
-        else:
-            geometric_bias = np.zeros_like(base_probs)
-
+            geometric_bias = self._quadreplex_geometric_bias(
+                W=W,
+                energies=energies,
+                base_probs=base_probs,
+                vocab100=vocab100,
+                text_seed="",   # you can thread text_seed into fit() if you want seed-aware geometry here
+            )
         # ---- Final logits/probs with geometric modulation
         logits = base_logits + pillar_bias + geometric_bias
         probs = softmax(logits, temp=self.softmax_temp)
