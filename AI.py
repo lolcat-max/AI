@@ -1092,7 +1092,7 @@ def build_app() -> gr.Blocks:
                     n_takeaways_regen = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
                     seed_regen = gr.Number(value=7, precision=0, label="Numeric seed")
 
-                regen_btn = gr.Button("generate", variant="primary", size="lg")
+                regen_btn = gr.Button("Generate", variant="primary", size="lg")
 
                 with gr.Row():
                     regen_preview = gr.Textbox(label="generated report preview", lines=16)
