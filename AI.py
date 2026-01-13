@@ -5,7 +5,7 @@ Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
 + Vertical Pillars (ADDITIVE logit-level bias)
 + Geometric Distance & Angle Modulation
 + Quad-gram Language Model (4-gram)
-+ Cosine similarity edit->retrieve context->generate workflow
++ Cosine similarity edit->retrieve context->regenerate workflow
 + Regen uses edited text as prompt (prefix continuation) AND mixes edit into LM corpus
 """
 
@@ -877,7 +877,7 @@ def find_similar_context(
     return ctx, rows
 
 
-def generate_from_edit(
+def regenerate_from_edit(
     edited_text: str,
     context_text: str,
     use_context_only: bool,
@@ -939,7 +939,7 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# Neurosymbolic Text Generator")
         gr.Markdown(
-            "*TF‑IDF/SVD nodelets + quad-gram LM + geometric distance/angle modulation + HF dataset support + cosine-sim edit/generate (prompt + corpus mix)*"
+            "*TF‑IDF/SVD nodelets + quad-gram LM + geometric distance/angle modulation + HF dataset support + cosine-sim edit/regenerate (prompt + corpus mix)*"
         )
 
         with gr.Tabs():
@@ -1133,7 +1133,7 @@ def build_app() -> gr.Blocks:
             outputs=[preview_hf, download_hf, edited_text_hf],
         )
 
-        # Convenience: push edits into Edit & generate tab
+        # Convenience: push edits into Edit & Regenerate tab
         edited_text_file.change(lambda x: x, edited_text_file, edited_text)
         edited_text_hf.change(lambda x: x, edited_text_hf, edited_text)
 
@@ -1144,7 +1144,7 @@ def build_app() -> gr.Blocks:
         )
 
         regen_btn.click(
-            fn=generate_from_edit,
+            fn=regenerate_from_edit,
             inputs=[
                 edited_text,
                 context_text,
