@@ -1,37 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
-+ Vertical Pillars (Diagonal Top-Prob Weighting)
-
-Install:
-  pip install numpy scikit-learn gradio datasets tqdm
-
-Optional (for file types):
-  pip install python-docx
-  pip install pypdf
-
-Run:
-  python neurosymbolic_textgen_hf.py
++ Vertical Pillars (ADDITIVE logit-level bias, original code retained)
++ Geometric Distance & Angle Modulation
 """
-
 from __future__ import annotations
-
 import re
 import math
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-
 import numpy as np
 import gradio as gr
 from tqdm.auto import tqdm
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
-
 
 # ----------------------------
 # File loading
@@ -40,33 +25,18 @@ def load_text(path: str) -> str:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
-
     ext = p.suffix.lower()
-
     if ext in [".txt", ".md"]:
         return p.read_text(encoding="utf-8", errors="replace")
-
     if ext == ".docx":
-        try:
-            import docx  # python-docx
-        except Exception as e:
-            raise RuntimeError("Reading .docx requires: pip install python-docx") from e
+        import docx
         d = docx.Document(str(p))
         return "\n".join([para.text for para in d.paragraphs])
-
     if ext == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except Exception as e:
-            raise RuntimeError("Reading .pdf requires: pip install pypdf") from e
+        from pypdf import PdfReader
         reader = PdfReader(str(p))
-        parts = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n".join(parts)
-
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     raise ValueError(f"Unsupported file extension: {ext}")
-
 
 def load_hf_dataset(
     dataset_name: str,
@@ -76,87 +46,62 @@ def load_hf_dataset(
     max_samples: Optional[int] = None,
     progress: Optional[gr.Progress] = None,
 ) -> str:
-    """
-    Load text from a Hugging Face dataset.
-    """
+    """Load text from a Hugging Face dataset."""
     try:
         from datasets import load_dataset
-    except ImportError as e:
-        raise RuntimeError("Loading HF datasets requires: pip install datasets") from e
-
+    except ImportError:
+        raise ImportError("Please install datasets: pip install datasets")
+    
     if progress:
         progress(0, desc=f"Loading dataset: {dataset_name}")
-
-    try:
-        if config_name and config_name.strip():
-            dataset = load_dataset(dataset_name, config_name.strip(), split=split, trust_remote_code=True)
-        else:
-            dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
-    except Exception as e:
-        error_msg = str(e)
-        if "Config name is missing" in error_msg or "available configs" in error_msg:
-            raise RuntimeError(
-                f"Dataset '{dataset_name}' requires a config name. {error_msg}\n"
-                f"Please specify a config in the 'Config/Subset' field."
-            ) from e
-        raise RuntimeError(f"Failed to load dataset '{dataset_name}': {error_msg}") from e
-
+    
+    # Load dataset
+    if config_name:
+        ds = load_dataset(dataset_name, config_name, split=split)
+    else:
+        ds = load_dataset(dataset_name, split=split)
+    
     # Auto-detect text column if not specified
     if text_column is None:
-        common_text_columns = ["text", "content", "article", "document", "passage", "sentence"]
-        for col in common_text_columns:
-            if col in dataset.column_names:
-                text_column = col
+        text_candidates = ["text", "article", "content", "document", "context", "sentence"]
+        for candidate in text_candidates:
+            if candidate in ds.column_names:
+                text_column = candidate
                 break
-
         if text_column is None:
-            for col in dataset.column_names:
-                feat = dataset.features.get(col)
-                if hasattr(feat, "dtype") and feat.dtype == "string":
-                    text_column = col
-                    break
-
-        if text_column is None:
-            raise ValueError(f"Could not auto-detect text column. Available columns: {dataset.column_names}")
-
-    if text_column not in dataset.column_names:
-        raise ValueError(f"Column '{text_column}' not found. Available: {dataset.column_names}")
-
-    num_samples = len(dataset) if max_samples is None else min(max_samples, len(dataset))
+            text_column = ds.column_names[0]
+    
+    if text_column not in ds.column_names:
+        raise ValueError(f"Column '{text_column}' not found. Available: {ds.column_names}")
+    
+    # Extract text
+    if max_samples and max_samples > 0:
+        ds = ds.select(range(min(max_samples, len(ds))))
+    
+    if progress:
+        progress(0.5, desc="Extracting text from dataset")
+    
     texts = []
-
-    if progress:
-        progress(0.1, desc=f"Extracting {num_samples} samples")
-
-    for i in tqdm(range(num_samples), desc=f"Loading {dataset_name}", disable=progress is None):
-        sample = dataset[i]
-        text = sample.get(text_column, "")
-        if text and isinstance(text, str):
+    for item in ds:
+        text = item[text_column]
+        if isinstance(text, str) and text.strip():
             texts.append(text.strip())
-
-        if progress and i % max(1, num_samples // 20) == 0:
-            progress(0.1 + 0.5 * (i / num_samples), desc=f"Loaded {i}/{num_samples} samples")
-
-    if progress:
-        progress(0.7, desc="Concatenating text")
-
-    combined_text = "\n\n".join(texts)
-
+    
+    combined = "\n\n".join(texts)
+    
     if progress:
         progress(1.0, desc="Dataset loaded successfully")
-
-    return combined_text
-
+    
+    return combined
 
 # ----------------------------
 # Text utilities
 # ----------------------------
 STOPWORDS = set("""
-a an and are as at be by for from has have he her hers him his i in is it its
-me my of on or our ours she so that the their them they this to was we were
-what when where which who will with you your yours
+a an and are as at be by for from has have he her hers him his i in is it its me my
+of on or our ours she so that the their them they this to was we were what when where
+which who will with you your yours
 """.split())
-
 
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -164,22 +109,18 @@ def normalize(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
 def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     x = x.astype(float) / max(temp, 1e-12)
     x = x - np.max(x)
     ex = np.exp(x)
     return ex / (np.sum(ex) + 1e-12)
 
-
 def entropy(p: np.ndarray) -> float:
     p = np.asarray(p, dtype=float)
     return float(-np.sum(p * np.log(p + 1e-12)))
 
-
 def clip01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
-
 
 # ----------------------------
 # Tokenization + simple trigram LM
@@ -194,7 +135,6 @@ def basic_tokenize(text: str) -> List[str]:
         else:
             out.append(t)
     return out
-
 
 def detokenize(tokens: List[str]) -> str:
     out = []
@@ -214,86 +154,11 @@ def detokenize(tokens: List[str]) -> str:
                 out[-1] = out[-1] + t
             else:
                 out.append(t)
-
     s = " ".join(out)
     s = re.sub(r"\(\s+", "(", s)
     s = re.sub(r"\s+\)", ")", s)
     s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
-
-
-class TrigramLM:
-    def __init__(self, add_k: float = 0.25):
-        self.add_k = add_k
-        self.uni: Dict[str, int] = {}
-        self.bi: Dict[Tuple[str, str], int] = {}
-        self.tri: Dict[Tuple[str, str, str], int] = {}
-        self.vocab: List[str] = []
-        self.total: int = 0
-
-    def fit(self, tokens: List[str]) -> None:
-        self.uni.clear()
-        self.bi.clear()
-        self.tri.clear()
-        self.total = 0
-
-        def inc(d, key, val=1):
-            d[key] = d.get(key, 0) + val
-
-        for t in tokens:
-            inc(self.uni, t)
-            self.total += 1
-
-        for i in range(len(tokens) - 1):
-            inc(self.bi, (tokens[i], tokens[i + 1]))
-
-        for i in range(len(tokens) - 2):
-            inc(self.tri, (tokens[i], tokens[i + 1], tokens[i + 2]))
-
-        self.vocab = list(self.uni.keys())
-
-    def _prob_unigram(self, w: str) -> float:
-        V = len(self.vocab) + 1
-        return (self.uni.get(w, 0) + self.add_k) / (self.total + self.add_k * V)
-
-    def _prob_bigram(self, w1: str, w2: str) -> float:
-        V = len(self.vocab) + 1
-        c1 = self.uni.get(w1, 0)
-        c12 = self.bi.get((w1, w2), 0)
-        return (c12 + self.add_k) / (c1 + self.add_k * V) if c1 > 0 else self._prob_unigram(w2)
-
-    def _prob_trigram(self, w1: str, w2: str, w3: str) -> float:
-        V = len(self.vocab) + 1
-        c12 = self.bi.get((w1, w2), 0)
-        c123 = self.tri.get((w1, w2, w3), 0)
-        return (c123 + self.add_k) / (c12 + self.add_k * V) if c12 > 0 else self._prob_bigram(w2, w3)
-
-    def next_distribution(self, w1: str, w2: str) -> Tuple[List[str], np.ndarray]:
-        cont: List[str] = []
-        for (a, b, c), _count in self.tri.items():
-            if a == w1 and b == w2:
-                cont.append(c)
-
-        if not cont:
-            for (a, b), _count in self.bi.items():
-                if a == w2:
-                    cont.append(b)
-
-        if not cont:
-            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
-
-        seen = set()
-        cand = []
-        for w in cont:
-            if w not in seen:
-                seen.add(w)
-                cand.append(w)
-
-        cand = cand[:500]
-        probs = np.array([self._prob_trigram(w1, w2, w) for w in cand], dtype=float)
-        probs = probs / (probs.sum() + 1e-12)
-        return cand, probs
-
 
 # ----------------------------
 # Neurosymbolic model pieces
@@ -305,7 +170,6 @@ class Nodelet:
     energy: float
     narrative: str
 
-
 @dataclass
 class ModelState:
     nodelets: List[Nodelet]
@@ -315,7 +179,7 @@ class ModelState:
     bar_logits: np.ndarray
     token_boost: Dict[str, float]
     pillar_weights: np.ndarray
-
+    geometric_bias: np.ndarray  # NEW: geometric modulation
 
 class NeuroSymbolicTextGenerator:
     """
@@ -323,7 +187,8 @@ class NeuroSymbolicTextGenerator:
     - Nodelets: latent semantic factors (TF-IDF->SVD)
     - Bars: top N vocab items
     - W: bindings nodelets->bars
-    - Vertical pillars: diagonal top-prob weighting applied to W columns (feature-wise reinforcement)
+    - Vertical pillars: ADDITIVE logit-level bias
+    - Geometric modulation: distance & angle from first word
     - Takeaways: trigram LM steered by token boosts
     """
 
@@ -335,9 +200,9 @@ class NeuroSymbolicTextGenerator:
         softmax_temp: float = 0.85,
         steer_strength: float = 1.35,
         lm_add_k: float = 0.25,
-        # Pillars (subversive by default; set pillar_strength=0.0 to disable)
         pillar_strength: float = 0.85,
-        pillar_floor: float = 0.25,
+        pillar_floor: float = 0.15,
+        geometric_strength: float = 0.9,  # NEW: control geometric modulation
     ):
         self.nodelets_n = nodelets_n
         self.bars_n = bars_n
@@ -345,9 +210,120 @@ class NeuroSymbolicTextGenerator:
         self.softmax_temp = softmax_temp
         self.steer_strength = steer_strength
         self.lm_add_k = lm_add_k
-
         self.pillar_strength = float(pillar_strength)
         self.pillar_floor = float(pillar_floor)
+        self.geometric_strength = float(geometric_strength)  # NEW
+
+    def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
+        if progress:
+            progress(0, desc="Normalizing text")
+        text = normalize(text)
+        chunks = self._chunk_text(text)
+
+        if progress:
+            progress(0.2, desc="Computing TF-IDF vectors")
+        vec = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            max_features=8000,
+            ngram_range=(1, 2),
+        )
+        X = vec.fit_transform(chunks)
+        vocab = np.array(vec.get_feature_names_out())
+        global_mass = np.asarray(X.sum(axis=0)).ravel()
+        top_idx = np.argsort(-global_mass)[: self.bars_n]
+        vocab100 = vocab[top_idx].tolist()
+
+        if progress:
+            progress(0.4, desc="Performing SVD decomposition")
+        k = min(self.nodelets_n, max(2, X.shape[0] - 1), max(2, X.shape[1] - 1))
+        svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
+        svd.fit(X)
+
+        nodelets = []
+        for i, comp in enumerate(svd.components_):
+            term_idx = np.argsort(-np.abs(comp))[:20]
+            terms = [(vocab[j], float(comp[j])) for j in term_idx]
+            energy = float(np.linalg.norm(comp))
+            narrative = self._nodelet_narrative(i, terms, energy)
+            nodelets.append(Nodelet(i, terms, energy, narrative))
+
+        if progress:
+            progress(0.8, desc="Building bindings matrix")
+        W = np.zeros((k, self.bars_n))
+        for i, n in enumerate(nodelets):
+            weights = {t: abs(w) for t, w in n.top_terms}
+            for j, term in enumerate(vocab100):
+                W[i, j] = weights.get(term, 0.0)
+            mx = W[i].max()
+            if mx > 1e-12:
+                W[i] /= mx
+
+        energies = np.array([n.energy for n in nodelets])
+        energies /= energies.max() + 1e-12
+
+        # ---- Base logits
+        rng = np.random.default_rng(self.svd_random_state)
+        base_logits = (energies[:, None] * W).sum(axis=0)
+        base_logits += 0.02 * rng.normal(size=base_logits.shape)
+        base_probs = softmax(base_logits, temp=self.softmax_temp)
+
+        # ---- ADDITIVE PILLARS (external field)
+        if self.pillar_strength > 0.0:
+            pnorm = base_probs / (base_probs.max() + 1e-12)
+            pillar_bias = self.pillar_strength * pnorm
+        else:
+            pillar_bias = np.zeros_like(base_probs)
+
+        # ---- GEOMETRIC DISTANCE & ANGLE MODULATION
+        # Treat probabilities as vectors in high-dimensional space
+        # Compute distance from each probability to the first word's probability
+        if len(base_probs) > 1 and self.geometric_strength > 0.0:
+            # Create position vectors (using index as spatial coordinate)
+            positions = np.arange(len(base_probs)).astype(float)
+            
+            # Distance from first word (index 0)
+            distances = np.abs(positions - positions[0])
+            # Normalize distances to [0, 1]
+            max_dist = distances.max()
+            if max_dist > 1e-12:
+                norm_distances = distances / max_dist
+            else:
+                norm_distances = distances
+            
+            # Compute angle-like features based on probability magnitude differences
+            # Vector from first prob to each prob
+            prob_vectors = base_probs - base_probs[0]
+            
+            # Compute angles using arctan2-style computation
+            # Using position as x-axis and probability difference as y-axis
+            angles = np.arctan2(prob_vectors, norm_distances + 1e-12)
+            
+            # Normalize angles to [0, 1] range
+            angle_norm = (angles - angles.min()) / (angles.max() - angles.min() + 1e-12)
+            
+            # Combine distance and angle information
+            # This creates a spatial modulation of probabilities
+            geometric_bias = self.geometric_strength * (norm_distances + angle_norm)
+        else:
+            geometric_bias = np.zeros_like(base_probs)
+
+        # ---- Final logits/probs with geometric modulation
+        logits = base_logits + pillar_bias + geometric_bias
+        probs = softmax(logits, temp=self.softmax_temp)
+
+        token_boost = self._make_token_boost(vocab100, probs, nodelets, pillar_bias)
+
+        return ModelState(
+            nodelets=nodelets,
+            vocab100=vocab100,
+            binding_W=W,
+            bar_probs=probs,
+            bar_logits=logits,
+            token_boost=token_boost,
+            pillar_weights=pillar_bias,
+            geometric_bias=geometric_bias,  # NEW
+        )
 
     def _chunk_text(self, text: str) -> List[str]:
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 120]
@@ -364,126 +340,6 @@ class NeuroSymbolicTextGenerator:
                 blocks.append(blk)
         return blocks or [text2[:800]]
 
-    def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
-        if progress:
-            progress(0, desc="Normalizing text")
-
-        text = normalize(text)
-
-        text_len = len(text)
-        word_count = len(text.split())
-
-        chunks = self._chunk_text(text)
-        if not chunks or len(" ".join(chunks).strip()) < 250:
-            raise ValueError(
-                f"Not enough readable text to analyze.\n"
-                f"Text length: {text_len} characters, ~{word_count} words\n"
-                f"Required: At least 250 characters of substantive text.\n"
-                f"Suggestion: Load more samples or choose a different dataset/text column."
-            )
-
-        if progress:
-            progress(0.2, desc="Computing TF-IDF vectors")
-
-        vec = TfidfVectorizer(
-            lowercase=True,
-            stop_words="english",
-            max_features=8000,
-            ngram_range=(1, 2),
-        )
-        X = vec.fit_transform(chunks)
-        vocab = np.array(vec.get_feature_names_out())
-
-        global_mass = np.asarray(X.sum(axis=0)).ravel()
-        top_idx = np.argsort(-global_mass)[: self.bars_n]
-        vocab100 = vocab[top_idx].tolist()
-
-        if progress:
-            progress(0.4, desc="Performing SVD decomposition")
-
-        k = min(self.nodelets_n, max(2, X.shape[0] - 1), max(2, X.shape[1] - 1))
-        svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
-        svd.fit(X)
-        components = svd.components_
-
-        if progress:
-            progress(0.6, desc="Creating nodelets")
-
-        nodelets: List[Nodelet] = []
-        for i in range(k):
-            comp = components[i]
-            term_idx = np.argsort(-np.abs(comp))[:20]
-            terms = [(vocab[j], float(comp[j])) for j in term_idx]
-            energy = float(np.linalg.norm(comp))
-            narrative = self._nodelet_narrative(i, terms, energy)
-            nodelets.append(Nodelet(idx=i, top_terms=terms, energy=energy, narrative=narrative))
-
-        if progress:
-            progress(0.8, desc="Building bindings matrix")
-
-        W = np.zeros((k, self.bars_n), dtype=float)
-        for i in range(k):
-            weights = {t: abs(w) for t, w in nodelets[i].top_terms}
-            for b, term in enumerate(vocab100):
-                base = weights.get(term, 0.0)
-                if base == 0.0:
-                    toks = set(term.split())
-                    near = 0.0
-                    for tt, ww in weights.items():
-                        if toks & set(tt.split()):
-                            near = max(near, 0.35 * ww)
-                    base = near
-                W[i, b] = base
-
-            mx = W[i].max()
-            if mx > 1e-12:
-                W[i] /= mx
-
-        energies = np.array([n.energy for n in nodelets], dtype=float)
-        energies = energies / (energies.max() + 1e-12)
-
-        # ---- Base logits/probs (before pillars)
-        base_logits = (energies.reshape(-1, 1) * W).sum(axis=0)
-
-        rng = np.random.default_rng(self.svd_random_state)
-        base_logits = base_logits + 0.02 * rng.normal(size=base_logits.shape)
-        base_probs = softmax(base_logits, temp=self.softmax_temp)
-
-        # ---- Vertical pillars: diagonal top-prob weighting applied to columns
-        # pillar_weights acts like diag(pillar_weights) multiplying bar features.
-        # Efficient implementation: column-wise scaling of W.
-        if self.pillar_strength > 0.0:
-            pnorm = base_probs / (base_probs.max() + 1e-12)
-            pillar_weights = self.pillar_floor + self.pillar_strength * pnorm
-            pillar_weights = np.clip(pillar_weights, 0.0, 3.0)
-        else:
-            pillar_weights = np.ones_like(base_probs, dtype=float)
-
-        W_pillared = W * pillar_weights.reshape(1, -1)
-
-        # ---- Final logits/probs (after pillars)
-        logits = (energies.reshape(-1, 1) * W_pillared).sum(axis=0)
-        logits = logits + 0.02 * rng.normal(size=logits.shape)
-        probs = softmax(logits, temp=self.softmax_temp)
-
-        if progress:
-            progress(0.9, desc="Computing token boosts")
-
-        token_boost = self._make_token_boost(vocab100, probs, nodelets, pillar_weights)
-
-        if progress:
-            progress(1.0, desc="Model fitted")
-
-        return ModelState(
-            nodelets=nodelets,
-            vocab100=vocab100,
-            binding_W=W_pillared,
-            bar_probs=probs,
-            bar_logits=logits,
-            token_boost=token_boost,
-            pillar_weights=pillar_weights,
-        )
-
     def _make_token_boost(
         self,
         vocab100: List[str],
@@ -492,20 +348,18 @@ class NeuroSymbolicTextGenerator:
         pillar_weights: np.ndarray,
     ) -> Dict[str, float]:
         boost: Dict[str, float] = {}
-
         # Base boost from bars + pillar emphasis
         for idx, (term, p) in enumerate(zip(vocab100, bar_probs)):
             pw = float(pillar_weights[idx]) if idx < len(pillar_weights) else 1.0
             for w in term.split():
                 if len(w) <= 2 or w in STOPWORDS:
                     continue
-                # Pillar weighting “subversively” amplifies token boosts for strong bars
+                # Pillar weighting "subversively" amplifies token boosts for strong bars
                 val = float(math.log(p + 1e-12) + 6.0) + 0.35 * float(np.log(pw + 1e-12) + 1.0)
                 boost[w] = max(boost.get(w, 0.0), val)
 
         energies = np.array([n.energy for n in nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
-
         for i, n in enumerate(nodelets):
             top_words = []
             for t, _w in n.top_terms[:12]:
@@ -523,7 +377,6 @@ class NeuroSymbolicTextGenerator:
                 hi = lo + 1.0
             for k in list(boost.keys()):
                 boost[k] = 1.5 * clip01((boost[k] - lo) / (hi - lo))
-
         return boost
 
     def _nodelet_narrative(self, i: int, terms: List[Tuple[str, float]], energy: float) -> str:
@@ -534,7 +387,6 @@ class NeuroSymbolicTextGenerator:
                 break
             if t not in tops_clean:
                 tops_clean.append(t)
-
         strength = "high" if energy > 2.2 else "moderate" if energy > 1.4 else "light"
         return (
             f"Nodelet {i} carries a {strength}-intensity semantic current, orbiting around "
@@ -558,7 +410,7 @@ class NeuroSymbolicTextGenerator:
 
     def _sample_next(
         self,
-        lm: TrigramLM,
+        lm: 'TrigramLM',
         w1: str,
         w2: str,
         token_boost: Dict[str, float],
@@ -566,23 +418,20 @@ class NeuroSymbolicTextGenerator:
         temperature: float = 0.95,
     ) -> str:
         cand, base_p = lm.next_distribution(w1, w2)
-
         scores = np.log(base_p + 1e-12)
         for i, w in enumerate(cand):
             if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
                 continue
             scores[i] = scores[i] + self.steer_strength * token_boost.get(w, 0.0)
-
         scores = scores / max(temperature, 1e-9)
         scores = scores - np.max(scores)
         p = np.exp(scores)
         p = p / (p.sum() + 1e-12)
-
         return str(rng.choice(cand, p=p))
 
     def _choose_start_word(
         self,
-        lm: TrigramLM,
+        lm: 'TrigramLM',
         token_boost: Dict[str, float],
         rng: np.random.Generator,
         seed_words: List[str],
@@ -591,16 +440,14 @@ class NeuroSymbolicTextGenerator:
         if usable:
             usable.sort(key=lambda w: (token_boost.get(w, 0.0), lm.uni.get(w, 0)), reverse=True)
             return str(rng.choice(usable[:10]))
-
         boosted = [(w, b) for w, b in token_boost.items() if b > 0.9 and w in lm.uni]
         if boosted:
             return max(boosted, key=lambda x: x[1])[0]
-
         return max(lm.uni.items(), key=lambda x: x[1])[0]
 
     def _generate_sentence(
         self,
-        lm: TrigramLM,
+        lm: 'TrigramLM',
         token_boost: Dict[str, float],
         rng: np.random.Generator,
         seed_words: Optional[List[str]] = None,
@@ -609,31 +456,24 @@ class NeuroSymbolicTextGenerator:
     ) -> str:
         seed_words = seed_words or []
         seed = self._choose_start_word(lm, token_boost, rng, seed_words)
-
         tokens = ["("] if rng.random() < 0.12 else []
         tokens.append(seed)
-
         w1 = tokens[-1]
         w2 = tokens[-1]
-
         target_len = int(rng.integers(min_len, max_len + 1))
         for _ in range(target_len):
             nxt = self._sample_next(lm, w1, w2, token_boost, rng)
             tokens.append(nxt)
             w1, w2 = w2, nxt
-
             if nxt in [".", "!", "?"] and len([t for t in tokens if re.match(r"[a-z]", t)]) >= min_len:
                 break
-
         if tokens and tokens[-1] not in [".", "!", "?"]:
             tokens.append(".")
-
         if tokens and tokens[0] == "(" and ")" not in tokens:
             if rng.random() < 0.6:
                 tokens.insert(min(len(tokens), 6), ")")
             else:
                 tokens = tokens[1:]
-
         return detokenize(tokens)
 
     def _generate_takeaways(
@@ -647,16 +487,13 @@ class NeuroSymbolicTextGenerator:
     ) -> List[str]:
         if progress:
             progress(0, desc="Training language model")
-
         tokens = basic_tokenize(text)
         if len(tokens) < 600:
             tokens = tokens * 2
-
         lm = TrigramLM(add_k=self.lm_add_k)
         lm.fit(tokens)
 
         seed_words = self._extract_seed_words(text_seed)
-
         takeaways = []
         energies = np.array([n.energy for n in state.nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
@@ -664,12 +501,10 @@ class NeuroSymbolicTextGenerator:
         for i in range(n_takeaways):
             if progress:
                 progress(i / n_takeaways, desc=f"Generating takeaway {i+1}/{n_takeaways}")
-
             lead = int(rng.choice(len(state.nodelets), p=softmax(energies, temp=0.9)))
             row = state.binding_W[lead]
 
             local_boost = dict(state.token_boost)
-
             for w in seed_words:
                 local_boost[w] = max(local_boost.get(w, 0.0), 1.25)
 
@@ -689,7 +524,6 @@ class NeuroSymbolicTextGenerator:
 
         if progress:
             progress(1.0, desc="Generation complete")
-
         return takeaways
 
     def generate_report(
@@ -702,12 +536,77 @@ class NeuroSymbolicTextGenerator:
     ) -> str:
         text = normalize(text)
         state = self.fit(text, progress=progress)
-
         rng = np.random.default_rng(seed)
         takeaways = self._generate_takeaways(
             text, state, n_takeaways=n_takeaways, rng=rng, text_seed=text_seed, progress=progress
         )
         return "\n\n".join(takeaways)
+
+
+class TrigramLM:
+    def __init__(self, add_k: float = 0.25):
+        self.add_k = add_k
+        self.uni: Dict[str, int] = {}
+        self.bi: Dict[Tuple[str, str], int] = {}
+        self.tri: Dict[Tuple[str, str, str], int] = {}
+        self.vocab: List[str] = []
+        self.total: int = 0
+
+    def fit(self, tokens: List[str]) -> None:
+        self.uni.clear()
+        self.bi.clear()
+        self.tri.clear()
+        self.total = 0
+
+        def inc(d, key, val=1):
+            d[key] = d.get(key, 0) + val
+
+        for t in tokens:
+            inc(self.uni, t)
+            self.total += 1
+        for i in range(len(tokens) - 1):
+            inc(self.bi, (tokens[i], tokens[i + 1]))
+        for i in range(len(tokens) - 2):
+            inc(self.tri, (tokens[i], tokens[i + 1], tokens[i + 2]))
+        self.vocab = list(self.uni.keys())
+
+    def _prob_unigram(self, w: str) -> float:
+        V = len(self.vocab) + 1
+        return (self.uni.get(w, 0) + self.add_k) / (self.total + self.add_k * V)
+
+    def _prob_bigram(self, w1: str, w2: str) -> float:
+        V = len(self.vocab) + 1
+        c1 = self.uni.get(w1, 0)
+        c12 = self.bi.get((w1, w2), 0)
+        return (c12 + self.add_k) / (c1 + self.add_k * V) if c1 > 0 else self._prob_unigram(w2)
+
+    def _prob_trigram(self, w1: str, w2: str, w3: str) -> float:
+        V = len(self.vocab) + 1
+        c12 = self.bi.get((w1, w2), 0)
+        c123 = self.tri.get((w1, w2, w3), 0)
+        return (c123 + self.add_k) / (c12 + self.add_k * V) if c12 > 0 else self._prob_bigram(w2, w3)
+
+    def next_distribution(self, w1: str, w2: str) -> Tuple[List[str], np.ndarray]:
+        cont: List[str] = []
+        for (a, b, c), _count in self.tri.items():
+            if a == w1 and b == w2:
+                cont.append(c)
+        if not cont:
+            for (a, b), _count in self.bi.items():
+                if a == w2:
+                    cont.append(b)
+        if not cont:
+            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
+        seen = set()
+        cand = []
+        for w in cont:
+            if w not in seen:
+                seen.add(w)
+                cand.append(w)
+        cand = cand[:500]
+        probs = np.array([self._prob_trigram(w1, w2, w) for w in cand], dtype=float)
+        probs = probs / (probs.sum() + 1e-12)
+        return cand, probs
 
 
 # ----------------------------
@@ -717,6 +616,7 @@ def generate_from_file(
     in_file: str,
     softmax_temp: float,
     steer_strength: float,
+    geometric_strength: float,
     n_takeaways: int,
     seed: int,
     text_seed: str,
@@ -725,7 +625,6 @@ def generate_from_file(
 ):
     if not in_file:
         raise gr.Error("Please upload an input file.")
-
     progress(0, desc="Loading file")
     raw = load_text(in_file)
 
@@ -736,8 +635,9 @@ def generate_from_file(
         softmax_temp=float(softmax_temp),
         steer_strength=float(steer_strength),
         lm_add_k=0.25,
-        pillar_strength=0.85,  # set 0.0 to disable pillars
+        pillar_strength=0.85,
         pillar_floor=0.25,
+        geometric_strength=float(geometric_strength),
     )
 
     report = gen.generate_report(
@@ -752,13 +652,11 @@ def generate_from_file(
     tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
     stem = Path(in_file).stem
     out_name = (output_name or "").strip()
-
     if not out_name:
         out_path = tmpdir / f"{stem}_generated_report.txt"
     else:
         out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
         out_path = tmpdir / out_name
-
     out_path.write_text(report, encoding="utf-8")
     return report, str(out_path)
 
@@ -771,6 +669,7 @@ def generate_from_hf_dataset(
     max_samples: int,
     softmax_temp: float,
     steer_strength: float,
+    geometric_strength: float,
     n_takeaways: int,
     seed: int,
     text_seed: str,
@@ -796,8 +695,9 @@ def generate_from_hf_dataset(
         softmax_temp=float(softmax_temp),
         steer_strength=float(steer_strength),
         lm_add_k=0.25,
-        pillar_strength=0.85,  # set 0.0 to disable pillars
+        pillar_strength=0.85,
         pillar_floor=0.25,
+        geometric_strength=float(geometric_strength),
     )
 
     report = gen.generate_report(
@@ -811,13 +711,11 @@ def generate_from_hf_dataset(
     progress(0, desc="Saving output file")
     tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
     out_name = (output_name or "").strip()
-
     if not out_name:
         out_path = tmpdir / f"{dataset_name.replace('/', '_')}_generated_report.txt"
     else:
         out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
         out_path = tmpdir / out_name
-
     out_path.write_text(report, encoding="utf-8")
     return report, str(out_path)
 
@@ -825,7 +723,7 @@ def generate_from_hf_dataset(
 def build_app() -> gr.Blocks:
     with gr.Blocks(title="Neurosymbolic Text Generator", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# Neurosymbolic Text Generator")
-        gr.Markdown("*TF‑IDF/SVD nodelets + trigram LM with Hugging Face dataset support*")
+        gr.Markdown("*TF‑IDF/SVD nodelets + trigram LM + geometric distance/angle modulation + Hugging Face dataset support*")
 
         with gr.Tabs() as tabs:
             with gr.Tab("Upload File"):
@@ -848,6 +746,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
+                    geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
 
                 with gr.Row():
                     n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
@@ -857,7 +756,7 @@ def build_app() -> gr.Blocks:
 
                 with gr.Row():
                     preview_file = gr.Textbox(label="Generated report preview", lines=20)
-                download_file = gr.File(label="Download generated .txt")
+                    download_file = gr.File(label="Download generated .txt")
 
             with gr.Tab("Hugging Face Dataset"):
                 gr.Markdown("""
@@ -910,6 +809,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     softmax_temp_hf = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_hf = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
+                    geometric_strength_hf = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
 
                 with gr.Row():
                     n_takeaways_hf = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
@@ -919,13 +819,19 @@ def build_app() -> gr.Blocks:
 
                 with gr.Row():
                     preview_hf = gr.Textbox(label="Generated report preview", lines=20)
-                download_hf = gr.File(label="Download generated .txt")
+                    download_hf = gr.File(label="Download generated .txt")
 
         run_btn_file.click(
             fn=generate_from_file,
             inputs=[
-                in_file, softmax_temp_file, steer_strength_file,
-                n_takeaways_file, seed_file, text_seed_file, output_name_file
+                in_file,
+                softmax_temp_file,
+                steer_strength_file,
+                geometric_strength_file,
+                n_takeaways_file,
+                seed_file,
+                text_seed_file,
+                output_name_file
             ],
             outputs=[preview_file, download_file],
         )
@@ -933,9 +839,18 @@ def build_app() -> gr.Blocks:
         run_btn_hf.click(
             fn=generate_from_hf_dataset,
             inputs=[
-                dataset_name, config_name, split, text_column, max_samples,
-                softmax_temp_hf, steer_strength_hf, n_takeaways_hf, seed_hf,
-                text_seed_hf, output_name_hf
+                dataset_name,
+                config_name,
+                split,
+                text_column,
+                max_samples,
+                softmax_temp_hf,
+                steer_strength_hf,
+                geometric_strength_hf,
+                n_takeaways_hf,
+                seed_hf,
+                text_seed_hf,
+                output_name_hf
             ],
             outputs=[preview_hf, download_hf],
         )
