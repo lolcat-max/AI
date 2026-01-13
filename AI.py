@@ -746,7 +746,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
-                    geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
+                    geometric_strength_file = gr.Slider(0.0, 2.0, value=0.9, step=0.05, label="Geometric strength")
 
                 with gr.Row():
                     n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
