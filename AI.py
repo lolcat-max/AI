@@ -73,6 +73,73 @@ def clip01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
 
+def concave_focus(p: np.ndarray, strength: float = 0.5) -> np.ndarray:
+    """
+    Apply concave focus via cumulative centric dot product.
+    
+    For each probability p_i, we compute a focus weight based on:
+    1. Distance from the centroid (mean position weighted by probabilities)
+    2. Cumulative dot product with the probability mass distribution
+    3. Concave transformation (sqrt) to emphasize central tendencies
+    
+    Args:
+        p: probability distribution (will be normalized if needed)
+        strength: strength of focus effect (0.0 = no effect, 1.0 = strong focus)
+    
+    Returns:
+        Focused probability distribution
+    """
+    p = np.asarray(p, dtype=float)
+    p = p / (p.sum() + 1e-12)  # ensure normalized
+    
+    if len(p) <= 1 or strength <= 0.0:
+        return p
+    
+    strength = max(0.0, min(1.0, strength))
+    
+    # Position array (normalized to [0, 1])
+    positions = np.arange(len(p), dtype=float)
+    positions = positions / (len(p) - 1) if len(p) > 1 else positions
+    
+    # Centroid: expected position under p
+    centroid = np.dot(positions, p)
+    
+    # Distance from centroid (normalized)
+    distances = np.abs(positions - centroid)
+    max_dist = distances.max()
+    if max_dist > 1e-12:
+        distances = distances / max_dist
+    
+    # Cumulative distribution for dot product
+    cumsum = np.cumsum(p)
+    
+    # Centric dot product: measure alignment with cumulative mass
+    # Elements near the centroid get higher scores
+    centric_scores = np.zeros_like(p)
+    for i in range(len(p)):
+        # Dot product of local neighborhood with cumulative mass
+        start = max(0, i - 3)
+        end = min(len(p), i + 4)
+        local_p = p[start:end]
+        local_cumsum = cumsum[start:end]
+        centric_scores[i] = np.dot(local_p, local_cumsum)
+    
+    # Normalize centric scores
+    centric_scores = centric_scores / (centric_scores.max() + 1e-12)
+    
+    # Concave transformation: sqrt emphasizes mid-range values
+    # Combines distance (penalize outliers) with centric scores (reward alignment)
+    focus_weights = np.sqrt(
+        (1.0 - distances) * centric_scores + 1e-12
+    )
+    
+    # Apply focus with strength parameter
+    focused = p * (1.0 + strength * focus_weights)
+    focused = focused / (focused.sum() + 1e-12)
+    
+    return focused
+
+
 def basic_tokenize(text: str) -> List[str]:
     text = text.replace("\n", " ")
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
@@ -323,6 +390,7 @@ class NeuroSymbolicGraphGenerator:
     """
     Same settings as your original code, but adds graph representations and
     gates outputs with automorphism/isomorphism-derived checks.
+    Now includes concave focus for probability distributions.
     """
 
     def __init__(
@@ -339,6 +407,7 @@ class NeuroSymbolicGraphGenerator:
         rfe_enabled: bool = True,
         rfe_iterations: int = 3,
         rfe_removal_rate: float = 0.15,
+        concave_focus_strength: float = 0.5,
     ):
         self.nodelets_n = nodelets_n
         self.bars_n = bars_n
@@ -352,6 +421,7 @@ class NeuroSymbolicGraphGenerator:
         self.rfe_enabled = bool(rfe_enabled)
         self.rfe_iterations = int(rfe_iterations)
         self.rfe_removal_rate = float(rfe_removal_rate)
+        self.concave_focus_strength = float(concave_focus_strength)
 
     # ----------------------------
     # Graph helpers (output gating)
@@ -600,7 +670,7 @@ class NeuroSymbolicGraphGenerator:
         return G
 
     # ----------------------------
-    # Fit (TF-IDF -> SVD -> W -> RFE -> pillars -> geometric)
+    # Fit (TF-IDF -> SVD -> W -> RFE -> pillars -> geometric -> concave focus)
     # ----------------------------
     def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
         if progress:
@@ -686,6 +756,9 @@ class NeuroSymbolicGraphGenerator:
 
         logits = base_logits + pillar_bias + geometric_bias
         probs = softmax(logits, temp=self.softmax_temp)
+        
+        # Apply concave focus to probability distribution
+        probs = concave_focus(probs, strength=self.concave_focus_strength)
 
         token_boost = self._make_token_boost(vocab100, probs, nodelets, pillar_bias)
 
@@ -709,7 +782,7 @@ class NeuroSymbolicGraphGenerator:
         )
 
     # ----------------------------
-    # Generation (graph-gated)
+    # Generation (graph-gated with concave focus)
     # ----------------------------
     def _sample_next(
         self,
@@ -722,6 +795,10 @@ class NeuroSymbolicGraphGenerator:
         temperature: float = 0.95,
     ) -> str:
         cand, base_p = lm.next_distribution(w1, w2, w3)
+        
+        # Apply concave focus to base LM probabilities
+        base_p = concave_focus(base_p, strength=self.concave_focus_strength)
+        
         scores = np.log(base_p + 1e-12)
         for i, w in enumerate(cand):
             if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
@@ -731,6 +808,10 @@ class NeuroSymbolicGraphGenerator:
         scores = scores - np.max(scores)
         p = np.exp(scores)
         p = p / (p.sum() + 1e-12)
+        
+        # Apply concave focus one more time to final distribution
+        p = concave_focus(p, strength=self.concave_focus_strength * 0.7)
+        
         return str(rng.choice(cand, p=p))
 
     def _choose_start_word(
@@ -818,6 +899,9 @@ class NeuroSymbolicGraphGenerator:
 
         energies = np.array([n.energy for n in state.nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
+        
+        # Apply concave focus to nodelet selection probabilities
+        energies = concave_focus(energies, strength=self.concave_focus_strength)
 
         # More strict => more attempts
         max_attempts = int(6 + 6 * max(0.0, min(2.0, self.geometric_strength)))
@@ -889,6 +973,7 @@ def generate_from_file(
     softmax_temp: float,
     steer_strength: float,
     geometric_strength: float,
+    concave_focus_strength: float,
     rfe_enabled: bool,
     rfe_iterations: int,
     rfe_removal_rate: float,
@@ -916,6 +1001,7 @@ def generate_from_file(
         rfe_enabled=bool(rfe_enabled),
         rfe_iterations=int(rfe_iterations),
         rfe_removal_rate=float(rfe_removal_rate),
+        concave_focus_strength=float(concave_focus_strength),
     )
 
     report = gen.generate_report(
@@ -948,6 +1034,7 @@ def generate_from_hf_dataset(
     softmax_temp: float,
     steer_strength: float,
     geometric_strength: float,
+    concave_focus_strength: float,
     rfe_enabled: bool,
     rfe_iterations: int,
     rfe_removal_rate: float,
@@ -982,6 +1069,7 @@ def generate_from_hf_dataset(
         rfe_enabled=bool(rfe_enabled),
         rfe_iterations=int(rfe_iterations),
         rfe_removal_rate=float(rfe_removal_rate),
+        concave_focus_strength=float(concave_focus_strength),
     )
 
     report = gen.generate_report(
@@ -1008,7 +1096,7 @@ def build_app() -> gr.Blocks:
     # Gradio 6: theme passed to launch(), not Blocks()
     with gr.Blocks(title="Neurosymbolic Text Generator") as demo:
         gr.Markdown("# Neurosymbolic Text Generator (Graph Automorphism Gated)")
-        gr.Markdown("*TF‑IDF/SVD nodelets + RFE + quad-gram LM + geometric modulation + automorphism checks + HF dataset support*")
+        gr.Markdown("*TF‑IDF/SVD nodelets + RFE + quad-gram LM + geometric modulation + concave focus + automorphism checks + HF dataset support*")
 
         with gr.Tabs():
             with gr.Tab("Upload File"):
@@ -1032,6 +1120,7 @@ def build_app() -> gr.Blocks:
                     softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
                     geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
+                    concave_focus_strength_file = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength")
 
                 with gr.Row():
                     rfe_enabled_file = gr.Checkbox(value=True, label="Enable RFE")
@@ -1100,6 +1189,7 @@ def build_app() -> gr.Blocks:
                     softmax_temp_hf = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_hf = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
                     geometric_strength_hf = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
+                    concave_focus_strength_hf = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength")
 
                 with gr.Row():
                     rfe_enabled_hf = gr.Checkbox(value=True, label="Enable RFE")
@@ -1123,6 +1213,7 @@ def build_app() -> gr.Blocks:
                 softmax_temp_file,
                 steer_strength_file,
                 geometric_strength_file,
+                concave_focus_strength_file,
                 rfe_enabled_file,
                 rfe_iterations_file,
                 rfe_removal_rate_file,
@@ -1145,6 +1236,7 @@ def build_app() -> gr.Blocks:
                 softmax_temp_hf,
                 steer_strength_hf,
                 geometric_strength_hf,
+                concave_focus_strength_hf,
                 rfe_enabled_hf,
                 rfe_iterations_hf,
                 rfe_removal_rate_hf,
