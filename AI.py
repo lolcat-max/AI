@@ -1103,8 +1103,7 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     in_file = gr.File(
                         label="Input file (.txt/.md/.docx/.pdf)",
-                        file_types=[".txt", ".md", ".docx", ".pdf"],
-                        type="filepath",
+                        file_types=[".txt", ".md", ".docx", ".pdf"],type="filepath",
                     )
                     with gr.Column():
                         output_name_file = gr.Textbox(
@@ -1254,4 +1253,4 @@ def build_app() -> gr.Blocks:
 if __name__ == "__main__":
     app = build_app()
     # Gradio 6: theme belongs in launch()
-    app.queue().launch(theme=gr.themes.Soft())
+    app.queue().launch(theme=gr.themes.Soft(),share=True,max_file_size="1MB")
