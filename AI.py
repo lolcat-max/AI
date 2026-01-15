@@ -14,10 +14,10 @@ Keeps your Gradio tabs & controls:
 + Geometric Distance & Angle Modulation
 + Quad-gram LM (4-gram)
 + Recursive Feature Elimination (RFE)
++ NEW: Dataset partition mixing based on prompt + HF context field composition
 
 Dependencies:
   pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx
-(Install what you actually use.)
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ import gradio as gr
 from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Graph theory core
 import networkx as nx
@@ -76,67 +77,62 @@ def clip01(x: float) -> float:
 def concave_focus(p: np.ndarray, strength: float = 0.5) -> np.ndarray:
     """
     Apply concave focus via cumulative centric dot product.
-    
+
     For each probability p_i, we compute a focus weight based on:
     1. Distance from the centroid (mean position weighted by probabilities)
     2. Cumulative dot product with the probability mass distribution
     3. Concave transformation (sqrt) to emphasize central tendencies
-    
+
     Args:
         p: probability distribution (will be normalized if needed)
         strength: strength of focus effect (0.0 = no effect, 1.0 = strong focus)
-    
+
     Returns:
         Focused probability distribution
     """
     p = np.asarray(p, dtype=float)
     p = p / (p.sum() + 1e-12)  # ensure normalized
-    
+
     if len(p) <= 1 or strength <= 0.0:
         return p
-    
+
     strength = max(0.0, min(1.0, strength))
-    
+
     # Position array (normalized to [0, 1])
     positions = np.arange(len(p), dtype=float)
     positions = positions / (len(p) - 1) if len(p) > 1 else positions
-    
+
     # Centroid: expected position under p
     centroid = np.dot(positions, p)
-    
+
     # Distance from centroid (normalized)
     distances = np.abs(positions - centroid)
     max_dist = distances.max()
     if max_dist > 1e-12:
         distances = distances / max_dist
-    
+
     # Cumulative distribution for dot product
     cumsum = np.cumsum(p)
-    
+
     # Centric dot product: measure alignment with cumulative mass
-    # Elements near the centroid get higher scores
     centric_scores = np.zeros_like(p)
     for i in range(len(p)):
-        # Dot product of local neighborhood with cumulative mass
         start = max(0, i - 3)
         end = min(len(p), i + 4)
         local_p = p[start:end]
         local_cumsum = cumsum[start:end]
         centric_scores[i] = np.dot(local_p, local_cumsum)
-    
+
     # Normalize centric scores
     centric_scores = centric_scores / (centric_scores.max() + 1e-12)
-    
+
     # Concave transformation: sqrt emphasizes mid-range values
-    # Combines distance (penalize outliers) with centric scores (reward alignment)
-    focus_weights = np.sqrt(
-        (1.0 - distances) * centric_scores + 1e-12
-    )
-    
+    focus_weights = np.sqrt((1.0 - distances) * centric_scores + 1e-12)
+
     # Apply focus with strength parameter
     focused = p * (1.0 + strength * focus_weights)
     focused = focused / (focused.sum() + 1e-12)
-    
+
     return focused
 
 
@@ -198,53 +194,218 @@ def load_text(path: str) -> str:
     raise ValueError(f"Unsupported file extension: {ext}")
 
 
+# ----------------------------
+# HF dataset loading with split mixing + context fields
+# ----------------------------
 def load_hf_dataset(
     dataset_name: str,
     config_name: Optional[str] = None,
-    split: str = "train",
-    text_column: Optional[str] = None,
+    splits: str = "train",                       # comma-separated splits
+    text_columns: Optional[str] = None,          # comma-separated main columns
+    context_columns: Optional[str] = None,       # comma-separated context/support columns
     max_samples: Optional[int] = None,
+    mix_mode: str = "off",                       # "off" | "auto" | "manual"
+    manual_mix: str = "",                        # e.g. "train=0.7,validation=0.3"
+    prompt_text: str = "",                       # uses your text_seed
+    seed: int = 7,
     progress: Optional[gr.Progress] = None,
 ) -> str:
-    """Load text from a Hugging Face dataset."""
+    """Load text from one or more HF dataset splits, optionally mixing splits based on prompt relevance."""
     try:
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
 
-    if progress:
-        progress(0, desc=f"Loading dataset: {dataset_name}")
+    def _parse_csv(s: Optional[str]) -> List[str]:
+        if not s:
+            return []
+        return [x.strip() for x in s.split(",") if x.strip()]
 
-    if config_name:
-        ds = load_dataset(dataset_name, config_name, split=split)
+    def _pick_default_text_cols(cols: List[str]) -> List[str]:
+        candidates = ["text", "article", "content", "document", "context", "sentence", "review", "body"]
+        picked = [c for c in candidates if c in cols]
+        return picked[:1] if picked else [cols[0]]
+
+    def _join_fields(item: dict, main_cols: List[str], ctx_cols: List[str]) -> str:
+        parts: List[str] = []
+
+        def add_field(k: str, label: Optional[str] = None):
+            if k not in item:
+                return
+            v = item[k]
+            if v is None:
+                return
+            if isinstance(v, (list, tuple)):
+                v = "\n".join([str(x) for x in v if str(x).strip()])
+            v = str(v).strip()
+            if not v:
+                return
+            if label:
+                parts.append(f"{label}: {v}")
+            else:
+                parts.append(v)
+
+        # main columns (primary content)
+        for k in main_cols:
+            add_field(k, label=None if len(main_cols) == 1 else k)
+
+        # context columns (supporting info), skip duplicates
+        for k in ctx_cols:
+            if k in main_cols:
+                continue
+            add_field(k, label=k)
+
+        return "\n".join(parts).strip()
+
+    def _load_split(split_name: str):
+        if config_name:
+            return load_dataset(dataset_name, config_name, split=split_name)
+        return load_dataset(dataset_name, split=split_name)
+
+    split_list = _parse_csv(splits) or ["train"]
+    main_cols = _parse_csv(text_columns)
+    ctx_cols = _parse_csv(context_columns)
+
+    if progress:
+        progress(0.0, desc=f"Loading dataset: {dataset_name} ({', '.join(split_list)})")
+
+    # Load all requested splits
+    dsets: Dict[str, object] = {}
+    for i, sp in enumerate(split_list):
+        if progress:
+            progress(0.05 + 0.20 * (i / max(1, len(split_list))), desc=f"Loading split: {sp}")
+        dsets[sp] = _load_split(sp)
+
+    # Determine columns if not provided
+    if not main_cols:
+        cols = list(dsets[split_list[0]].column_names)
+        main_cols = _pick_default_text_cols(cols)
+
+    # Validate provided columns
+    for sp, ds in dsets.items():
+        cols = set(ds.column_names)
+        for c in main_cols:
+            if c not in cols:
+                raise ValueError(f"Column '{c}' not found in split '{sp}'. Available: {ds.column_names}")
+        for c in ctx_cols:
+            if c and c not in cols:
+                raise ValueError(f"Context column '{c}' not found in split '{sp}'. Available: {ds.column_names}")
+
+    # ---------- Split mixing ----------
+    rng = np.random.default_rng(int(seed))
+    total_cap = int(max_samples) if (max_samples and max_samples > 0) else None
+
+    def _manual_weights(manual_spec: str) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for chunk in _parse_csv(manual_spec):
+            if "=" not in chunk:
+                continue
+            k, v = chunk.split("=", 1)
+            k = k.strip()
+            try:
+                out[k] = float(v.strip())
+            except ValueError:
+                pass
+        out = {k: out[k] for k in split_list if k in out}
+        s = sum(out.values())
+        if s <= 0:
+            return {}
+        return {k: out[k] / s for k in out}
+
+    def _auto_weights(prompt: str) -> Dict[str, float]:
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return {sp: 1.0 / len(split_list) for sp in split_list}
+
+        probe_docs: List[str] = []
+        split_names: List[str] = []
+        for sp in split_list:
+            ds = dsets[sp]
+            n = min(200, len(ds))
+            if n <= 0:
+                continue
+
+            idx = rng.choice(len(ds), size=n, replace=False) if len(ds) >= n else np.arange(len(ds))
+            texts: List[str] = []
+            for j in idx:
+                t = _join_fields(ds[int(j)], main_cols, ctx_cols)
+                if t:
+                    texts.append(t)
+            probe_docs.append("\n".join(texts)[:12000])
+            split_names.append(sp)
+
+        if not probe_docs:
+            return {sp: 1.0 / len(split_list) for sp in split_list}
+
+        vec = TfidfVectorizer(lowercase=True, stop_words="english", max_features=6000, ngram_range=(1, 2))
+        X = vec.fit_transform([prompt] + probe_docs)
+        sims = cosine_similarity(X[0], X[1:]).ravel()
+        sims = np.clip(sims, 0.0, None)
+        w = softmax(sims, temp=0.7)
+        return {split_names[i]: float(w[i]) for i in range(len(split_names))}
+
+    mm = (mix_mode or "off").lower().strip()
+    if mm == "manual":
+        weights = _manual_weights(manual_mix)
+        if not weights:
+            weights = {sp: 1.0 / len(split_list) for sp in split_list}
+    elif mm == "auto":
+        weights = _auto_weights(prompt_text)
     else:
-        ds = load_dataset(dataset_name, split=split)
+        weights = {split_list[0]: 1.0}
 
-    if text_column is None:
-        text_candidates = ["text", "article", "content", "document", "context", "sentence"]
-        for candidate in text_candidates:
-            if candidate in ds.column_names:
-                text_column = candidate
-                break
-        if text_column is None:
-            text_column = ds.column_names[0]
+    # Allocate sample counts per split
+    if total_cap is None:
+        alloc = {sp: len(dsets[sp]) for sp in weights}
+    else:
+        raw = {sp: weights.get(sp, 0.0) for sp in weights}
+        s = sum(raw.values())
+        if s <= 0:
+            raw = {sp: 1.0 / len(raw) for sp in raw}
+        else:
+            raw = {sp: raw[sp] / s for sp in raw}
 
-    if text_column not in ds.column_names:
-        raise ValueError(f"Column '{text_column}' not found. Available: {ds.column_names}")
-
-    if max_samples and max_samples > 0:
-        ds = ds.select(range(min(max_samples, len(ds))))
+        alloc = {sp: int(round(total_cap * raw[sp])) for sp in raw}
+        drift = total_cap - sum(alloc.values())
+        if drift != 0:
+            order = sorted(raw.keys(), key=lambda k: raw[k], reverse=True)
+            k = 0
+            while drift != 0 and order:
+                sp = order[k % len(order)]
+                if drift > 0:
+                    alloc[sp] += 1
+                    drift -= 1
+                else:
+                    if alloc[sp] > 0:
+                        alloc[sp] -= 1
+                        drift += 1
+                k += 1
 
     if progress:
-        progress(0.5, desc="Extracting text from dataset")
+        progress(0.35, desc="Mixing splits: " + ", ".join([f"{sp}:{alloc.get(sp,0)}" for sp in alloc]))
 
-    texts = []
-    for item in ds:
-        t = item[text_column]
-        if isinstance(t, str) and t.strip():
-            texts.append(t.strip())
+    # Extract text
+    texts_out: List[str] = []
+    for i, sp in enumerate(alloc.keys()):
+        ds = dsets[sp]
+        n_take = min(int(alloc[sp]), len(ds))
+        if n_take <= 0:
+            continue
 
-    combined = "\n\n".join(texts)
+        if progress:
+            progress(0.35 + 0.55 * (i / max(1, len(alloc))), desc=f"Extracting from split '{sp}'")
+
+        if n_take < len(ds):
+            idx = rng.choice(len(ds), size=n_take, replace=False)
+        else:
+            idx = np.arange(len(ds))
+
+        for j in idx:
+            t = _join_fields(ds[int(j)], main_cols, ctx_cols)
+            if isinstance(t, str) and t.strip():
+                texts_out.append(t.strip())
+
+    combined = "\n\n".join(texts_out)
 
     if progress:
         progress(1.0, desc="Dataset loaded successfully")
@@ -370,12 +531,10 @@ class QuadgramLM:
         Edge weight = aggregated transition frequency (w3 -> w4) across all quadgrams.
         """
         G = nx.DiGraph()
-        # Aggregate quad transitions by (w3 -> w4)
         agg: Dict[Tuple[str, str], int] = {}
         for (w1, w2, w3, w4), c in self.quad.items():
             agg[(w3, w4)] = agg.get((w3, w4), 0) + int(c)
 
-        # Keep top edges for responsiveness
         items = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:max_edges]
         for (a, b), c in items:
             if not G.has_node(a):
@@ -453,8 +612,11 @@ class NeuroSymbolicGraphGenerator:
         node_match = iso.categorical_node_match("cls", default=None) if G.is_directed() else None
         edge_match = iso.categorical_edge_match("rel", default=None) if G.is_directed() else None
 
-        GM = iso.DiGraphMatcher(G, G, node_match=node_match, edge_match=edge_match) if G.is_directed() \
-             else iso.GraphMatcher(G, G, node_match=node_match, edge_match=edge_match)
+        GM = (
+            iso.DiGraphMatcher(G, G, node_match=node_match, edge_match=edge_match)
+            if G.is_directed()
+            else iso.GraphMatcher(G, G, node_match=node_match, edge_match=edge_match)
+        )
 
         cnt = 0
         for _mapping in GM.isomorphisms_iter():
@@ -486,7 +648,6 @@ class NeuroSymbolicGraphGenerator:
         strict = float(self.geometric_strength)  # 0..2 from UI
         strict = max(0.0, min(2.0, strict))
 
-        # Degree-shape similarity
         ref = ref_sig["deg_hist"].astype(float)
         out = out_sig["deg_hist"].astype(float)
         ref /= (ref.sum() + 1e-12)
@@ -497,17 +658,15 @@ class NeuroSymbolicGraphGenerator:
         if l1 > max(0.25, max_l1):
             return False
 
-        # Symmetry constraint (automorphism estimate ratio band)
         a_ref = max(1, int(ref_sig["aut_est"]))
         a_out = max(1, int(out_sig["aut_est"]))
         ratio = a_out / a_ref
 
-        band = 3.5 - 1.2 * min(2.0, float(self.steer_strength) / 2.0)  # steer_strength 0..5
+        band = 3.5 - 1.2 * min(2.0, float(self.steer_strength) / 2.0)
         band = max(1.3, band)
         if not (1.0 / band <= ratio <= band):
             return False
 
-        # Optional ultra strict WL match
         if strict >= 1.6:
             if out_sig["wl"] != ref_sig["wl"]:
                 return False
@@ -536,7 +695,7 @@ class NeuroSymbolicGraphGenerator:
             if progress:
                 progress(
                     0.8 + 0.05 * (iteration / self.rfe_iterations),
-                    desc=f"RFE iteration {iteration + 1}/{self.rfe_iterations}"
+                    desc=f"RFE iteration {iteration + 1}/{self.rfe_iterations}",
                 )
 
             importance = np.zeros(W_current.shape[1])
@@ -756,7 +915,7 @@ class NeuroSymbolicGraphGenerator:
 
         logits = base_logits + pillar_bias + geometric_bias
         probs = softmax(logits, temp=self.softmax_temp)
-        
+
         # Apply concave focus to probability distribution
         probs = concave_focus(probs, strength=self.concave_focus_strength)
 
@@ -764,9 +923,7 @@ class NeuroSymbolicGraphGenerator:
 
         # Graph views
         semantic_graph = self._build_semantic_graph(nodelets, vocab100, W)
-
-        # LM graph is built later when LM is fit; placeholder for now
-        lm_graph = nx.DiGraph()
+        lm_graph = nx.DiGraph()  # built after LM fit
 
         return ModelState(
             nodelets=nodelets,
@@ -795,10 +952,9 @@ class NeuroSymbolicGraphGenerator:
         temperature: float = 0.95,
     ) -> str:
         cand, base_p = lm.next_distribution(w1, w2, w3)
-        
-        # Apply concave focus to base LM probabilities
+
         base_p = concave_focus(base_p, strength=self.concave_focus_strength)
-        
+
         scores = np.log(base_p + 1e-12)
         for i, w in enumerate(cand):
             if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
@@ -808,10 +964,9 @@ class NeuroSymbolicGraphGenerator:
         scores = scores - np.max(scores)
         p = np.exp(scores)
         p = p / (p.sum() + 1e-12)
-        
-        # Apply concave focus one more time to final distribution
+
         p = concave_focus(p, strength=self.concave_focus_strength * 0.7)
-        
+
         return str(rng.choice(cand, p=p))
 
     def _choose_start_word(
@@ -886,10 +1041,8 @@ class NeuroSymbolicGraphGenerator:
         lm = QuadgramLM(add_k=self.lm_add_k)
         lm.fit(tokens)
 
-        # Graph theory: LM as transition digraph
         state.lm_graph = lm.build_transition_graph(max_edges=20000)
 
-        # Reference graph signature from the source text structure
         ref_tokens = basic_tokenize(text)
         ref_graph = self._build_token_structure_graph(ref_tokens, max_nodes=220)
         ref_sig = self._graph_signature(ref_graph)
@@ -899,11 +1052,9 @@ class NeuroSymbolicGraphGenerator:
 
         energies = np.array([n.energy for n in state.nodelets], dtype=float)
         energies = energies / (energies.max() + 1e-12)
-        
-        # Apply concave focus to nodelet selection probabilities
+
         energies = concave_focus(energies, strength=self.concave_focus_strength)
 
-        # More strict => more attempts
         max_attempts = int(6 + 6 * max(0.0, min(2.0, self.geometric_strength)))
 
         for i in range(n_takeaways):
@@ -928,7 +1079,6 @@ class NeuroSymbolicGraphGenerator:
             for k in list(local_boost.keys()):
                 local_boost[k] = float(min(2.0, max(0.0, local_boost[k])))
 
-            # Graph-gated rejection sampling
             last_sent = ""
             for _attempt in range(max_attempts):
                 sent = self._generate_sentence(lm, local_boost, rng, seed_words=seed_words)
@@ -966,7 +1116,7 @@ class NeuroSymbolicGraphGenerator:
 
 
 # ----------------------------
-# Gradio app
+# Gradio app actions
 # ----------------------------
 def generate_from_file(
     in_file: str,
@@ -1028,9 +1178,12 @@ def generate_from_file(
 def generate_from_hf_dataset(
     dataset_name: str,
     config_name: str,
-    split: str,
-    text_column: str,
+    splits: str,
+    text_columns: str,
+    context_columns: str,
     max_samples: int,
+    mix_mode: str,
+    manual_mix: str,
     softmax_temp: float,
     steer_strength: float,
     geometric_strength: float,
@@ -1050,9 +1203,14 @@ def generate_from_hf_dataset(
     raw = load_hf_dataset(
         dataset_name=dataset_name.strip(),
         config_name=config_name.strip() if config_name and config_name.strip() else None,
-        split=split,
-        text_column=text_column.strip() if text_column and text_column.strip() else None,
+        splits=splits.strip() if splits and splits.strip() else "train",
+        text_columns=text_columns.strip() if text_columns and text_columns.strip() else None,
+        context_columns=context_columns.strip() if context_columns and context_columns.strip() else None,
         max_samples=int(max_samples) if max_samples and max_samples > 0 else None,
+        mix_mode=(mix_mode or "off"),
+        manual_mix=(manual_mix or ""),
+        prompt_text=(text_seed or ""),
+        seed=int(seed),
         progress=progress,
     )
 
@@ -1092,18 +1250,24 @@ def generate_from_hf_dataset(
     return report, str(out_path)
 
 
+# ----------------------------
+# Gradio UI
+# ----------------------------
 def build_app() -> gr.Blocks:
     # Gradio 6: theme passed to launch(), not Blocks()
     with gr.Blocks(title="Neurosymbolic Text Generator") as demo:
         gr.Markdown("# Neurosymbolic Text Generator (Graph Automorphism Gated)")
-        gr.Markdown("*TF‑IDF/SVD nodelets + RFE + quad-gram LM + geometric modulation + concave focus + automorphism checks + HF dataset support*")
+        gr.Markdown(
+            "*TF-IDF/SVD nodelets + RFE + quad-gram LM + geometric modulation + concave focus + automorphism checks + HF split mixing + context fields*"
+        )
 
         with gr.Tabs():
             with gr.Tab("Upload File"):
                 with gr.Row():
                     in_file = gr.File(
                         label="Input file (.txt/.md/.docx/.pdf)",
-                        file_types=[".txt", ".md", ".docx", ".pdf"],type="filepath",
+                        file_types=[".txt", ".md", ".docx", ".pdf"],
+                        type="filepath",
                     )
                     with gr.Column():
                         output_name_file = gr.Textbox(
@@ -1119,7 +1283,9 @@ def build_app() -> gr.Blocks:
                     softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
                     geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
-                    concave_focus_strength_file = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength")
+                    concave_focus_strength_file = gr.Slider(
+                        0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength"
+                    )
 
                 with gr.Row():
                     rfe_enabled_file = gr.Checkbox(value=True, label="Enable RFE")
@@ -1137,41 +1303,68 @@ def build_app() -> gr.Blocks:
                     download_file = gr.File(label="Download generated .txt")
 
             with gr.Tab("Hugging Face Dataset"):
-                gr.Markdown("""
-                ### Load data from Hugging Face datasets
-                Browse datasets at: https://huggingface.co/datasets
-                """)
+                gr.Markdown(
+                    """
+### Load data from Hugging Face datasets
+Examples:
+- Dataset: `imdb` | splits: `train,test` | text_columns: `text`
+- Dataset: `squad` | splits: `train,validation` | text_columns: `question,answers` | context_columns: `context,title`
+- Dataset: `cnn_dailymail` | config: `3.0.0` | splits: `train,validation` | text_columns: `article,highlights`
+"""
+                )
 
                 with gr.Row():
                     with gr.Column():
                         dataset_name = gr.Textbox(
                             label="Dataset name",
-                            placeholder="e.g., imdb, ag_news, cnn_dailymail",
+                            placeholder="e.g., imdb, ag_news, cnn_dailymail, squad",
                             value="",
                         )
                         config_name = gr.Textbox(
                             label="Config/Subset (if required)",
-                            placeholder="e.g., 3.0.0 for cnn_dailymail, wikitext-2-raw-v1 for wikitext",
+                            placeholder="e.g., 3.0.0 for cnn_dailymail",
                             value="",
                         )
                     with gr.Column():
-                        split = gr.Textbox(
-                            label="Split",
-                            placeholder="train, test, validation, etc.",
+                        splits = gr.Textbox(
+                            label="Splits (comma-separated)",
+                            placeholder="train,validation,test",
                             value="train",
                         )
-                        text_column = gr.Textbox(
-                            label="Text column (leave empty for auto-detect)",
-                            placeholder="e.g., text, article, context",
-                            value="",
+                        max_samples = gr.Number(
+                            label="Max samples (0 = all, recommended: 100-500)",
+                            value=100,
+                            precision=0,
                         )
 
                 with gr.Row():
-                    max_samples = gr.Number(
-                        label="Max samples (0 = all, recommended: 1000-5000)",
-                        value=2000,
-                        precision=0,
+                    text_columns = gr.Textbox(
+                        label="Main text columns (comma-separated, empty = auto)",
+                        placeholder="e.g., text OR article,highlights OR question,answers",
+                        value="",
+                        scale=2,
                     )
+                    context_columns = gr.Textbox(
+                        label="Context/support columns (comma-separated, optional)",
+                        placeholder="e.g., context,title,document",
+                        value="",
+                        scale=2,
+                    )
+
+                with gr.Row():
+                    mix_mode = gr.Dropdown(
+                        choices=["off", "auto", "manual"],
+                        value="off",
+                        label="Split mixing mode",
+                        info="off: use first split only • auto: infer split weights from text seed • manual: provide weights",
+                    )
+                    manual_mix = gr.Textbox(
+                        label="Manual split weights (only for manual mode)",
+                        placeholder="e.g., train=0.7,validation=0.3,test=0.0",
+                        value="",
+                    )
+
+                with gr.Row():
                     output_name_hf = gr.Textbox(
                         label="Output filename (optional)",
                         placeholder="e.g., report.txt",
@@ -1179,8 +1372,8 @@ def build_app() -> gr.Blocks:
 
                 with gr.Row():
                     text_seed_hf = gr.Textbox(
-                        label="Text seed (optional)",
-                        placeholder="Words/phrase to bias generation",
+                        label="Text seed (optional; also drives auto mixing)",
+                        placeholder="Words/phrase to bias generation and (if auto) split mixing",
                         scale=2,
                     )
 
@@ -1188,7 +1381,9 @@ def build_app() -> gr.Blocks:
                     softmax_temp_hf = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
                     steer_strength_hf = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
                     geometric_strength_hf = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
-                    concave_focus_strength_hf = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength")
+                    concave_focus_strength_hf = gr.Slider(
+                        0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength"
+                    )
 
                 with gr.Row():
                     rfe_enabled_hf = gr.Checkbox(value=True, label="Enable RFE")
@@ -1219,7 +1414,7 @@ def build_app() -> gr.Blocks:
                 n_takeaways_file,
                 seed_file,
                 text_seed_file,
-                output_name_file
+                output_name_file,
             ],
             outputs=[preview_file, download_file],
         )
@@ -1229,9 +1424,12 @@ def build_app() -> gr.Blocks:
             inputs=[
                 dataset_name,
                 config_name,
-                split,
-                text_column,
+                splits,
+                text_columns,
+                context_columns,
                 max_samples,
+                mix_mode,
+                manual_mix,
                 softmax_temp_hf,
                 steer_strength_hf,
                 geometric_strength_hf,
@@ -1242,7 +1440,7 @@ def build_app() -> gr.Blocks:
                 n_takeaways_hf,
                 seed_hf,
                 text_seed_hf,
-                output_name_hf
+                output_name_hf,
             ],
             outputs=[preview_hf, download_hf],
         )
@@ -1253,4 +1451,4 @@ def build_app() -> gr.Blocks:
 if __name__ == "__main__":
     app = build_app()
     # Gradio 6: theme belongs in launch()
-    app.queue().launch(theme=gr.themes.Soft(),share=True,max_file_size="1MB")
+    app.queue().launch(share=False, max_file_size="1MB")
