@@ -1,43 +1,120 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI) with Hugging Face Dataset Support
+Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
+V3.2: Shape-safe + Synthetic GELU Bias + TRAIN BUTTON
 
-All core logic is expressed as graph constructions + automorphism/isomorphism checks:
-- Semantics: bipartite graph (nodelets <-> bars) from TF-IDF/SVD (+ RFE)
-- Language model: weighted transition digraph (token -> token) derived from 4-gram counts
-- Output: token-structure digraph (positional nodes with class labels)
-- Acceptance: output is gated by graph signatures + automorphism-estimates
-
-Keeps your Gradio tabs & controls:
-+ Vertical Pillars (additive logit bias)
-+ Geometric Distance & Angle Modulation
-+ Quad-gram LM (4-gram)
-+ Recursive Feature Elimination (RFE)
+Training button:
+- Trains ONLY the SyntheticGELUBias (GELU MLP) on your input file.
+- Stores learned weights in gr.State, then Generate loads them for sampling.
 
 Dependencies:
-  pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx
-(Install what you actually use.)
+  pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
 """
 
 from __future__ import annotations
 import re
 import math
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import gradio as gr
-from tqdm.auto import tqdm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 
-# Graph theory core
 import networkx as nx
 from networkx.algorithms import isomorphism as iso
 from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
+
+
+# ----------------------------
+# PyTorch Isomorphic Neuromorphisms
+# ----------------------------
+class LateralInhibition(nn.Module):
+    def __init__(self, kernel_size=7, strength=0.5):
+        super().__init__()
+        self.strength = float(strength)
+        k = torch.tensor([-0.05, -0.2, -0.4, 1.3, -0.4, -0.2, -0.05], dtype=torch.float32)
+        self.register_buffer("kernel", k.view(1, 1, -1))
+        self.pad = int(kernel_size // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept [L], [B,L], or [B,1,L]
+        if x.dim() == 1:
+            x = x.view(1, 1, -1)
+        elif x.dim() == 2:
+            x = x.view(x.shape[0], 1, x.shape[1])
+
+        modulation = F.conv1d(x, self.kernel, padding=self.pad)
+        out = x + self.strength * modulation
+        out = F.relu(out)
+        return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
+
+
+class SynapticPruner(nn.Module):
+    def __init__(self, n_features: int):
+        super().__init__()
+        self.gain = nn.Parameter(torch.ones(int(n_features)))
+
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        return W * self.gain.view(1, -1)
+
+
+class ResonantGate(nn.Module):
+    def __init__(self, steer_strength=1.35):
+        super().__init__()
+        self.steer_strength = float(steer_strength)
+        self.noise_injector = nn.Dropout(p=0.05)
+
+    def forward(self, lm_probs: torch.Tensor, token_boosts: torch.Tensor, temp=0.95) -> torch.Tensor:
+        lm_probs = lm_probs.view(-1)
+        token_boosts = token_boosts.view(-1)
+
+        potentials = torch.log(lm_probs.clamp_min(1e-12))
+        potentials = potentials + self.steer_strength * token_boosts
+        potentials = potentials / max(float(temp), 1e-9)
+        potentials = self.noise_injector(potentials)
+        return F.softmax(potentials, dim=-1)
+
+
+class SyntheticGELUBias(nn.Module):
+    """
+    Trainable GELU MLP bias field:
+    Input: [log(base_prob), token_boost] -> per-token bias
+    """
+    def __init__(self, hidden=32, approximate="tanh"):
+        super().__init__()
+        self.fc1 = nn.Linear(2, int(hidden))
+        self.act = nn.GELU(approximate=approximate)
+        self.fc2 = nn.Linear(int(hidden), 1)
+
+    def reset_seed(self, seed: int):
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        with torch.no_grad():
+            nn.init.normal_(self.fc1.weight, mean=0.0, std=0.15, generator=g)
+            nn.init.zeros_(self.fc1.bias)
+            nn.init.normal_(self.fc2.weight, mean=0.0, std=0.15, generator=g)
+            nn.init.zeros_(self.fc2.bias)
+
+    def freeze_(self, frozen: bool = True):
+        for p in self.parameters():
+            p.requires_grad_(not frozen)
+
+    def forward(self, base_probs: torch.Tensor, token_boosts: torch.Tensor) -> torch.Tensor:
+        base_probs = base_probs.view(-1)
+        token_boosts = token_boosts.view(-1)
+
+        x1 = torch.log(base_probs.clamp_min(1e-12))
+        x = torch.stack([x1, token_boosts], dim=-1)  # [V,2]
+        h = self.act(self.fc1(x))
+        return self.fc2(h).squeeze(-1)               # [V]
 
 
 # ----------------------------
@@ -57,89 +134,6 @@ def normalize(text: str) -> str:
     return text.strip()
 
 
-def softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
-    x = x.astype(float) / max(temp, 1e-12)
-    x = x - np.max(x)
-    ex = np.exp(x)
-    return ex / (np.sum(ex) + 1e-12)
-
-
-def entropy(p: np.ndarray) -> float:
-    p = np.asarray(p, dtype=float)
-    return float(-np.sum(p * np.log(p + 1e-12)))
-
-
-def clip01(x: float) -> float:
-    return float(max(0.0, min(1.0, x)))
-
-
-def concave_focus(p: np.ndarray, strength: float = 0.5) -> np.ndarray:
-    """
-    Apply concave focus via cumulative centric dot product.
-    
-    For each probability p_i, we compute a focus weight based on:
-    1. Distance from the centroid (mean position weighted by probabilities)
-    2. Cumulative dot product with the probability mass distribution
-    3. Concave transformation (sqrt) to emphasize central tendencies
-    
-    Args:
-        p: probability distribution (will be normalized if needed)
-        strength: strength of focus effect (0.0 = no effect, 1.0 = strong focus)
-    
-    Returns:
-        Focused probability distribution
-    """
-    p = np.asarray(p, dtype=float)
-    p = p / (p.sum() + 1e-12)  # ensure normalized
-    
-    if len(p) <= 1 or strength <= 0.0:
-        return p
-    
-    strength = max(0.0, min(1.0, strength))
-    
-    # Position array (normalized to [0, 1])
-    positions = np.arange(len(p), dtype=float)
-    positions = positions / (len(p) - 1) if len(p) > 1 else positions
-    
-    # Centroid: expected position under p
-    centroid = np.dot(positions, p)
-    
-    # Distance from centroid (normalized)
-    distances = np.abs(positions - centroid)
-    max_dist = distances.max()
-    if max_dist > 1e-12:
-        distances = distances / max_dist
-    
-    # Cumulative distribution for dot product
-    cumsum = np.cumsum(p)
-    
-    # Centric dot product: measure alignment with cumulative mass
-    # Elements near the centroid get higher scores
-    centric_scores = np.zeros_like(p)
-    for i in range(len(p)):
-        # Dot product of local neighborhood with cumulative mass
-        start = max(0, i - 3)
-        end = min(len(p), i + 4)
-        local_p = p[start:end]
-        local_cumsum = cumsum[start:end]
-        centric_scores[i] = np.dot(local_p, local_cumsum)
-    
-    # Normalize centric scores
-    centric_scores = centric_scores / (centric_scores.max() + 1e-12)
-    
-    # Concave transformation: sqrt emphasizes mid-range values
-    # Combines distance (penalize outliers) with centric scores (reward alignment)
-    focus_weights = np.sqrt(
-        (1.0 - distances) * centric_scores + 1e-12
-    )
-    
-    # Apply focus with strength parameter
-    focused = p * (1.0 + strength * focus_weights)
-    focused = focused / (focused.sum() + 1e-12)
-    
-    return focused
-
-
 def basic_tokenize(text: str) -> List[str]:
     text = text.replace("\n", " ")
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
@@ -156,9 +150,7 @@ def detokenize(tokens: List[str]) -> str:
     out = []
     for t in tokens:
         if t in [".", ",", ";", ":", "!", "?", ")", "("]:
-            if t == "(":
-                out.append(t)
-            elif t == ")":
+            if t in ["(", ")"]:
                 out.append(t)
             else:
                 if out:
@@ -198,62 +190,88 @@ def load_text(path: str) -> str:
     raise ValueError(f"Unsupported file extension: {ext}")
 
 
-def load_hf_dataset(
-    dataset_name: str,
-    config_name: Optional[str] = None,
-    split: str = "train",
-    text_column: Optional[str] = None,
-    max_samples: Optional[int] = None,
-    progress: Optional[gr.Progress] = None,
-) -> str:
-    """Load text from a Hugging Face dataset."""
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        raise ImportError("Please install datasets: pip install datasets")
+# ----------------------------
+# Quadgram LM (symbolic)
+# ----------------------------
+class QuadgramLM:
+    def __init__(self, add_k: float = 0.25):
+        self.add_k = float(add_k)
+        self.uni: Dict[str, int] = {}
+        self.bi: Dict[Tuple[str, str], int] = {}
+        self.tri: Dict[Tuple[str, str, str], int] = {}
+        self.quad: Dict[Tuple[str, str, str, str], int] = {}
+        self.vocab: List[str] = []
+        self.total = 0
 
-    if progress:
-        progress(0, desc=f"Loading dataset: {dataset_name}")
+    def ingest(self, tokens: List[str]) -> None:
+        self.uni.clear(); self.bi.clear(); self.tri.clear(); self.quad.clear()
+        self.total = 0
+        for t in tokens:
+            self.uni[t] = self.uni.get(t, 0) + 1
+            self.total += 1
+        for i in range(len(tokens) - 1):
+            k = (tokens[i], tokens[i + 1])
+            self.bi[k] = self.bi.get(k, 0) + 1
+        for i in range(len(tokens) - 2):
+            k = (tokens[i], tokens[i + 1], tokens[i + 2])
+            self.tri[k] = self.tri.get(k, 0) + 1
+        for i in range(len(tokens) - 3):
+            k = (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])
+            self.quad[k] = self.quad.get(k, 0) + 1
+        self.vocab = list(self.uni.keys())
 
-    if config_name:
-        ds = load_dataset(dataset_name, config_name, split=split)
-    else:
-        ds = load_dataset(dataset_name, split=split)
+    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
+        cont = []
+        for (a, b, c, d), count in self.quad.items():
+            if a == w1 and b == w2 and c == w3:
+                cont.append(d)
+        if not cont:
+            for (a, b, c), count in self.tri.items():
+                if a == w2 and b == w3:
+                    cont.append(c)
+        if not cont:
+            for (a, b), count in self.bi.items():
+                if a == w3:
+                    cont.append(b)
+        if not cont:
+            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
-    if text_column is None:
-        text_candidates = ["text", "article", "content", "document", "context", "sentence"]
-        for candidate in text_candidates:
-            if candidate in ds.column_names:
-                text_column = candidate
-                break
-        if text_column is None:
-            text_column = ds.column_names[0]
+        seen = set()
+        cand = []
+        for w in cont:
+            if w not in seen:
+                seen.add(w)
+                cand.append(w)
+        cand = cand[:500]
 
-    if text_column not in ds.column_names:
-        raise ValueError(f"Column '{text_column}' not found. Available: {ds.column_names}")
+        V = len(self.vocab) + 1
+        add_k = self.add_k
 
-    if max_samples and max_samples > 0:
-        ds = ds.select(range(min(max_samples, len(ds))))
+        def get_prob(w4: str) -> float:
+            c123 = self.tri.get((w1, w2, w3), 0)
+            c1234 = self.quad.get((w1, w2, w3, w4), 0)
+            if c123 > 0:
+                return (c1234 + add_k) / (c123 + add_k * V)
 
-    if progress:
-        progress(0.5, desc="Extracting text from dataset")
+            c12 = self.bi.get((w2, w3), 0)
+            c123_tri = self.tri.get((w2, w3, w4), 0)
+            if c12 > 0:
+                return (c123_tri + add_k) / (c12 + add_k * V)
 
-    texts = []
-    for item in ds:
-        t = item[text_column]
-        if isinstance(t, str) and t.strip():
-            texts.append(t.strip())
+            c1 = self.uni.get(w3, 0)
+            c12_bi = self.bi.get((w3, w4), 0)
+            if c1 > 0:
+                return (c12_bi + add_k) / (c1 + add_k * V)
 
-    combined = "\n\n".join(texts)
+            return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
 
-    if progress:
-        progress(1.0, desc="Dataset loaded successfully")
-
-    return combined
+        probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
+        probs = probs / (probs.sum() + 1e-12)
+        return cand, probs
 
 
 # ----------------------------
-# Graph-theoretic generator
+# Graph generator state
 # ----------------------------
 @dataclass
 class Nodelet:
@@ -267,132 +285,16 @@ class Nodelet:
 class ModelState:
     nodelets: List[Nodelet]
     vocab100: List[str]
-    binding_W: np.ndarray
-    bar_probs: np.ndarray
-    bar_logits: np.ndarray
+    binding_W: torch.Tensor
+    bar_probs: torch.Tensor
     token_boost: Dict[str, float]
-    pillar_weights: np.ndarray
-    geometric_bias: np.ndarray
-    # Graph representations
+    pillar_weights: torch.Tensor
+    geometric_bias: torch.Tensor
     semantic_graph: nx.Graph
     lm_graph: nx.DiGraph
 
 
-class QuadgramLM:
-    """4-gram language model with add-k smoothing + transition graph export."""
-    def __init__(self, add_k: float = 0.25):
-        self.add_k = add_k
-        self.uni: Dict[str, int] = {}
-        self.bi: Dict[Tuple[str, str], int] = {}
-        self.tri: Dict[Tuple[str, str, str], int] = {}
-        self.quad: Dict[Tuple[str, str, str, str], int] = {}
-        self.vocab: List[str] = []
-        self.total: int = 0
-
-    def fit(self, tokens: List[str]) -> None:
-        self.uni.clear()
-        self.bi.clear()
-        self.tri.clear()
-        self.quad.clear()
-        self.total = 0
-
-        def inc(d, key, val=1):
-            d[key] = d.get(key, 0) + val
-
-        for t in tokens:
-            inc(self.uni, t)
-            self.total += 1
-        for i in range(len(tokens) - 1):
-            inc(self.bi, (tokens[i], tokens[i + 1]))
-        for i in range(len(tokens) - 2):
-            inc(self.tri, (tokens[i], tokens[i + 1], tokens[i + 2]))
-        for i in range(len(tokens) - 3):
-            inc(self.quad, (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3]))
-        self.vocab = list(self.uni.keys())
-
-    def _prob_unigram(self, w: str) -> float:
-        V = len(self.vocab) + 1
-        return (self.uni.get(w, 0) + self.add_k) / (self.total + self.add_k * V)
-
-    def _prob_bigram(self, w1: str, w2: str) -> float:
-        V = len(self.vocab) + 1
-        c1 = self.uni.get(w1, 0)
-        c12 = self.bi.get((w1, w2), 0)
-        return (c12 + self.add_k) / (c1 + self.add_k * V) if c1 > 0 else self._prob_unigram(w2)
-
-    def _prob_trigram(self, w1: str, w2: str, w3: str) -> float:
-        V = len(self.vocab) + 1
-        c12 = self.bi.get((w1, w2), 0)
-        c123 = self.tri.get((w1, w2, w3), 0)
-        return (c123 + self.add_k) / (c12 + self.add_k * V) if c12 > 0 else self._prob_bigram(w2, w3)
-
-    def _prob_quadgram(self, w1: str, w2: str, w3: str, w4: str) -> float:
-        V = len(self.vocab) + 1
-        c123 = self.tri.get((w1, w2, w3), 0)
-        c1234 = self.quad.get((w1, w2, w3, w4), 0)
-        return (c1234 + self.add_k) / (c123 + self.add_k * V) if c123 > 0 else self._prob_trigram(w2, w3, w4)
-
-    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], np.ndarray]:
-        cont: List[str] = []
-
-        for (a, b, c, d), _count in self.quad.items():
-            if a == w1 and b == w2 and c == w3:
-                cont.append(d)
-
-        if not cont:
-            for (a, b, c), _count in self.tri.items():
-                if a == w2 and b == w3:
-                    cont.append(c)
-
-        if not cont:
-            for (a, b), _count in self.bi.items():
-                if a == w3:
-                    cont.append(b)
-
-        if not cont:
-            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
-
-        seen = set()
-        cand = []
-        for w in cont:
-            if w not in seen:
-                seen.add(w)
-                cand.append(w)
-        cand = cand[:500]
-
-        probs = np.array([self._prob_quadgram(w1, w2, w3, w) for w in cand], dtype=float)
-        probs = probs / (probs.sum() + 1e-12)
-        return cand, probs
-
-    def build_transition_graph(self, max_edges: int = 20000) -> nx.DiGraph:
-        """
-        Graph theory view of LM: weighted digraph on tokens.
-        Edge weight = aggregated transition frequency (w3 -> w4) across all quadgrams.
-        """
-        G = nx.DiGraph()
-        # Aggregate quad transitions by (w3 -> w4)
-        agg: Dict[Tuple[str, str], int] = {}
-        for (w1, w2, w3, w4), c in self.quad.items():
-            agg[(w3, w4)] = agg.get((w3, w4), 0) + int(c)
-
-        # Keep top edges for responsiveness
-        items = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:max_edges]
-        for (a, b), c in items:
-            if not G.has_node(a):
-                G.add_node(a, kind="tok")
-            if not G.has_node(b):
-                G.add_node(b, kind="tok")
-            G.add_edge(a, b, weight=float(c))
-        return G
-
-
 class NeuroSymbolicGraphGenerator:
-    """
-    Same settings as your original code, but adds graph representations and
-    gates outputs with automorphism/isomorphism-derived checks.
-    Now includes concave focus for probability distributions.
-    """
-
     def __init__(
         self,
         nodelets_n: int = 10,
@@ -402,41 +304,41 @@ class NeuroSymbolicGraphGenerator:
         steer_strength: float = 1.35,
         lm_add_k: float = 0.25,
         pillar_strength: float = 0.85,
-        pillar_floor: float = 0.25,
         geometric_strength: float = 0.3,
         rfe_enabled: bool = True,
         rfe_iterations: int = 3,
         rfe_removal_rate: float = 0.15,
-        concave_focus_strength: float = 0.5,
+        focus_strength: float = 0.5,
+        gelu_seed: int = 1337,
+        gelu_hidden: int = 32,
     ):
-        self.nodelets_n = nodelets_n
-        self.bars_n = bars_n
-        self.svd_random_state = svd_random_state
-        self.softmax_temp = softmax_temp
-        self.steer_strength = steer_strength
-        self.lm_add_k = lm_add_k
+        self.nodelets_n = int(nodelets_n)
+        self.bars_n = int(bars_n)
+        self.svd_random_state = int(svd_random_state)
+        self.softmax_temp = float(softmax_temp)
+        self.lm_add_k = float(lm_add_k)
         self.pillar_strength = float(pillar_strength)
-        self.pillar_floor = float(pillar_floor)
         self.geometric_strength = float(geometric_strength)
         self.rfe_enabled = bool(rfe_enabled)
         self.rfe_iterations = int(rfe_iterations)
         self.rfe_removal_rate = float(rfe_removal_rate)
-        self.concave_focus_strength = float(concave_focus_strength)
 
-    # ----------------------------
-    # Graph helpers (output gating)
-    # ----------------------------
+        self.focus_layer = LateralInhibition(strength=float(focus_strength))
+        self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
+
+        self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh")
+        self.synthetic_bias.reset_seed(int(gelu_seed))
+        self.synthetic_bias.freeze_(True)  # default frozen unless training button used
+
+        self.pruner: Optional[SynapticPruner] = None
+
     def _token_class(self, tok: str) -> str:
         if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
             return "PUNC"
         if not re.match(r"[a-z]", tok):
             return "OTHER"
         L = len(tok)
-        if L <= 3:
-            return "S"
-        if L <= 7:
-            return "M"
-        return "L"
+        return "S" if L <= 3 else "M" if L <= 7 else "L"
 
     def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> nx.DiGraph:
         toks = tokens[:max_nodes]
@@ -449,802 +351,415 @@ class NeuroSymbolicGraphGenerator:
             G.add_edge(i, i + 2, rel="skip")
         return G
 
-    def _estimate_automorphisms(self, G: nx.Graph, limit: int = 150) -> int:
-        node_match = iso.categorical_node_match("cls", default=None) if G.is_directed() else None
-        edge_match = iso.categorical_edge_match("rel", default=None) if G.is_directed() else None
+    def _graph_signature(self, G: nx.Graph) -> Dict[str, object]:
+        deg = [d for _, d in G.degree()]
+        wl_mode = G.to_undirected() if G.is_directed() else G
+        node_attr = "cls" if G.is_directed() else None
+        wl = weisfeiler_lehman_graph_hash(wl_mode, node_attr=node_attr, iterations=3, digest_size=16)
 
-        GM = iso.DiGraphMatcher(G, G, node_match=node_match, edge_match=edge_match) if G.is_directed() \
-             else iso.GraphMatcher(G, G, node_match=node_match, edge_match=edge_match)
+        match_kwargs = (
+            {"node_match": iso.categorical_node_match("cls", None),
+             "edge_match": iso.categorical_edge_match("rel", None)}
+            if G.is_directed()
+            else {}
+        )
+        GM = iso.DiGraphMatcher(G, G, **match_kwargs) if G.is_directed() else iso.GraphMatcher(G, G, **match_kwargs)
 
         cnt = 0
-        for _mapping in GM.isomorphisms_iter():
+        for _ in GM.isomorphisms_iter():
             cnt += 1
-            if cnt >= limit:
+            if cnt >= 150:
                 break
-        return cnt
 
-    def _graph_signature(self, G: nx.Graph) -> Dict[str, object]:
-        if isinstance(G, nx.DiGraph):
-            deg = [d for _, d in G.degree()]
-            wl = weisfeiler_lehman_graph_hash(G.to_undirected(), node_attr="cls", iterations=3, digest_size=16)
-        else:
-            deg = [d for _, d in G.degree()]
-            wl = weisfeiler_lehman_graph_hash(G, node_attr=None, iterations=3, digest_size=16)
+        return {"deg_hist": np.bincount(deg, minlength=16)[:16], "wl": wl, "aut_est": cnt}
 
-        deg_hist = np.bincount(np.array(deg, dtype=int), minlength=16)[:16]
-        aut_est = self._estimate_automorphisms(G, limit=150)
+    def _passes_automorphism_checks(self, ref_sig, out_sig) -> bool:
+        strict = max(0.0, min(2.0, self.geometric_strength))
 
-        return {
-            "n": G.number_of_nodes(),
-            "m": G.number_of_edges(),
-            "deg_hist": deg_hist,
-            "wl": wl,
-            "aut_est": aut_est,
-        }
-
-    def _passes_automorphism_checks(self, ref_sig: Dict[str, object], out_sig: Dict[str, object]) -> bool:
-        strict = float(self.geometric_strength)  # 0..2 from UI
-        strict = max(0.0, min(2.0, strict))
-
-        # Degree-shape similarity
-        ref = ref_sig["deg_hist"].astype(float)
-        out = out_sig["deg_hist"].astype(float)
-        ref /= (ref.sum() + 1e-12)
-        out /= (out.sum() + 1e-12)
-        l1 = float(np.abs(ref - out).sum())  # 0..2
-
-        max_l1 = 1.10 - 0.35 * strict
-        if l1 > max(0.25, max_l1):
+        ref = ref_sig["deg_hist"].astype(float); ref /= (ref.sum() + 1e-12)
+        out = out_sig["deg_hist"].astype(float); out /= (out.sum() + 1e-12)
+        if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict):
             return False
 
-        # Symmetry constraint (automorphism estimate ratio band)
-        a_ref = max(1, int(ref_sig["aut_est"]))
-        a_out = max(1, int(out_sig["aut_est"]))
-        ratio = a_out / a_ref
-
-        band = 3.5 - 1.2 * min(2.0, float(self.steer_strength) / 2.0)  # steer_strength 0..5
-        band = max(1.3, band)
+        ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
+        band = max(1.3, 3.5 - 1.2 * min(1.0, self.gate_layer.steer_strength / 2.0))
         if not (1.0 / band <= ratio <= band):
             return False
 
-        # Optional ultra strict WL match
-        if strict >= 1.6:
-            if out_sig["wl"] != ref_sig["wl"]:
-                return False
+        if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]:
+            return False
 
         return True
 
-    # ----------------------------
-    # RFE
-    # ----------------------------
-    def _recursive_feature_elimination(
-        self,
-        W: np.ndarray,
-        energies: np.ndarray,
-        vocab100: List[str],
-        progress: Optional[gr.Progress] = None,
-    ) -> Tuple[np.ndarray, List[str], List[int]]:
+    def _synaptic_prune(self, W: torch.Tensor, energies: torch.Tensor, vocab100: List[str], progress=None):
         if not self.rfe_enabled or self.rfe_iterations <= 0:
-            return W, vocab100, list(range(len(vocab100)))
+            return W, vocab100
 
         k, bars_n = W.shape
-        kept_indices = np.arange(bars_n)
-        W_current = W.copy()
-        vocab_current = list(vocab100)
+        self.pruner = SynapticPruner(bars_n)
+
+        W_curr = W.detach().clone().requires_grad_(True)
+        kept_mask = torch.ones(bars_n, dtype=torch.bool)
 
         for iteration in range(self.rfe_iterations):
             if progress:
-                progress(
-                    0.8 + 0.05 * (iteration / self.rfe_iterations),
-                    desc=f"RFE iteration {iteration + 1}/{self.rfe_iterations}"
-                )
+                progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
 
-            importance = np.zeros(W_current.shape[1])
-            for i in range(k):
-                importance += energies[i] * np.abs(W_current[i, :])
+            W_modulated = self.pruner(W_curr)
+            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * torch.var(W_modulated, dim=0).sum()
+            loss.backward()
 
-            variance_score = np.var(W_current, axis=0)
-            importance = 0.7 * importance + 0.3 * variance_score
-            importance = importance / (importance.max() + 1e-12)
+            with torch.no_grad():
+                grads = W_curr.grad.abs().sum(dim=0)
+                weights = W_curr.abs().sum(dim=0)
+                importance = 0.6 * weights + 0.4 * grads
+                importance = importance / (importance.max() + 1e-12)
 
-            n_current = W_current.shape[1]
-            n_to_remove = max(1, int(n_current * self.rfe_removal_rate))
-            n_to_keep = n_current - n_to_remove
+                n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
+                if n_keep < 10:
+                    break
 
-            if n_to_keep < max(10, self.bars_n // 3):
-                break
+                active = torch.where(kept_mask)[0]
+                local_importance = importance[active]
+                _, top_local = torch.topk(local_importance, k=min(n_keep, local_importance.numel()))
 
-            top_features = np.argsort(-importance)[:n_to_keep]
-            top_features = np.sort(top_features)
+                new_mask = torch.zeros_like(kept_mask)
+                new_mask[active[top_local]] = True
+                kept_mask = new_mask
 
-            W_current = W_current[:, top_features]
-            vocab_current = [vocab_current[i] for i in top_features]
-            kept_indices = kept_indices[top_features]
+                W_curr.grad.zero_()
 
+        with torch.no_grad():
+            final_idx = torch.where(kept_mask)[0]
+            W_final = W[:, final_idx]
+            vocab_final = [vocab100[i] for i in final_idx.tolist()]
+        return W_final, vocab_final
+
+    def build_state(self, text: str, progress=None) -> ModelState:
         if progress:
-            progress(0.85, desc=f"RFE complete: {len(vocab_current)}/{bars_n} features retained")
-
-        return W_current, vocab_current, kept_indices.tolist()
-
-    # ----------------------------
-    # Semantic narrative + boosts
-    # ----------------------------
-    def _nodelet_narrative(self, i: int, terms: List[Tuple[str, float]], energy: float) -> str:
-        tops = [t for t, _ in terms[:8]]
-        tops_clean = []
-        for t in tops:
-            if len(tops_clean) >= 6:
-                break
-            if t not in tops_clean:
-                tops_clean.append(t)
-        strength = "high" if energy > 2.2 else "moderate" if energy > 1.4 else "light"
-        return (
-            f"Nodelet {i} carries a {strength}-intensity semantic current, orbiting around "
-            f"{', '.join(tops_clean)}."
-        )
-
-    def _chunk_text(self, text: str) -> List[str]:
-        paras = [p.strip() for p in re.split(r"\n\s*\n", text) if len(p.strip()) >= 120]
-        if len(paras) >= 6:
-            return paras[:500]
-        text2 = re.sub(r"\s+", " ", text).strip()
-        if len(text2) < 400:
-            return [text2]
-        blocks = []
-        step = 320
-        for i in range(0, min(len(text2), 320 * 600), step):
-            blk = text2[i:i + step]
-            if len(blk) >= 150:
-                blocks.append(blk)
-        return blocks or [text2[:800]]
-
-    def _make_token_boost(
-        self,
-        vocab100: List[str],
-        bar_probs: np.ndarray,
-        nodelets: List[Nodelet],
-        pillar_weights: np.ndarray,
-    ) -> Dict[str, float]:
-        boost: Dict[str, float] = {}
-        for idx, (term, p) in enumerate(zip(vocab100, bar_probs)):
-            pw = float(pillar_weights[idx]) if idx < len(pillar_weights) else 1.0
-            for w in term.split():
-                if len(w) <= 2 or w in STOPWORDS:
-                    continue
-                val = float(math.log(p + 1e-12) + 6.0) + 0.35 * float(np.log(pw + 1e-12) + 1.0)
-                boost[w] = max(boost.get(w, 0.0), val)
-
-        energies = np.array([n.energy for n in nodelets], dtype=float)
-        energies = energies / (energies.max() + 1e-12)
-        for i, n in enumerate(nodelets):
-            top_words = []
-            for t, _w in n.top_terms[:12]:
-                for tok in t.split():
-                    if len(tok) > 2 and tok not in STOPWORDS:
-                        top_words.append(tok)
-            node_strength = energies[i]
-            for w in top_words:
-                boost[w] = boost.get(w, 0.0) + 0.35 * node_strength
-
-        if boost:
-            vals = np.array(list(boost.values()), dtype=float)
-            lo, hi = float(np.percentile(vals, 10)), float(np.percentile(vals, 95))
-            if hi - lo < 1e-9:
-                hi = lo + 1.0
-            for k in list(boost.keys()):
-                boost[k] = 1.5 * clip01((boost[k] - lo) / (hi - lo))
-        return boost
-
-    def _extract_seed_words(self, text_seed: str) -> List[str]:
-        if not text_seed:
-            return []
-        toks = basic_tokenize(text_seed)
-        words = [t for t in toks if re.match(r"[a-z]", t)]
-        out = []
-        seen = set()
-        for w in words:
-            if len(w) <= 2 or w in STOPWORDS:
-                continue
-            if w not in seen:
-                seen.add(w)
-                out.append(w)
-        return out[:50]
-
-    # ----------------------------
-    # Graph construction from semantics
-    # ----------------------------
-    def _build_semantic_graph(self, nodelets: List[Nodelet], vocab100: List[str], W: np.ndarray) -> nx.Graph:
-        """
-        Bipartite graph: nodelets <-> bars, edge weight is binding strength.
-        """
-        G = nx.Graph()
-        for n in nodelets:
-            G.add_node(f"N{n.idx}", bipartite=0, kind="nodelet", energy=float(n.energy))
-        for j, term in enumerate(vocab100):
-            G.add_node(f"B{j}", bipartite=1, kind="bar", term=term)
-        for i in range(W.shape[0]):
-            for j in range(W.shape[1]):
-                w = float(W[i, j])
-                if w > 0.0:
-                    G.add_edge(f"N{i}", f"B{j}", weight=w)
-        return G
-
-    # ----------------------------
-    # Fit (TF-IDF -> SVD -> W -> RFE -> pillars -> geometric -> concave focus)
-    # ----------------------------
-    def fit(self, text: str, progress: Optional[gr.Progress] = None) -> ModelState:
-        if progress:
-            progress(0, desc="Normalizing text")
+            progress(0, desc="Normalizing")
         text = normalize(text)
-        chunks = self._chunk_text(text)
 
-        if progress:
-            progress(0.2, desc="Computing TF-IDF vectors")
-        vec = TfidfVectorizer(
-            lowercase=True,
-            stop_words="english",
-            max_features=8000,
-            ngram_range=(1, 2),
-        )
-        X = vec.fit_transform(chunks)
+        vec = TfidfVectorizer(stop_words="english", max_features=8000, ngram_range=(1, 2))
+        X = vec.fit_transform(re.split(r"\n\s*\n", text)[:500])
         vocab = np.array(vec.get_feature_names_out())
-        global_mass = np.asarray(X.sum(axis=0)).ravel()
-        top_idx = np.argsort(-global_mass)[: self.bars_n]
+
+        top_idx = np.argsort(-np.asarray(X.sum(axis=0)).ravel())[:self.bars_n]
         vocab100 = vocab[top_idx].tolist()
 
-        if progress:
-            progress(0.4, desc="Performing SVD decomposition")
-        k = min(self.nodelets_n, max(2, X.shape[0] - 1), max(2, X.shape[1] - 1))
+        X_svd = X[:, top_idx]
+        n_rows, n_cols = X_svd.shape
+        max_rank = min(n_rows, n_cols)
+        k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
+
         svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
-        svd.fit(X)
+        svd.fit(X_svd)
 
         nodelets = []
         for i, comp in enumerate(svd.components_):
-            term_idx = np.argsort(-np.abs(comp))[:20]
-            terms = [(vocab[j], float(comp[j])) for j in term_idx]
-            energy = float(np.linalg.norm(comp))
-            narrative = self._nodelet_narrative(i, terms, energy)
-            nodelets.append(Nodelet(i, terms, energy, narrative))
+            terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))], key=lambda x: -abs(x[1]))[:10]
+            eng = float(np.linalg.norm(comp))
+            nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
 
-        if progress:
-            progress(0.8, desc="Building bindings matrix")
-        W = np.zeros((k, self.bars_n))
-        for i, n in enumerate(nodelets):
-            weights = {t: abs(w) for t, w in n.top_terms}
-            for j, term in enumerate(vocab100):
-                W[i, j] = weights.get(term, 0.0)
-            mx = W[i].max()
-            if mx > 1e-12:
-                W[i] /= mx
+        W = torch.tensor(svd.components_, dtype=torch.float32)
+        W = F.relu(W)
+        W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
-        energies = np.array([n.energy for n in nodelets])
-        energies /= energies.max() + 1e-12
+        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32)
+        energies = energies / (energies.max() + 1e-12)
 
-        # RFE
-        W, vocab100, _kept_indices = self._recursive_feature_elimination(
-            W=W,
-            energies=energies,
-            vocab100=vocab100,
-            progress=progress,
-        )
+        W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
 
-        rng = np.random.default_rng(self.svd_random_state)
-        base_logits = (energies[:, None] * W).sum(axis=0)
-        base_logits += 0.02 * rng.normal(size=base_logits.shape)
-        base_probs = softmax(base_logits, temp=self.softmax_temp)
+        logits = (energies.view(-1, 1) * W).sum(dim=0)
+        probs = F.softmax(logits / self.softmax_temp, dim=-1)
+        probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        # Pillars
-        if self.pillar_strength > 0.0:
-            pnorm = base_probs / (base_probs.max() + 1e-12)
-            pillar_bias = self.pillar_strength * pnorm
-        else:
-            pillar_bias = np.zeros_like(base_probs)
+        token_boost: Dict[str, float] = {}
+        for w, p in zip(vocab100, probs.detach().cpu().tolist()):
+            for subw in w.split():
+                if len(subw) > 2 and subw not in STOPWORDS:
+                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
 
-        # Geometric modulation
-        if len(base_probs) > 1 and self.geometric_strength > 0.0:
-            positions = np.arange(len(base_probs)).astype(float)
-            distances = np.abs(positions - positions[0])
-            max_dist = distances.max()
-            norm_distances = distances / max_dist if max_dist > 1e-12 else distances
-
-            prob_vectors = base_probs - base_probs[0]
-            angles = np.arctan2(prob_vectors, norm_distances + 1e-12)
-            angle_norm = (angles - angles.min()) / (angles.max() - angles.min() + 1e-12)
-            geometric_bias = self.geometric_strength * (norm_distances + angle_norm)
-        else:
-            geometric_bias = np.zeros_like(base_probs)
-
-        logits = base_logits + pillar_bias + geometric_bias
-        probs = softmax(logits, temp=self.softmax_temp)
-        
-        # Apply concave focus to probability distribution
-        probs = concave_focus(probs, strength=self.concave_focus_strength)
-
-        token_boost = self._make_token_boost(vocab100, probs, nodelets, pillar_bias)
-
-        # Graph views
-        semantic_graph = self._build_semantic_graph(nodelets, vocab100, W)
-
-        # LM graph is built later when LM is fit; placeholder for now
-        lm_graph = nx.DiGraph()
+        G_sem = nx.Graph()
+        W_np = W.detach().cpu().numpy()
+        for i in range(W_np.shape[0]):
+            for j in range(W_np.shape[1]):
+                if W_np[i, j] > 0.05:
+                    G_sem.add_edge(f"N{i}", f"B{j}", weight=float(W_np[i, j]))
 
         return ModelState(
             nodelets=nodelets,
             vocab100=vocab100,
             binding_W=W,
             bar_probs=probs,
-            bar_logits=logits,
             token_boost=token_boost,
-            pillar_weights=pillar_bias,
-            geometric_bias=geometric_bias,
-            semantic_graph=semantic_graph,
-            lm_graph=lm_graph,
+            pillar_weights=torch.zeros_like(probs),
+            geometric_bias=torch.zeros_like(probs),
+            semantic_graph=G_sem,
+            lm_graph=nx.DiGraph(),
         )
 
-    # ----------------------------
-    # Generation (graph-gated with concave focus)
-    # ----------------------------
-    def _sample_next(
-        self,
-        lm: QuadgramLM,
-        w1: str,
-        w2: str,
-        w3: str,
-        token_boost: Dict[str, float],
-        rng: np.random.Generator,
-        temperature: float = 0.95,
-    ) -> str:
-        cand, base_p = lm.next_distribution(w1, w2, w3)
-        
-        # Apply concave focus to base LM probabilities
-        base_p = concave_focus(base_p, strength=self.concave_focus_strength)
-        
-        scores = np.log(base_p + 1e-12)
-        for i, w in enumerate(cand):
-            if w in [".", ",", ";", ":", "!", "?", "(", ")"]:
-                continue
-            scores[i] = scores[i] + self.steer_strength * token_boost.get(w, 0.0)
-        scores = scores / max(temperature, 1e-9)
-        scores = scores - np.max(scores)
-        p = np.exp(scores)
-        p = p / (p.sum() + 1e-12)
-        
-        # Apply concave focus one more time to final distribution
-        p = concave_focus(p, strength=self.concave_focus_strength * 0.7)
-        
-        return str(rng.choice(cand, p=p))
-
-    def _choose_start_word(
+    def _final_probs_for_context(
         self,
         lm: QuadgramLM,
         token_boost: Dict[str, float],
-        rng: np.random.Generator,
-        seed_words: List[str],
-    ) -> str:
-        usable = [w for w in seed_words if w in lm.uni and w not in STOPWORDS and len(w) > 2]
-        if usable:
-            usable.sort(key=lambda w: (token_boost.get(w, 0.0), lm.uni.get(w, 0)), reverse=True)
-            return str(rng.choice(usable[:10]))
-        boosted = [(w, b) for w, b in token_boost.items() if b > 0.9 and w in lm.uni]
-        if boosted:
-            return max(boosted, key=lambda x: x[1])[0]
-        return max(lm.uni.items(), key=lambda x: x[1])[0]
+        w1: str, w2: str, w3: str
+    ) -> Tuple[List[str], torch.Tensor]:
+        cand, base_probs = lm.next_distribution(w1, w2, w3)
 
-    def _generate_sentence(
-        self,
-        lm: QuadgramLM,
-        token_boost: Dict[str, float],
-        rng: np.random.Generator,
-        seed_words: Optional[List[str]] = None,
-        min_len: int = 800,
-        max_len: int = 900,
-    ) -> str:
-        seed_words = seed_words or []
-        seed = self._choose_start_word(lm, token_boost, rng, seed_words)
-        tokens = ["("] if rng.random() < 0.12 else []
-        tokens.append(seed)
+        if len(cand) == 0:
+            cand = lm.vocab[:100] if lm.vocab else ["the", "is", "a"]
+            base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
+        else:
+            base_p = base_probs.detach().clone().to(dtype=torch.float32)
 
-        w1 = tokens[-1]
-        w2 = tokens[-1]
-        w3 = tokens[-1]
+        if base_p.numel() != len(cand):
+            base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
 
-        target_len = int(rng.integers(min_len, max_len + 1))
-        for _ in range(target_len):
-            nxt = self._sample_next(lm, w1, w2, w3, token_boost, rng)
-            tokens.append(nxt)
-            w1, w2, w3 = w2, w3, nxt
-            if nxt in [".", "!", "?"] and len([t for t in tokens if re.match(r"[a-z]", t)]) >= min_len:
-                break
+        base_p = base_p.view(-1)
+        base_p = base_p / (base_p.sum() + 1e-12)
+        base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        if tokens and tokens[-1] not in [".", "!", "?"]:
-            tokens.append(".")
+        boosts = torch.tensor([token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
+        bias = self.synthetic_bias(base_p, boosts).view(-1)
 
-        if tokens and tokens[0] == "(" and ")" not in tokens:
-            if rng.random() < 0.6:
-                tokens.insert(min(len(tokens), 6), ")")
-            else:
-                tokens = tokens[1:]
+        final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9)
+        return cand, final_probs
 
-        return detokenize(tokens)
-
-    def _generate_takeaways(
-        self,
-        text: str,
-        state: ModelState,
-        n_takeaways: int,
-        rng: np.random.Generator,
-        text_seed: str = "",
-        progress: Optional[gr.Progress] = None,
-    ) -> List[str]:
-        if progress:
-            progress(0, desc="Training language model (4-gram)")
+    def generate_report(self, text: str, n_takeaways=7, seed=7, text_seed="", progress=None) -> str:
+        rng = np.random.default_rng(int(seed))
+        state = self.build_state(text, progress)
 
         tokens = basic_tokenize(text)
-        if len(tokens) < 600:
-            tokens = tokens * 2
+        lm = QuadgramLM(self.lm_add_k)
+        lm.ingest(tokens)
 
-        lm = QuadgramLM(add_k=self.lm_add_k)
-        lm.fit(tokens)
+        ref_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(text)))
+        seed_words = basic_tokenize(text_seed) if text_seed else []
 
-        # Graph theory: LM as transition digraph
-        state.lm_graph = lm.build_transition_graph(max_edges=20000)
+        # seed word handling
+        seed_tok = seed_words[0] if seed_words else (lm.vocab[0] if lm.vocab else "the")
 
-        # Reference graph signature from the source text structure
-        ref_tokens = basic_tokenize(text)
-        ref_graph = self._build_token_structure_graph(ref_tokens, max_nodes=220)
-        ref_sig = self._graph_signature(ref_graph)
-
-        seed_words = self._extract_seed_words(text_seed)
         takeaways = []
-
-        energies = np.array([n.energy for n in state.nodelets], dtype=float)
-        energies = energies / (energies.max() + 1e-12)
-        
-        # Apply concave focus to nodelet selection probabilities
-        energies = concave_focus(energies, strength=self.concave_focus_strength)
-
-        # More strict => more attempts
-        max_attempts = int(6 + 6 * max(0.0, min(2.0, self.geometric_strength)))
-
-        for i in range(n_takeaways):
+        for i in range(int(n_takeaways)):
             if progress:
-                progress(i / max(1, n_takeaways), desc=f"Generating takeaway {i+1}/{n_takeaways}")
+                progress(i / max(1, int(n_takeaways)), desc=f"Generating {i+1}/{n_takeaways}")
 
-            lead = int(rng.choice(len(state.nodelets), p=softmax(energies, temp=0.9)))
-            row = state.binding_W[lead]
+            best_sent = ""
+            for _ in range(10):
+                # generate a long-ish stream, graph-gated
+                tokens_out = [seed_tok]
+                w1 = w2 = w3 = seed_tok
+                for _step in range(int(rng.integers(800, 900))):
+                    cand, probs = self._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
+                    p = probs.detach().cpu().numpy()
+                    p = p / (p.sum() + 1e-12)
+                    nxt = rng.choice(cand, p=p)
+                    tokens_out.append(nxt)
+                    w1, w2, w3 = w2, w3, nxt
+                    if nxt in [".", "!", "?"] and len([t for t in tokens_out if t.isalpha()]) > 200:
+                        break
+                sent = detokenize(tokens_out)
 
-            local_boost = dict(state.token_boost)
-            for w in seed_words:
-                local_boost[w] = max(local_boost.get(w, 0.0), 1.25)
-
-            topbars = np.argsort(-row)[:10]
-            for b in topbars:
-                term = state.vocab100[b]
-                strength = float(row[b])
-                for w in term.split():
-                    if len(w) > 2 and w not in STOPWORDS:
-                        local_boost[w] = max(local_boost.get(w, 0.0), 1.0 + 0.6 * strength)
-
-            for k in list(local_boost.keys()):
-                local_boost[k] = float(min(2.0, max(0.0, local_boost[k])))
-
-            # Graph-gated rejection sampling
-            last_sent = ""
-            for _attempt in range(max_attempts):
-                sent = self._generate_sentence(lm, local_boost, rng, seed_words=seed_words)
-                last_sent = sent
-
-                out_tokens = basic_tokenize(sent)
-                out_graph = self._build_token_structure_graph(out_tokens, max_nodes=220)
-                out_sig = self._graph_signature(out_graph)
-
+                out_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(sent)))
                 if self._passes_automorphism_checks(ref_sig, out_sig):
-                    takeaways.append(sent)
+                    best_sent = sent
                     break
-            else:
-                takeaways.append(last_sent)
+                best_sent = sent
+            takeaways.append(best_sent)
 
-        if progress:
-            progress(1.0, desc="Generation complete")
-        return takeaways
-
-    def generate_report(
-        self,
-        text: str,
-        n_takeaways: int = 7,
-        seed: int = 7,
-        text_seed: str = "",
-        progress: Optional[gr.Progress] = None,
-    ) -> str:
-        text = normalize(text)
-        state = self.fit(text, progress=progress)
-        rng = np.random.default_rng(int(seed))
-        takeaways = self._generate_takeaways(
-            text, state, n_takeaways=int(n_takeaways), rng=rng, text_seed=text_seed, progress=progress
-        )
         return "\n\n".join(takeaways)
 
 
 # ----------------------------
-# Gradio app
+# Gradio functions: Train + Generate
 # ----------------------------
-def generate_from_file(
-    in_file: str,
-    softmax_temp: float,
-    steer_strength: float,
-    geometric_strength: float,
-    concave_focus_strength: float,
-    rfe_enabled: bool,
-    rfe_iterations: int,
-    rfe_removal_rate: float,
-    n_takeaways: int,
-    seed: int,
-    text_seed: str,
-    output_name: str,
-    progress: gr.Progress = gr.Progress(),
+def train_bias_net(
+    infile,
+    seed,
+    steer,
+    focus,
+    gelu_seed,
+    train_steps,
+    lr,
+    max_contexts,
+    progress=gr.Progress()
 ):
-    if not in_file:
-        raise gr.Error("Please upload an input file.")
-    progress(0, desc="Loading file")
-    raw = load_text(in_file)
+    text = load_text(infile)
 
     gen = NeuroSymbolicGraphGenerator(
-        nodelets_n=10,
-        bars_n=100,
-        svd_random_state=7,
-        softmax_temp=float(softmax_temp),
-        steer_strength=float(steer_strength),
-        lm_add_k=0.25,
-        pillar_strength=0.85,
-        pillar_floor=0.25,
-        geometric_strength=float(geometric_strength),
-        rfe_enabled=bool(rfe_enabled),
-        rfe_iterations=int(rfe_iterations),
-        rfe_removal_rate=float(rfe_removal_rate),
-        concave_focus_strength=float(concave_focus_strength),
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        gelu_seed=int(gelu_seed),
     )
 
-    report = gen.generate_report(
-        raw,
-        n_takeaways=int(n_takeaways),
-        seed=int(seed),
-        text_seed=(text_seed or "").strip(),
-        progress=progress,
-    )
+    progress(0.0, desc="Building state")
+    state = gen.build_state(text, progress)
 
-    progress(0, desc="Saving output file")
-    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
-    stem = Path(in_file).stem
-    out_name = (output_name or "").strip()
-    if not out_name:
-        out_path = tmpdir / f"{stem}_generated_report.txt"
-    else:
-        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
-        out_path = tmpdir / out_name
-    out_path.write_text(report, encoding="utf-8")
-    return report, str(out_path)
+    tokens = basic_tokenize(text)
+    if len(tokens) < 10:
+        return None, "Not enough tokens to train."
+
+    lm = QuadgramLM(gen.lm_add_k)
+    lm.ingest(tokens)
+
+    # Make GELU net trainable
+    gen.synthetic_bias.reset_seed(int(gelu_seed))
+    gen.synthetic_bias.freeze_(False)
+    gen.synthetic_bias.train()
+    gen.gate_layer.eval()
+    gen.focus_layer.eval()
+
+    opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
+
+    # choose training positions
+    # contexts are tokens[i-3:i] -> predict tokens[i]
+    positions = list(range(3, len(tokens)))
+    if max_contexts and int(max_contexts) > 0:
+        positions = positions[: min(len(positions), int(max_contexts))]
+
+    if len(positions) == 0:
+        return None, "No training contexts available."
+
+    rng = np.random.default_rng(int(seed))
+    batch_size = 24
+
+    running_loss = 0.0
+    running_hits = 0
+    running_used = 0
+
+    steps = int(train_steps)
+    for step in range(steps):
+        opt.zero_grad(set_to_none=True)
+        loss_acc = 0.0
+        used = 0
+        hits = 0
+
+        # sample a mini-batch of positions
+        batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
+
+        for i in batch_pos:
+            w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
+            true_next = tokens[i]
+
+            cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
+
+            # supervised only when true is in candidate set (keeps it simple + fast)
+            try:
+                j = cand.index(true_next)
+            except ValueError:
+                continue
+
+            # NLL
+            nll = -torch.log(probs[j].clamp_min(1e-12))
+            loss_acc = loss_acc + nll
+            used += 1
+            hits += 1
+
+        if used == 0:
+            # nothing to learn from this batch
+            continue
+
+        loss = loss_acc / used
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(gen.synthetic_bias.parameters(), 1.0)
+        opt.step()
+
+        running_loss += float(loss.detach().cpu().item())
+        running_hits += hits
+        running_used += used
+
+        if (step + 1) % max(1, steps // 20) == 0:
+            progress((step + 1) / steps, desc=f"Training GELU bias ({step+1}/{steps})")
+
+    avg_loss = running_loss / max(1, (steps if steps > 0 else 1))
+    msg = f"Trained SyntheticGELUBias. Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
+
+    trained = {
+        "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()},
+        "gelu_seed": int(gelu_seed),
+        "focus": float(focus),
+        "steer": float(steer),
+    }
+    return trained, msg
 
 
-def generate_from_hf_dataset(
-    dataset_name: str,
-    config_name: str,
-    split: str,
-    text_column: str,
-    max_samples: int,
-    softmax_temp: float,
-    steer_strength: float,
-    geometric_strength: float,
-    concave_focus_strength: float,
-    rfe_enabled: bool,
-    rfe_iterations: int,
-    rfe_removal_rate: float,
-    n_takeaways: int,
-    seed: int,
-    text_seed: str,
-    output_name: str,
-    progress: gr.Progress = gr.Progress(),
+def generate_with_optional_training(
+    infile,
+    n_take,
+    seed,
+    t_seed,
+    steer,
+    focus,
+    gelu_seed,
+    trained_state,
+    progress=gr.Progress()
 ):
-    if not dataset_name or not dataset_name.strip():
-        raise gr.Error("Please enter a dataset name.")
-
-    raw = load_hf_dataset(
-        dataset_name=dataset_name.strip(),
-        config_name=config_name.strip() if config_name and config_name.strip() else None,
-        split=split,
-        text_column=text_column.strip() if text_column and text_column.strip() else None,
-        max_samples=int(max_samples) if max_samples and max_samples > 0 else None,
-        progress=progress,
-    )
+    text = load_text(infile)
 
     gen = NeuroSymbolicGraphGenerator(
-        nodelets_n=10,
-        bars_n=100,
-        svd_random_state=7,
-        softmax_temp=float(softmax_temp),
-        steer_strength=float(steer_strength),
-        lm_add_k=0.25,
-        pillar_strength=0.85,
-        pillar_floor=0.25,
-        geometric_strength=float(geometric_strength),
-        rfe_enabled=bool(rfe_enabled),
-        rfe_iterations=int(rfe_iterations),
-        rfe_removal_rate=float(rfe_removal_rate),
-        concave_focus_strength=float(concave_focus_strength),
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        gelu_seed=int(gelu_seed),
     )
 
-    report = gen.generate_report(
-        raw,
-        n_takeaways=int(n_takeaways),
-        seed=int(seed),
-        text_seed=(text_seed or "").strip(),
-        progress=progress,
-    )
+    # If trained weights exist, load them (ignore if shapes mismatch)
+    if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
+        try:
+            gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
+        except Exception:
+            pass
+        gen.synthetic_bias.freeze_(True)
+        gen.synthetic_bias.eval()
 
-    progress(0, desc="Saving output file")
-    tmpdir = Path(tempfile.mkdtemp(prefix="neurosym_textgen_"))
-    out_name = (output_name or "").strip()
-    if not out_name:
-        out_path = tmpdir / f"{dataset_name.replace('/', '_')}_generated_report.txt"
-    else:
-        out_name = out_name if out_name.lower().endswith(".txt") else out_name + ".txt"
-        out_path = tmpdir / out_name
-    out_path.write_text(report, encoding="utf-8")
-    return report, str(out_path)
+    return gen.generate_report(text, int(n_take), int(seed), t_seed, progress)
 
 
-def build_app() -> gr.Blocks:
-    # Gradio 6: theme passed to launch(), not Blocks()
-    with gr.Blocks(title="Neurosymbolic Text Generator") as demo:
-        gr.Markdown("# Neurosymbolic Text Generator (Graph Automorphism Gated)")
-        gr.Markdown("*TF‑IDF/SVD nodelets + RFE + quad-gram LM + geometric modulation + concave focus + automorphism checks + HF dataset support*")
+# ----------------------------
+# Gradio UI
+# ----------------------------
+def build_app():
+    with gr.Blocks(title="Neurosymbolic V3.2 (Trainable GELU Bias)") as demo:
+        gr.Markdown("# Neurosymbolic Text Generator V3.2\n*Add Train button (GELU bias fine-tune)*")
 
-        with gr.Tabs():
-            with gr.Tab("Upload File"):
-                with gr.Row():
-                    in_file = gr.File(
-                        label="Input file (.txt/.md/.docx/.pdf)",
-                        file_types=[".txt", ".md", ".docx", ".pdf"],type="filepath",
-                    )
-                    with gr.Column():
-                        output_name_file = gr.Textbox(
-                            label="Output filename (optional)",
-                            placeholder="e.g., report.txt (leave blank to auto-name)",
-                        )
-                        text_seed_file = gr.Textbox(
-                            label="Text seed (optional)",
-                            placeholder="Words/phrase to bias generation (e.g., 'quantum measurement')",
-                        )
+        trained_state = gr.State(None)
 
-                with gr.Row():
-                    softmax_temp_file = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
-                    steer_strength_file = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
-                    geometric_strength_file = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
-                    concave_focus_strength_file = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength")
+        with gr.Row():
+            infile = gr.File(label="Input File", type="filepath")
+            out_txt = gr.Textbox(label="Output", lines=15)
 
-                with gr.Row():
-                    rfe_enabled_file = gr.Checkbox(value=True, label="Enable RFE")
-                    rfe_iterations_file = gr.Slider(1, 10, value=3, step=1, label="RFE iterations")
-                    rfe_removal_rate_file = gr.Slider(0.05, 0.5, value=0.15, step=0.05, label="RFE removal rate")
+        status = gr.Textbox(label="Status", lines=2)
 
-                with gr.Row():
-                    n_takeaways_file = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
-                    seed_file = gr.Number(value=7, precision=0, label="Numeric seed")
+        with gr.Row():
+            n_take = gr.Slider(1, 20, value=5, label="Takeaways")
+            seed = gr.Number(value=42, label="Global Seed")
 
-                run_btn_file = gr.Button("Generate from file", variant="primary", size="lg")
+        with gr.Row():
+            steer = gr.Slider(0, 5, value=1.35, label="Steer Strength")
+            focus = gr.Slider(0, 1, value=0.5, label="Focus Strength (Lateral Inhibition)")
+            gelu_seed = gr.Number(value=1337, label="GELU Init Seed")
 
-                with gr.Row():
-                    preview_file = gr.Textbox(label="Generated report preview", lines=20)
-                    download_file = gr.File(label="Download generated .txt")
+        with gr.Row():
+            train_steps = gr.Slider(10, 2000, value=250, step=10, label="Train steps")
+            lr = gr.Number(value=1e-3, label="LR")
+            max_contexts = gr.Slider(0, 20000, value=4000, step=100, label="Max contexts (0=all)")
 
-            with gr.Tab("Hugging Face Dataset"):
-                gr.Markdown("""
-                ### Load data from Hugging Face datasets
-                Browse datasets at: https://huggingface.co/datasets
-                """)
+        t_seed = gr.Textbox(label="Text Seed")
 
-                with gr.Row():
-                    with gr.Column():
-                        dataset_name = gr.Textbox(
-                            label="Dataset name",
-                            placeholder="e.g., imdb, ag_news, cnn_dailymail",
-                            value="",
-                        )
-                        config_name = gr.Textbox(
-                            label="Config/Subset (if required)",
-                            placeholder="e.g., 3.0.0 for cnn_dailymail, wikitext-2-raw-v1 for wikitext",
-                            value="",
-                        )
-                    with gr.Column():
-                        split = gr.Textbox(
-                            label="Split",
-                            placeholder="train, test, validation, etc.",
-                            value="train",
-                        )
-                        text_column = gr.Textbox(
-                            label="Text column (leave empty for auto-detect)",
-                            placeholder="e.g., text, article, context",
-                            value="",
-                        )
+        with gr.Row():
+            train_btn = gr.Button("Train (GELU Bias)", variant="secondary")
+            gen_btn = gr.Button("Generate", variant="primary")
 
-                with gr.Row():
-                    max_samples = gr.Number(
-                        label="Max samples (0 = all, recommended: 1000-5000)",
-                        value=2000,
-                        precision=0,
-                    )
-                    output_name_hf = gr.Textbox(
-                        label="Output filename (optional)",
-                        placeholder="e.g., report.txt",
-                    )
-
-                with gr.Row():
-                    text_seed_hf = gr.Textbox(
-                        label="Text seed (optional)",
-                        placeholder="Words/phrase to bias generation",
-                        scale=2,
-                    )
-
-                with gr.Row():
-                    softmax_temp_hf = gr.Slider(0.2, 2.5, value=0.85, step=0.05, label="Softmax temp")
-                    steer_strength_hf = gr.Slider(0.0, 5.0, value=1.35, step=0.05, label="Steer strength")
-                    geometric_strength_hf = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Geometric strength")
-                    concave_focus_strength_hf = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Concave focus strength")
-
-                with gr.Row():
-                    rfe_enabled_hf = gr.Checkbox(value=True, label="Enable RFE")
-                    rfe_iterations_hf = gr.Slider(1, 10, value=3, step=1, label="RFE iterations")
-                    rfe_removal_rate_hf = gr.Slider(0.05, 0.5, value=0.15, step=0.05, label="RFE removal rate")
-
-                with gr.Row():
-                    n_takeaways_hf = gr.Slider(1, 30, value=7, step=1, label="# takeaways")
-                    seed_hf = gr.Number(value=7, precision=0, label="Numeric seed")
-
-                run_btn_hf = gr.Button("Generate from dataset", variant="primary", size="lg")
-
-                with gr.Row():
-                    preview_hf = gr.Textbox(label="Generated report preview", lines=20)
-                    download_hf = gr.File(label="Download generated .txt")
-
-        run_btn_file.click(
-            fn=generate_from_file,
-            inputs=[
-                in_file,
-                softmax_temp_file,
-                steer_strength_file,
-                geometric_strength_file,
-                concave_focus_strength_file,
-                rfe_enabled_file,
-                rfe_iterations_file,
-                rfe_removal_rate_file,
-                n_takeaways_file,
-                seed_file,
-                text_seed_file,
-                output_name_file
-            ],
-            outputs=[preview_file, download_file],
+        train_btn.click(
+            train_bias_net,
+            inputs=[infile, seed, steer, focus, gelu_seed, train_steps, lr, max_contexts],
+            outputs=[trained_state, status],
         )
 
-        run_btn_hf.click(
-            fn=generate_from_hf_dataset,
-            inputs=[
-                dataset_name,
-                config_name,
-                split,
-                text_column,
-                max_samples,
-                softmax_temp_hf,
-                steer_strength_hf,
-                geometric_strength_hf,
-                concave_focus_strength_hf,
-                rfe_enabled_hf,
-                rfe_iterations_hf,
-                rfe_removal_rate_hf,
-                n_takeaways_hf,
-                seed_hf,
-                text_seed_hf,
-                output_name_hf
-            ],
-            outputs=[preview_hf, download_hf],
+        gen_btn.click(
+            generate_with_optional_training,
+            inputs=[infile, n_take, seed, t_seed, steer, focus, gelu_seed, trained_state],
+            outputs=out_txt,
         )
 
     return demo
@@ -1252,5 +767,4 @@ def build_app() -> gr.Blocks:
 
 if __name__ == "__main__":
     app = build_app()
-    # Gradio 6: theme belongs in launch()
-    app.queue().launch(theme=gr.themes.Soft(),share=True,max_file_size="1MB")
+    app.queue().launch()
