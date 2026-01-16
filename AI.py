@@ -201,7 +201,7 @@ class NeuroSymbolicGraphGenerator:
         self.synthetic_bias.freeze_(True)
 
     def build_state(self, text: str) -> ModelState:
-        print("🔬 Extracting neurosymbolic features...")
+        print("Extracting neurosymbolic features...")
         text = normalize(text)
         paragraphs = re.split(r"\n\s*\n", text)[:500]
         
