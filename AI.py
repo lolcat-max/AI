@@ -40,7 +40,7 @@ class LateralInhibition(nn.Module):
     def __init__(self, kernel_size=7, strength=0.5):
         super().__init__()
         self.strength = float(strength)
-        k = torch.tensor([-0.05, -0.2, -0.4, 1.3, -0.4, -0.2, -0.05], dtype=torch.float32)
+        k = torch.tensor([-0.95, -0.9, -0.1, 0.3, -1.4, -1.2, -1.05], dtype=torch.float32)
         self.register_buffer("kernel", k.view(1, 1, -1))
         self.pad = int(kernel_size // 2)
 
