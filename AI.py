@@ -339,7 +339,17 @@ class NeuroSymbolicGraphGenerator:
             return "OTHER"
         L = len(tok)
         return "S" if L <= 3 else "M" if L <= 7 else "L"
-
+    def _pick_initial_context(self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]) -> Tuple[str, str, str]:
+        # Use last 3 word-like seed tokens if provided, else fall back to corpus vocab.
+        sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
+        if len(sw) >= 3:
+            return (sw[-3], sw[-2], sw[-1])
+        if len(sw) == 2:
+            return (sw[-2], sw[-1], sw[-1])
+        if len(sw) == 1:
+            return (sw[-1], sw[-1], sw[-1])
+        seed_tok = lm.vocab[0] if lm.vocab else "the"
+        return (seed_tok, seed_tok, seed_tok)
     def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> nx.DiGraph:
         toks = tokens[:max_nodes]
         G = nx.DiGraph()
@@ -526,7 +536,17 @@ class NeuroSymbolicGraphGenerator:
         final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9)
         return cand, final_probs
 
-    def generate_report(self, text: str, n_takeaways=7, seed=7, text_seed="", progress=None) -> str:
+    def generate_report(
+        self,
+        text: str,
+        n_takeaways: int = 7,
+        seed: int = 7,
+        text_seed: str = "",
+        progress=None,
+        overlap_tokens: int = 3,         # NEW: how many tokens to overlap across takes
+        max_steps_min: int = 800,
+        max_steps_max: int = 900,
+    ) -> str:
         rng = np.random.default_rng(int(seed))
         state = self.build_state(text, progress)
 
@@ -537,38 +557,65 @@ class NeuroSymbolicGraphGenerator:
         ref_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(text)))
         seed_words = basic_tokenize(text_seed) if text_seed else []
 
-        # seed word handling
-        seed_tok = seed_words[0] if seed_words else (lm.vocab[0] if lm.vocab else "the")
+        # NEW: persistent cross-fold context across takeaways
+        w1, w2, w3 = self._pick_initial_context(lm, rng, seed_words)
 
-        takeaways = []
+        takeaways: List[str] = []
+        overlap_tokens = int(max(0, min(16, overlap_tokens)))
+
         for i in range(int(n_takeaways)):
             if progress:
                 progress(i / max(1, int(n_takeaways)), desc=f"Generating {i+1}/{n_takeaways}")
 
-            best_sent = ""
-            for _ in range(10):
-                # generate a long-ish stream, graph-gated
-                tokens_out = [seed_tok]
-                w1 = w2 = w3 = seed_tok
-                for _step in range(int(rng.integers(800, 900))):
-                    cand, probs = self._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
+            best_sent_tokens: List[str] = []
+            best_tail = (w1, w2, w3)
+
+            # rejection loop stays the same, but each attempt starts from current (w1,w2,w3)
+            for _attempt in range(10):
+                tokens_out = [w1, w2, w3] if overlap_tokens >= 3 else [w3]
+                cw1, cw2, cw3 = w1, w2, w3
+
+                # generate
+                for _step in range(int(rng.integers(max_steps_min, max_steps_max))):
+                    cand, probs = self._final_probs_for_context(lm, state.token_boost, cw1, cw2, cw3)
+
+                    # numpy Generator.choice requires p to be 1-D and match cand length; keep it normalized. [web:119][web:106]
                     p = probs.detach().cpu().numpy()
                     p = p / (p.sum() + 1e-12)
+
                     nxt = rng.choice(cand, p=p)
                     tokens_out.append(nxt)
-                    w1, w2, w3 = w2, w3, nxt
+                    cw1, cw2, cw3 = cw2, cw3, nxt
+
                     if nxt in [".", "!", "?"] and len([t for t in tokens_out if t.isalpha()]) > 200:
                         break
-                sent = detokenize(tokens_out)
 
+                # evaluate graph gate
+                sent = detokenize(tokens_out)
                 out_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(sent)))
+
                 if self._passes_automorphism_checks(ref_sig, out_sig):
-                    best_sent = sent
+                    best_sent_tokens = tokens_out
+                    best_tail = (cw1, cw2, cw3)
                     break
-                best_sent = sent
-            takeaways.append(best_sent)
+
+                # fallback keep last attempt
+                best_sent_tokens = tokens_out
+                best_tail = (cw1, cw2, cw3)
+
+            # NEW: update cross-fold context for next takeaway
+            w1, w2, w3 = best_tail
+
+            # NEW: when printing, remove the overlapped prefix to avoid visible duplication
+            if i == 0 or overlap_tokens <= 0:
+                printable = best_sent_tokens
+            else:
+                printable = best_sent_tokens[overlap_tokens:] if len(best_sent_tokens) > overlap_tokens else best_sent_tokens
+
+            takeaways.append(detokenize(printable))
 
         return "\n\n".join(takeaways)
+
 
 
 # ----------------------------
