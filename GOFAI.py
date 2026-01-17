@@ -79,7 +79,7 @@ class NltkSemanticKB:
     LEXNAME_OVERRIDES = {
         "noun.time": "when",
         "noun.motive": "why",
-        "noun.possession": "why",  # money, reward
+        "noun.possession": "why", 
         "noun.feeling": "feel",
         "noun.act": "how",
     }
