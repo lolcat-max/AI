@@ -424,44 +424,162 @@ def run_training(gen, state, lm, tokens, seed=1337, steps=500, lr=1e-3):
     final_loss = np.mean(losses[-20:]) if losses else 0.0
     print(f"Training Complete. Final Loss: {final_loss:.4f}\n")
 
+
+def _state_to_pack(state: ModelState) -> Dict:
+    return {
+        "nodelets": [
+            {"idx": n.idx, "top_terms": n.top_terms, "energy": n.energy, "narrative": n.narrative}
+            for n in state.nodelets
+        ],
+        "vocab100": state.vocab100,
+        "binding_W": state.binding_W,
+        "bar_probs": state.bar_probs,
+        "token_boost": state.token_boost,
+        "pillar_weights": state.pillar_weights,
+        "geometric_bias": state.geometric_bias,
+    }
+
+def _pack_to_state(pack: Dict) -> ModelState:
+    nodelets = [
+        Nodelet(
+            idx=int(n["idx"]),
+            top_terms=[(str(t), float(w)) for (t, w) in n["top_terms"]],
+            energy=float(n["energy"]),
+            narrative=str(n["narrative"]),
+        )
+        for n in pack["nodelets"]
+    ]
+    return ModelState(
+        nodelets=nodelets,
+        vocab100=list(pack["vocab100"]),
+        binding_W=pack["binding_W"],
+        bar_probs=pack["bar_probs"],
+        token_boost=dict(pack["token_boost"]),
+        pillar_weights=pack["pillar_weights"],
+        geometric_bias=pack["geometric_bias"],
+    )
+
+def _lm_to_pack(lm: QuadgramLM) -> Dict:
+    return {
+        "add_k": lm.add_k,
+        "uni": lm.uni,
+        "bi": lm.bi,
+        "tri": lm.tri,
+        "quad": lm.quad,
+        "total": lm.total,
+        "vocab": lm.vocab,
+    }
+
+def _pack_to_lm(pack: Dict) -> QuadgramLM:
+    lm = QuadgramLM(add_k=float(pack["add_k"]))
+    lm.uni = dict(pack["uni"])
+    lm.bi = dict(pack["bi"])
+    lm.tri = dict(pack["tri"])
+    lm.quad = dict(pack["quad"])
+    lm.total = int(pack["total"])
+    lm.vocab = list(pack.get("vocab") or lm.uni.keys())
+    return lm
+
+def save_checkpoint(path: str, gen: "NeuroSymbolicGraphGenerator", state: ModelState, lm: QuadgramLM,
+                    meta: Optional[Dict] = None):
+    ckpt = {
+        "format": "neurosym_v3_3",
+        "meta": meta or {},
+        # Recommended practice is to save model weights via state_dict. [web:41]
+        "synthetic_bias_state_dict": gen.synthetic_bias.state_dict(),
+        "state_pack": _state_to_pack(state),
+        "lm_pack": _lm_to_pack(lm),
+    }
+    torch.save(ckpt, path)
+    print(f"Saved checkpoint -> {path}")
+
+def load_checkpoint(path: str, map_location: str = "cpu"):
+    # Only load trusted files; torch.load uses pickle internally by default. [web:47]
+    ckpt = torch.load(path, map_location=map_location)
+
+    gen = NeuroSymbolicGraphGenerator(
+        gelu_seed=int(ckpt.get("meta", {}).get("gelu_seed", 1337))
+    )
+    gen.synthetic_bias.load_state_dict(ckpt["synthetic_bias_state_dict"])
+    gen.synthetic_bias.freeze_(True)
+
+    state = _pack_to_state(ckpt["state_pack"])
+    lm = _pack_to_lm(ckpt["lm_pack"])
+
+    meta = ckpt.get("meta", {})
+    return gen, state, lm, meta
+
 def main():
     print("=== Neurosymbolic Text Generator V3.3 (Seed-Context Enhanced) ===\n")
 
-    infile = input("Input file (Enter for demo): ").strip()
-    if infile and Path(infile).exists():
-        text = load_text(infile)
-        print(f"Loaded {len(text):,} chars")
+    def _resolve_ckpt_name(s: str) -> str:
+        s = s.strip()
+        if not s:
+            return s
+        p = Path(s)
+        if p.exists():
+            return str(p)
+        # Convenience: allow typing "model" instead of "model.pt"
+        if p.suffix == "":
+            p2 = p.with_suffix(".pt")
+            if p2.exists():
+                return str(p2)
+        return s  # let the normal exists-check fail
+
+    ckpt_in_raw = input("Load checkpoint (.pt) [Enter to skip]: ").strip()
+    ckpt_in = _resolve_ckpt_name(ckpt_in_raw)
+
+    if ckpt_in and Path(ckpt_in).exists():
+        # Load only — do NOT rebuild from text
+        gen, state, lm, meta = load_checkpoint(ckpt_in, map_location="cpu")
+        print(f"Loaded checkpoint '{ckpt_in}'. Meta: {meta}")
     else:
-        text = """Quantum computing leverages superposition and entanglement to solve complex
+        # Build fresh
+        infile = input("Input file (Enter for demo): ").strip()
+        if infile and Path(infile).exists():
+            text = load_text(infile)
+            print(f"Loaded {len(text):,} chars")
+        else:
+            text = """Quantum computing leverages superposition and entanglement to solve complex
 optimization problems that classical computers struggle with. Grover's algorithm
 provides quadratic speedup for unstructured search while Shor's algorithm factors
 large numbers exponentially faster. Neural networks excel at pattern recognition
 through gradient descent optimization of multi-layer perceptrons."""
-        print("Using demo text")
+            print("Using demo text")
 
-    seed_sys = 42
-    gen = NeuroSymbolicGraphGenerator(gelu_seed=seed_sys)
-    state = gen.build_state(text)
+        seed_sys = 42
+        gen = NeuroSymbolicGraphGenerator(gelu_seed=seed_sys)
+        state = gen.build_state(text)
 
-    tokens = basic_tokenize(text, lowercase=True)
-    lm = QuadgramLM()
-    lm.ingest(tokens)
+        tokens = basic_tokenize(text, lowercase=True)
+        lm = QuadgramLM()
+        lm.ingest(tokens)
 
-    if input("\nTrain GELU bias now? (Y/n) [y]: ").lower().strip() != 'n':
-        try:
-            steps = int(input("Steps [500]: ") or "500")
-        except ValueError:
-            steps = 500
-        run_training(gen, state, lm, tokens, seed=seed_sys, steps=steps)
-    else:
-        print("Skipping training (using random init)")
+        if input("\nTrain GELU bias now? (Y/n) [y]: ").lower().strip() != "n":
+            try:
+                steps = int(input("Steps [500]: ") or "500")
+            except ValueError:
+                steps = 500
+            run_training(gen, state, lm, tokens, seed=seed_sys, steps=steps)
+        else:
+            print("Skipping training (using random init)")
 
+        if input("\nSave checkpoint now? (y/N): ").lower().strip() == "y":
+            ckpt_out = input("Checkpoint filename [model.pt]: ").strip() or "model.pt"
+            if Path(ckpt_out).suffix == "":
+                ckpt_out += ".pt"
+            save_checkpoint(
+                ckpt_out, gen, state, lm,
+                meta={"gelu_seed": seed_sys, "note": "V3.3 seed-context enhanced"}
+            )
+
+    # From here on, gen/state/lm always exist (either loaded or built)
     print("Entering Generation Loop (Ctrl+C to quit)")
 
     while True:
         print("\n" + "-" * 40)
         text_seed = input("Text seed (or 'q' to quit): ").strip()
-        if text_seed.lower() == 'q':
+        if text_seed.lower() == "q":
             break
 
         if not text_seed:
@@ -487,13 +605,21 @@ through gradient descent optimization of multi-layer perceptrons."""
         print(output)
         print("=" * 80)
 
-        if input("\nSave result? (y/N): ").lower() == 'y':
+        if input("\nSave result? (y/N): ").lower() == "y":
             fname = input("Filename [output.txt]: ").strip() or "output.txt"
             with open(fname, "a", encoding="utf-8") as f:
                 f.write(f"\n\n--- Seed: {text_seed} ---\n{output}")
             print(f"Appended to {fname}")
 
+        if input("\nSave checkpoint now? (y/N): ").lower().strip() == "y":
+            ckpt_out = input("Checkpoint filename [model.pt]: ").strip() or "model.pt"
+            if Path(ckpt_out).suffix == "":
+                ckpt_out += ".pt"
+            save_checkpoint(ckpt_out, gen, state, lm, meta={"note": "Saved from generation loop"})
+            # Note: torch.load supports map_location for device remapping when loading. [web:47]
+
     print("\nExiting.")
+
 
 if __name__ == "__main__":
     main()
