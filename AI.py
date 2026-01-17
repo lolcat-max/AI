@@ -1,45 +1,3 @@
-Hugging Face's logo
-Hugging Face
-Models
-Datasets
-Spaces
-Community
-Docs
-Pricing
-
-
-Spaces:
-trainman999
-/
-Neurosymbolic_Text_Generator
-
-
-like
-0
-
-App
-Files
-Community
-Settings
-Neurosymbolic_Text_Generator
-/
-app.py
-
-trainman999's picture
-trainman999
-v23
-9d46c14
-verified
-1 day ago
-raw
-
-Copy download link
-history
-blame
-edit
-delete
-
-28.6 kB
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -855,4 +813,3 @@ def build_app():
 if __name__ == "__main__":
     app = build_app()
     app.queue().launch()
-
