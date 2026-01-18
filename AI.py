@@ -3,9 +3,11 @@
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
 V3.2: Shape-safe + Synthetic GELU Bias + TRAIN BUTTON
+
 Training button:
 - Trains ONLY the SyntheticGELUBias (GELU MLP) on your input file.
 - Stores learned weights in gr.State, then Generate loads them for sampling.
+
 Dependencies:
   pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
 """
