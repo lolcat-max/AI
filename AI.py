@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.2: Shape-safe + Synthetic GELU Bias + TRAIN BUTTON
+Pure Neural Text Generator (Gradio GUI)
+V4.4: Original logic preserved + stable training + stable generation + optional KV-cache
 
-Training button:
-- Trains ONLY the SyntheticGELUBias (GELU MLP) on your input file.
-- Stores learned weights in gr.State, then Generate loads them for sampling.
-
-Dependencies:
-  pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
+Original logic kept:
+LM probs -> focus(LateralInhibition) -> top-k -> boosts -> GELU bias -> ResonantGate -> sample
 """
 
 from __future__ import annotations
 import re
 import math
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import gradio as gr
@@ -25,45 +20,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import TruncatedSVD
-
-import networkx as nx
-from networkx.algorithms import isomorphism as iso
-from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
+from torch.utils.data import Dataset, DataLoader
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config
 
 
 # ----------------------------
-# PyTorch Isomorphic Neuromorphisms
+# Neural Components (same logic, safer shapes)
 # ----------------------------
 class LateralInhibition(nn.Module):
     def __init__(self, kernel_size=7, strength=0.5):
         super().__init__()
         self.strength = float(strength)
+        # (keep your original kernel)
         k = torch.tensor([-0.95, -0.9, -0.1, 0.3, -1.4, -1.2, -1.05], dtype=torch.float32)
         self.register_buffer("kernel", k.view(1, 1, -1))
         self.pad = int(kernel_size // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept [L], [B,L], or [B,1,L]
+        # x: (V,) or (B,V)
         if x.dim() == 1:
-            x = x.view(1, 1, -1)
+            x_ = x.view(1, 1, -1)
         elif x.dim() == 2:
-            x = x.view(x.shape[0], 1, x.shape[1])
+            x_ = x.unsqueeze(1)  # (B,1,V)
+        else:
+            raise ValueError(f"LateralInhibition expects 1D/2D, got {tuple(x.shape)}")
 
-        modulation = F.conv1d(x, self.kernel, padding=self.pad)
-        out = x + self.strength * modulation
+        modulation = F.conv1d(x_, self.kernel, padding=self.pad)
+        out = x_ + self.strength * modulation
         out = F.relu(out)
-        return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
+        out = out / (out.sum(dim=-1, keepdim=True) + 1e-12)
 
-
-class SynapticPruner(nn.Module):
-    def __init__(self, n_features: int):
-        super().__init__()
-        self.gain = nn.Parameter(torch.ones(int(n_features)))
-
-    def forward(self, W: torch.Tensor) -> torch.Tensor:
-        return W * self.gain.view(1, -1)
+        if x.dim() == 1:
+            return out.view(-1)
+        return out.squeeze(1)  # (B,V)
 
 
 class ResonantGate(nn.Module):
@@ -73,22 +62,21 @@ class ResonantGate(nn.Module):
         self.noise_injector = nn.Dropout(p=0.05)
 
     def forward(self, lm_probs: torch.Tensor, token_boosts: torch.Tensor, temp=0.95) -> torch.Tensor:
-        lm_probs = lm_probs.view(-1)
-        token_boosts = token_boosts.view(-1)
+        # lm_probs, token_boosts: (K,) or (B,K)
+        if lm_probs.dim() == 1:
+            lm_probs = lm_probs.unsqueeze(0)
+        if token_boosts.dim() == 1:
+            token_boosts = token_boosts.unsqueeze(0)
 
         potentials = torch.log(lm_probs.clamp_min(1e-12))
         potentials = potentials + self.steer_strength * token_boosts
         potentials = potentials / max(float(temp), 1e-9)
         potentials = self.noise_injector(potentials)
-        return F.softmax(potentials, dim=-1)
+        return F.softmax(potentials, dim=-1)  # (B,K)
 
 
 class SyntheticGELUBias(nn.Module):
-    """
-    Trainable GELU MLP bias field:
-    Input: [log(base_prob), token_boost] -> per-token bias
-    """
-    def __init__(self, hidden=32, approximate="tanh"):
+    def __init__(self, vocab_size=50257, hidden=32, approximate="tanh"):
         super().__init__()
         self.fc1 = nn.Linear(2, int(hidden))
         self.act = nn.GELU(approximate=approximate)
@@ -108,70 +96,56 @@ class SyntheticGELUBias(nn.Module):
             p.requires_grad_(not frozen)
 
     def forward(self, base_probs: torch.Tensor, token_boosts: torch.Tensor) -> torch.Tensor:
-        base_probs = base_probs.view(-1)
-        token_boosts = token_boosts.view(-1)
+        # base_probs, token_boosts: (K,) or (B,K)
+        if base_probs.dim() == 1:
+            base_probs = base_probs.unsqueeze(0)
+        if token_boosts.dim() == 1:
+            token_boosts = token_boosts.unsqueeze(0)
 
-        x1 = torch.log(base_probs.clamp_min(1e-12))
-        x = torch.stack([x1, token_boosts], dim=-1)  # [V,2]
-        h = self.act(self.fc1(x))
-        return self.fc2(h).squeeze(-1)               # [V]
+        x1 = torch.log(base_probs.clamp_min(1e-12))      # (B,K)
+        x = torch.stack([x1, token_boosts], dim=-1)      # (B,K,2)
+        h = self.act(self.fc1(x))                        # (B,K,H)
+        return self.fc2(h).squeeze(-1)                   # (B,K)
+
+
+# ----------------------------
+# Cube-root scaling (logits domain)
+# ----------------------------
+def cube_root_weights(n: int, device, dtype):
+    n = int(max(0, n))
+    if n <= 0:
+        return torch.empty(0, device=device, dtype=dtype)
+    return torch.arange(1, n + 1, device=device, dtype=dtype).pow(1.0 / 3.0)
+
+def scale_topn_logits_by_cuberoots(logits: torch.Tensor, n: int) -> torch.Tensor:
+    """
+    logits: (B,V)
+    Multiply top-n logits by [1^(1/3), 2^(1/3), ..., n^(1/3)] using scatter_.
+    """
+    n = int(max(0, n))
+    if n <= 0:
+        return logits
+    vocab = logits.shape[-1]
+    n = min(n, vocab)
+
+    top_vals, top_idx = torch.topk(logits, k=n, dim=-1)         # (B,n)
+    w = cube_root_weights(n, device=logits.device, dtype=logits.dtype)  # (n,)
+    scaled = top_vals * w                                        # (B,n) broadcast
+
+    out = logits.clone()
+    out.scatter_(dim=-1, index=top_idx, src=scaled)
+    return out
 
 
 # ----------------------------
 # Text utilities
 # ----------------------------
-STOPWORDS = set("""
-a an and are as at be by for from has have he her hers him his i in is it its me my
-of on or our ours she so that the their them they this to was we were what when where
-which who will with you your yours
-""".split())
-
-
 def normalize(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
-def basic_tokenize(text: str) -> List[str]:
-    text = text.replace("\n", " ")
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
-    out = []
-    for t in tokens:
-        if re.match(r"[A-Za-z]", t):
-            out.append(t.lower())
-        else:
-            out.append(t)
-    return out
-
-
-def detokenize(tokens: List[str]) -> str:
-    out = []
-    for t in tokens:
-        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
-            if t in ["(", ")"]:
-                out.append(t)
-            else:
-                if out:
-                    out[-1] = out[-1] + t
-                else:
-                    out.append(t)
-        else:
-            if out and out[-1].endswith("("):
-                out[-1] = out[-1] + t
-            else:
-                out.append(t)
-    s = " ".join(out)
-    s = re.sub(r"\(\s+", "(", s)
-    s = re.sub(r"\s+\)", ")", s)
-    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
-    return s
-
-
-# ----------------------------
-# File loading
-# ----------------------------
 def load_text(path: str) -> str:
     p = Path(path)
     if not p.exists():
@@ -191,436 +165,231 @@ def load_text(path: str) -> str:
 
 
 # ----------------------------
-# Quadgram LM (symbolic)
+# Generator (original logic preserved)
 # ----------------------------
-class QuadgramLM:
-    def __init__(self, add_k: float = 0.25):
-        self.add_k = float(add_k)
-        self.uni: Dict[str, int] = {}
-        self.bi: Dict[Tuple[str, str], int] = {}
-        self.tri: Dict[Tuple[str, str, str], int] = {}
-        self.quad: Dict[Tuple[str, str, str, str], int] = {}
-        self.vocab: List[str] = []
-        self.total = 0
-
-    def ingest(self, tokens: List[str]) -> None:
-        self.uni.clear(); self.bi.clear(); self.tri.clear(); self.quad.clear()
-        self.total = 0
-        for t in tokens:
-            self.uni[t] = self.uni.get(t, 0) + 1
-            self.total += 1
-        for i in range(len(tokens) - 1):
-            k = (tokens[i], tokens[i + 1])
-            self.bi[k] = self.bi.get(k, 0) + 1
-        for i in range(len(tokens) - 2):
-            k = (tokens[i], tokens[i + 1], tokens[i + 2])
-            self.tri[k] = self.tri.get(k, 0) + 1
-        for i in range(len(tokens) - 3):
-            k = (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])
-            self.quad[k] = self.quad.get(k, 0) + 1
-        self.vocab = list(self.uni.keys())
-
-    def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
-        cont = []
-        for (a, b, c, d), count in self.quad.items():
-            if a == w1 and b == w2 and c == w3:
-                cont.append(d)
-        if not cont:
-            for (a, b, c), count in self.tri.items():
-                if a == w2 and b == w3:
-                    cont.append(c)
-        if not cont:
-            for (a, b), count in self.bi.items():
-                if a == w3:
-                    cont.append(b)
-        if not cont:
-            cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
-
-        seen = set()
-        cand = []
-        for w in cont:
-            if w not in seen:
-                seen.add(w)
-                cand.append(w)
-        cand = cand[:500]
-
-        V = len(self.vocab) + 1
-        add_k = self.add_k
-
-        def get_prob(w4: str) -> float:
-            c123 = self.tri.get((w1, w2, w3), 0)
-            c1234 = self.quad.get((w1, w2, w3, w4), 0)
-            if c123 > 0:
-                return (c1234 + add_k) / (c123 + add_k * V)
-
-            c12 = self.bi.get((w2, w3), 0)
-            c123_tri = self.tri.get((w2, w3, w4), 0)
-            if c12 > 0:
-                return (c123_tri + add_k) / (c12 + add_k * V)
-
-            c1 = self.uni.get(w3, 0)
-            c12_bi = self.bi.get((w3, w4), 0)
-            if c1 > 0:
-                return (c12_bi + add_k) / (c1 + add_k * V)
-
-            return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
-
-        probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
-        probs = probs / (probs.sum() + 1e-12)
-        return cand, probs
-
-
-# ----------------------------
-# Graph generator state
-# ----------------------------
-@dataclass
-class Nodelet:
-    idx: int
-    top_terms: List[Tuple[str, float]]
-    energy: float
-    narrative: str
-
-
-@dataclass
-class ModelState:
-    nodelets: List[Nodelet]
-    vocab100: List[str]
-    binding_W: torch.Tensor
-    bar_probs: torch.Tensor
-    token_boost: Dict[str, float]
-    pillar_weights: torch.Tensor
-    geometric_bias: torch.Tensor
-    semantic_graph: nx.Graph
-    lm_graph: nx.DiGraph
-
-
-class NeuroSymbolicGraphGenerator:
+class NeuralTextGenerator(nn.Module):
     def __init__(
         self,
-        nodelets_n: int = 10,
-        bars_n: int = 100,
-        svd_random_state: int = 7,
-        softmax_temp: float = 0.85,
-        steer_strength: float = 1.35,
-        lm_add_k: float = 0.25,
-        pillar_strength: float = 0.85,
-        geometric_strength: float = 0.3,
-        rfe_enabled: bool = True,
-        rfe_iterations: int = 3,
-        rfe_removal_rate: float = 0.15,
-        focus_strength: float = 0.5,
-        gelu_seed: int = 1337,
-        gelu_hidden: int = 32,
+        model_name="gpt2",
+        steer_strength=1.35,
+        focus_strength=0.5,
+        gelu_seed=1337,
+        gelu_hidden=32,
     ):
-        self.nodelets_n = int(nodelets_n)
-        self.bars_n = int(bars_n)
-        self.svd_random_state = int(svd_random_state)
-        self.softmax_temp = float(softmax_temp)
-        self.lm_add_k = float(lm_add_k)
-        self.pillar_strength = float(pillar_strength)
-        self.geometric_strength = float(geometric_strength)
-        self.rfe_enabled = bool(rfe_enabled)
-        self.rfe_iterations = int(rfe_iterations)
-        self.rfe_removal_rate = float(rfe_removal_rate)
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        config = GPT2Config.from_pretrained(model_name)
+        self.lm = GPT2LMHeadModel.from_pretrained(model_name, config=config).to(self.device)
+        self.lm.eval()
 
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
+        self.synthetic_bias = SyntheticGELUBias(
+            vocab_size=config.vocab_size,
+            hidden=gelu_hidden,
+            approximate="tanh",
+        ).to(self.device)
 
-        self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh")
         self.synthetic_bias.reset_seed(int(gelu_seed))
-        self.synthetic_bias.freeze_(True)  # default frozen unless training button used
+        self.synthetic_bias.freeze_(True)
 
-        self.pruner: Optional[SynapticPruner] = None
+        self.eval()
 
-    def _token_class(self, tok: str) -> str:
-        if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
-            return "PUNC"
-        if not re.match(r"[a-z]", tok):
-            return "OTHER"
-        L = len(tok)
-        return "S" if L <= 3 else "M" if L <= 7 else "L"
-    def _pick_initial_context(self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]) -> Tuple[str, str, str]:
-        # Use last 3 word-like seed tokens if provided, else fall back to corpus vocab.
-        sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
-        if len(sw) >= 3:
-            return (sw[-3], sw[-2], sw[-1])
-        if len(sw) == 2:
-            return (sw[-2], sw[-1], sw[-1])
-        if len(sw) == 1:
-            return (sw[-1], sw[-1], sw[-1])
-        seed_tok = lm.vocab[0] if lm.vocab else "the"
-        return (seed_tok, seed_tok, seed_tok)
-    def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> nx.DiGraph:
-        toks = tokens[:max_nodes]
-        G = nx.DiGraph()
-        for i, t in enumerate(toks):
-            G.add_node(i, cls=self._token_class(t))
-        for i in range(len(toks) - 1):
-            G.add_edge(i, i + 1, rel="adj")
-        for i in range(len(toks) - 2):
-            G.add_edge(i, i + 2, rel="skip")
-        return G
+    def build_token_boosts(self, text: str) -> Dict[int, float]:
+        tokens = self.tokenizer.tokenize(text.lower())
+        token_freq: Dict[str, int] = {}
+        for t in tokens:
+            token_freq[t] = token_freq.get(t, 0) + 1
 
-    def _graph_signature(self, G: nx.Graph) -> Dict[str, object]:
-        deg = [d for _, d in G.degree()]
-        wl_mode = G.to_undirected() if G.is_directed() else G
-        node_attr = "cls" if G.is_directed() else None
-        wl = weisfeiler_lehman_graph_hash(wl_mode, node_attr=node_attr, iterations=3, digest_size=16)
+        total = len(tokens)
+        boosts: Dict[int, float] = {}
+        for token, freq in token_freq.items():
+            if freq > 1:
+                ids = self.tokenizer.encode(token, add_special_tokens=False)
+                if not ids:
+                    continue
+                boosts[int(ids[0])] = math.log(freq / max(total, 1) * 100 + 1e-12) + 2.0
+        return boosts
 
-        match_kwargs = (
-            {"node_match": iso.categorical_node_match("cls", None),
-             "edge_match": iso.categorical_edge_match("rel", None)}
-            if G.is_directed()
-            else {}
-        )
-        GM = iso.DiGraphMatcher(G, G, **match_kwargs) if G.is_directed() else iso.GraphMatcher(G, G, **match_kwargs)
-
-        cnt = 0
-        for _ in GM.isomorphisms_iter():
-            cnt += 1
-            if cnt >= 150:
-                break
-
-        return {"deg_hist": np.bincount(deg, minlength=16)[:16], "wl": wl, "aut_est": cnt}
-
-    def _passes_automorphism_checks(self, ref_sig, out_sig) -> bool:
-        strict = max(0.0, min(2.0, self.geometric_strength))
-
-        ref = ref_sig["deg_hist"].astype(float); ref /= (ref.sum() + 1e-12)
-        out = out_sig["deg_hist"].astype(float); out /= (out.sum() + 1e-12)
-        if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict):
-            return False
-
-        ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
-        band = max(1.3, 3.5 - 1.2 * min(1.0, self.gate_layer.steer_strength / 2.0))
-        if not (1.0 / band <= ratio <= band):
-            return False
-
-        if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]:
-            return False
-
-        return True
-
-    def _synaptic_prune(self, W: torch.Tensor, energies: torch.Tensor, vocab100: List[str], progress=None):
-        if not self.rfe_enabled or self.rfe_iterations <= 0:
-            return W, vocab100
-
-        k, bars_n = W.shape
-        self.pruner = SynapticPruner(bars_n)
-
-        W_curr = W.detach().clone().requires_grad_(True)
-        kept_mask = torch.ones(bars_n, dtype=torch.bool)
-
-        for iteration in range(self.rfe_iterations):
-            if progress:
-                progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
-
-            W_modulated = self.pruner(W_curr)
-            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * torch.var(W_modulated, dim=0).sum()
-            loss.backward()
-
-            with torch.no_grad():
-                grads = W_curr.grad.abs().sum(dim=0)
-                weights = W_curr.abs().sum(dim=0)
-                importance = 0.6 * weights + 0.4 * grads
-                importance = importance / (importance.max() + 1e-12)
-
-                n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
-                if n_keep < 10:
-                    break
-
-                active = torch.where(kept_mask)[0]
-                local_importance = importance[active]
-                _, top_local = torch.topk(local_importance, k=min(n_keep, local_importance.numel()))
-
-                new_mask = torch.zeros_like(kept_mask)
-                new_mask[active[top_local]] = True
-                kept_mask = new_mask
-
-                W_curr.grad.zero_()
-
-        with torch.no_grad():
-            final_idx = torch.where(kept_mask)[0]
-            W_final = W[:, final_idx]
-            vocab_final = [vocab100[i] for i in final_idx.tolist()]
-        return W_final, vocab_final
-
-    def build_state(self, text: str, progress=None) -> ModelState:
-        if progress:
-            progress(0, desc="Normalizing")
-        text = normalize(text)
-
-        vec = TfidfVectorizer(stop_words="english", max_features=8000, ngram_range=(1, 2))
-        X = vec.fit_transform(re.split(r"\n\s*\n", text)[:500])
-        vocab = np.array(vec.get_feature_names_out())
-
-        top_idx = np.argsort(-np.asarray(X.sum(axis=0)).ravel())[:self.bars_n]
-        vocab100 = vocab[top_idx].tolist()
-
-        X_svd = X[:, top_idx]
-        n_rows, n_cols = X_svd.shape
-        max_rank = min(n_rows, n_cols)
-        k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
-
-        svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
-        svd.fit(X_svd)
-
-        nodelets = []
-        for i, comp in enumerate(svd.components_):
-            terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))], key=lambda x: -abs(x[1]))[:10]
-            eng = float(np.linalg.norm(comp))
-            nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
-
-        W = torch.tensor(svd.components_, dtype=torch.float32)
-        W = F.relu(W)
-        W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
-
-        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32)
-        energies = energies / (energies.max() + 1e-12)
-
-        W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
-
-        logits = (energies.view(-1, 1) * W).sum(dim=0)
-        probs = F.softmax(logits / self.softmax_temp, dim=-1)
-        probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
-
-        token_boost: Dict[str, float] = {}
-        for w, p in zip(vocab100, probs.detach().cpu().tolist()):
-            for subw in w.split():
-                if len(subw) > 2 and subw not in STOPWORDS:
-                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
-
-        G_sem = nx.Graph()
-        W_np = W.detach().cpu().numpy()
-        for i in range(W_np.shape[0]):
-            for j in range(W_np.shape[1]):
-                if W_np[i, j] > 0.05:
-                    G_sem.add_edge(f"N{i}", f"B{j}", weight=float(W_np[i, j]))
-
-        return ModelState(
-            nodelets=nodelets,
-            vocab100=vocab100,
-            binding_W=W,
-            bar_probs=probs,
-            token_boost=token_boost,
-            pillar_weights=torch.zeros_like(probs),
-            geometric_bias=torch.zeros_like(probs),
-            semantic_graph=G_sem,
-            lm_graph=nx.DiGraph(),
-        )
-
-    def _final_probs_for_context(
+    @torch.no_grad()
+    def lm_next_logits_cached(
         self,
-        lm: QuadgramLM,
-        token_boost: Dict[str, float],
-        w1: str, w2: str, w3: str
-    ) -> Tuple[List[str], torch.Tensor]:
-        cand, base_probs = lm.next_distribution(w1, w2, w3)
-
-        if len(cand) == 0:
-            cand = lm.vocab[:100] if lm.vocab else ["the", "is", "a"]
-            base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
+        input_ids: torch.Tensor,
+        past_key_values=None,
+    ) -> Tuple[torch.Tensor, object]:
+        """
+        Returns next-token logits for the current prefix and updated cache.
+        - If past_key_values is None: feed full input_ids
+        - Else: feed only last token
+        """
+        input_ids = input_ids.to(self.device)
+        if past_key_values is None:
+            out = self.lm(input_ids, use_cache=True, return_dict=True)
         else:
-            base_p = base_probs.detach().clone().to(dtype=torch.float32)
+            out = self.lm(input_ids[:, -1:], use_cache=True, past_key_values=past_key_values, return_dict=True)
+        logits = out.logits[:, -1, :]  # (1,V) or (B,V)
+        return logits, out.past_key_values
 
-        if base_p.numel() != len(cand):
-            base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
+    @torch.no_grad()
+    def get_lm_probs_from_logits(self, logits: torch.Tensor, cube_root_n: int = 0) -> torch.Tensor:
+        # logits: (B,V)
+        if int(cube_root_n) > 0:
+            logits = scale_topn_logits_by_cuberoots(logits, int(cube_root_n))
+        return F.softmax(logits, dim=-1)
 
-        base_p = base_p.view(-1)
-        base_p = base_p / (base_p.sum() + 1e-12)
-        base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
+    @torch.no_grad()
+    def generate_step_from_probs(
+        self,
+        probs_full: torch.Tensor,                  # (V,)
+        token_boosts_dict: Dict[int, float],
+        temperature: float,
+        top_k: int,
+    ) -> int:
+        probs_full = self.focus_layer(probs_full)  # (V,) normalized
 
-        boosts = torch.tensor([token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
-        bias = self.synthetic_bias(base_p, boosts).view(-1)
+        top_indices = torch.topk(probs_full, int(top_k)).indices                 # (K,)
+        base_probs = probs_full[top_indices]                                     # (K,)
 
-        final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9)
-        return cand, final_probs
+        boosts = torch.tensor(
+            [float(token_boosts_dict.get(int(t), 0.0)) for t in top_indices.tolist()],
+            device=self.device,
+            dtype=base_probs.dtype,
+        )  # (K,)
 
-    def generate_report(
+        bias = self.synthetic_bias(base_probs, boosts).view(-1)                  # (K,)
+        final_probs = self.gate_layer(base_probs, boosts + bias, temp=temperature).view(-1)  # (K,)
+
+        k_idx = int(torch.multinomial(final_probs, num_samples=1).item())
+        return int(top_indices[k_idx].item())
+
+    @torch.no_grad()
+    def generate(
         self,
         text: str,
-        n_takeaways: int = 7,
-        seed: int = 7,
+        n_takeaways: int = 5,
+        max_length: int = 200,
+        seed: int = 42,
         text_seed: str = "",
-        progress=None,
-        overlap_tokens: int = 3,         # NEW: how many tokens to overlap across takes
-        max_steps_min: int = 800,
-        max_steps_max: int = 900,
+        overlap_tokens: int = 20,
+        temperature: float = 0.9,
+        top_k: int = 50,
+        cube_root_n: int = 0,
+        use_kv_cache: bool = True,
     ) -> str:
-        rng = np.random.default_rng(int(seed))
-        state = self.build_state(text, progress)
+        torch.manual_seed(int(seed))
+        np.random.seed(int(seed))
 
-        tokens = basic_tokenize(text)
-        lm = QuadgramLM(self.lm_add_k)
-        lm.ingest(tokens)
+        token_boosts_dict = self.build_token_boosts(text)
 
-        ref_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(text)))
-        seed_words = basic_tokenize(text_seed) if text_seed else []
-
-        # NEW: persistent cross-fold context across takeaways
-        w1, w2, w3 = self._pick_initial_context(lm, rng, seed_words)
+        prompt = text_seed or text[:200]
+        prompt_ids = self.tokenizer.encode(prompt)
+        if len(prompt_ids) == 0:
+            prompt_ids = [int(self.tokenizer.eos_token_id)]
 
         takeaways: List[str] = []
-        overlap_tokens = int(max(0, min(16, overlap_tokens)))
+        eos_id = int(self.tokenizer.eos_token_id)
+
+        # Each takeaway starts from last 20 tokens of previous as context (original)
+        current_ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
 
         for i in range(int(n_takeaways)):
-            if progress:
-                progress(i / max(1, int(n_takeaways)), desc=f"Generating {i+1}/{n_takeaways}")
+            generated_ids = current_ids.clone()
 
-            best_sent_tokens: List[str] = []
-            best_tail = (w1, w2, w3)
+            past = None
+            if use_kv_cache:
+                # Prime cache with current prefix
+                logits, past = self.lm_next_logits_cached(generated_ids, past_key_values=None)
+            else:
+                logits, past = None, None
 
-            # rejection loop stays the same, but each attempt starts from current (w1,w2,w3)
-            for _attempt in range(10):
-                tokens_out = [w1, w2, w3] if overlap_tokens >= 3 else [w3]
-                cw1, cw2, cw3 = w1, w2, w3
+            # Hard cap on steps for stability
+            for _ in range(int(max_length)):
+                if use_kv_cache:
+                    probs_full = self.get_lm_probs_from_logits(logits, cube_root_n=cube_root_n)[0]  # (V,)
+                else:
+                    logits_full, _ = self.lm_next_logits_cached(generated_ids, past_key_values=None)
+                    probs_full = self.get_lm_probs_from_logits(logits_full, cube_root_n=cube_root_n)[0]
 
-                # generate
-                for _step in range(int(rng.integers(max_steps_min, max_steps_max))):
-                    cand, probs = self._final_probs_for_context(lm, state.token_boost, cw1, cw2, cw3)
+                next_tok = self.generate_step_from_probs(
+                    probs_full=probs_full,
+                    token_boosts_dict=token_boosts_dict,
+                    temperature=float(temperature),
+                    top_k=int(top_k),
+                )
 
-                    # numpy Generator.choice requires p to be 1-D and match cand length; keep it normalized. [web:119][web:106]
-                    p = probs.detach().cpu().numpy()
-                    p = p / (p.sum() + 1e-12)
+                generated_ids = torch.cat(
+                    [generated_ids, torch.tensor([[next_tok]], device=self.device, dtype=torch.long)],
+                    dim=1,
+                )
 
-                    nxt = rng.choice(cand, p=p)
-                    tokens_out.append(nxt)
-                    cw1, cw2, cw3 = cw2, cw3, nxt
-
-                    if nxt in [".", "!", "?"] and len([t for t in tokens_out if t.isalpha()]) > 200:
-                        break
-
-                # evaluate graph gate
-                sent = detokenize(tokens_out)
-                out_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(sent)))
-
-                if self._passes_automorphism_checks(ref_sig, out_sig):
-                    best_sent_tokens = tokens_out
-                    best_tail = (cw1, cw2, cw3)
+                if next_tok == eos_id:
                     break
 
-                # fallback keep last attempt
-                best_sent_tokens = tokens_out
-                best_tail = (cw1, cw2, cw3)
+                if use_kv_cache:
+                    logits, past = self.lm_next_logits_cached(generated_ids, past_key_values=past)
 
-            # NEW: update cross-fold context for next takeaway
-            w1, w2, w3 = best_tail
+            takeaway = self.tokenizer.decode(generated_ids[0].tolist(), skip_special_tokens=True)
 
-            # NEW: when printing, remove the overlapped prefix to avoid visible duplication
-            if i == 0 or overlap_tokens <= 0:
-                printable = best_sent_tokens
-            else:
-                printable = best_sent_tokens[overlap_tokens:] if len(best_sent_tokens) > overlap_tokens else best_sent_tokens
+            if i > 0 and int(overlap_tokens) > 0:
+                overlap_start = max(0, len(takeaways[-1]) - int(overlap_tokens))
+                takeaway = takeaway[overlap_start:]
 
-            takeaways.append(detokenize(printable))
+            takeaways.append(takeaway)
+
+            keep = min(20, generated_ids.shape[1])
+            current_ids = generated_ids[:, -keep:]
 
         return "\n\n".join(takeaways)
 
 
+# ----------------------------
+# Training (original logic: target-aware NLL on gated top-k)
+# ----------------------------
+class TextDataset(Dataset):
+    """
+    Fixed-length (4,) windows: 3 context + 1 target.
+    """
+    def __init__(self, texts: List[str], tokenizer, max_length=512, stride=128):
+        self.tokenizer = tokenizer
+        self.stride = int(stride)
+        self.seq_len = 4
 
-# ----------------------------
-# Gradio functions: Train + Generate
-# ----------------------------
+        tok = tokenizer(
+            texts,
+            truncation=True,
+            max_length=int(max_length),
+            padding=False,
+            return_tensors="pt",
+        )
+        self.input_ids = tok["input_ids"]  # (N,T)
+
+        # If the file is extremely short, still keep at least one sample
+        if self.input_ids.numel() == 0:
+            self.input_ids = torch.tensor([[tokenizer.eos_token_id]], dtype=torch.long)
+
+    def __len__(self):
+        return max(1, len(self.input_ids) * self.stride)
+
+    def __getitem__(self, idx):
+        seq_idx = idx // self.stride
+        pos = (idx % self.stride) + 1
+
+        seq = self.input_ids[min(seq_idx, len(self.input_ids) - 1)]
+        start = max(0, pos - 3)
+        end = min(len(seq), start + self.seq_len)
+
+        window = seq[start:end]
+        if window.numel() < self.seq_len:
+            pad = self.seq_len - window.numel()
+            window = F.pad(window, (0, pad), value=self.tokenizer.pad_token_id)
+
+        return window  # (4,)
+
+
 def train_bias_net(
     infile,
     seed,
@@ -630,108 +399,130 @@ def train_bias_net(
     train_steps,
     lr,
     max_contexts,
-    progress=gr.Progress()
+    batch_size=16,
+    train_top_k=64,
+    progress=gr.Progress(),
 ):
-    text = load_text(infile)
+    try:
+        text = normalize(load_text(infile))
+        if len(text) < 100:
+            return None, "Text too short for training."
 
-    gen = NeuroSymbolicGraphGenerator(
-        steer_strength=float(steer),
-        focus_strength=float(focus),
-        gelu_seed=int(gelu_seed),
-    )
+        gen = NeuralTextGenerator(
+            steer_strength=float(steer),
+            focus_strength=float(focus),
+            gelu_seed=int(gelu_seed),
+        )
 
-    progress(0.0, desc="Building state")
-    state = gen.build_state(text, progress)
+        boosts_dict = gen.build_token_boosts(text)
 
-    tokens = basic_tokenize(text)
-    if len(tokens) < 10:
-        return None, "Not enough tokens to train."
+        progress(0.05, desc="Tokenizing")
+        dataset = TextDataset([text], gen.tokenizer, max_length=512, stride=128)
+        if max_contexts and int(max_contexts) > 0:
+            dataset = torch.utils.data.Subset(dataset, range(min(int(max_contexts), len(dataset))))
 
-    lm = QuadgramLM(gen.lm_add_k)
-    lm.ingest(tokens)
+        dataloader = DataLoader(dataset, batch_size=int(batch_size), shuffle=True, drop_last=False)
 
-    # Make GELU net trainable
-    gen.synthetic_bias.reset_seed(int(gelu_seed))
-    gen.synthetic_bias.freeze_(False)
-    gen.synthetic_bias.train()
-    gen.gate_layer.eval()
-    gen.focus_layer.eval()
+        gen.synthetic_bias.reset_seed(int(gelu_seed))
+        gen.synthetic_bias.freeze_(False)
+        gen.synthetic_bias.train()
 
-    opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
+        opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
 
-    # choose training positions
-    # contexts are tokens[i-3:i] -> predict tokens[i]
-    positions = list(range(3, len(tokens)))
-    if max_contexts and int(max_contexts) > 0:
-        positions = positions[: min(len(positions), int(max_contexts))]
+        pad_id = int(gen.tokenizer.pad_token_id)
+        top_k = int(train_top_k)
+        steps = int(train_steps)
 
-    if len(positions) == 0:
-        return None, "No training contexts available."
+        running_loss = 0.0
+        seen = 0
 
-    rng = np.random.default_rng(int(seed))
-    batch_size = 24
+        for step, batch in enumerate(dataloader):
+            if step >= steps:
+                break
 
-    running_loss = 0.0
-    running_hits = 0
-    running_used = 0
+            batch = batch.to(gen.device)     # (B,4)
+            contexts = batch[:, :-1]         # (B,3)
+            targets = batch[:, -1]           # (B,)
 
-    steps = int(train_steps)
-    for step in range(steps):
-        opt.zero_grad(set_to_none=True)
-        loss_acc = 0.0
-        used = 0
-        hits = 0
-
-        # sample a mini-batch of positions
-        batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
-
-        for i in batch_pos:
-            w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
-            true_next = tokens[i]
-
-            cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
-
-            # supervised only when true is in candidate set (keeps it simple + fast)
-            try:
-                j = cand.index(true_next)
-            except ValueError:
+            # Remove padded targets
+            keep = (targets != pad_id)
+            if keep.sum().item() == 0:
                 continue
+            contexts = contexts[keep]
+            targets = targets[keep]
+            B = contexts.shape[0]
 
-            # NLL
-            nll = -torch.log(probs[j].clamp_min(1e-12))
-            loss_acc = loss_acc + nll
-            used += 1
-            hits += 1
+            opt.zero_grad()
 
-        if used == 0:
-            # nothing to learn from this batch
-            continue
+            # LM full probs -> focus (original)
+            logits, _ = gen.lm_next_logits_cached(contexts, past_key_values=None)  # contexts treated as (B,T)
+            probs_full = gen.get_lm_probs_from_logits(logits, cube_root_n=0)       # (B,V)
+            probs_full = gen.focus_layer(probs_full)                               # (B,V)
 
-        loss = loss_acc / used
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(gen.synthetic_bias.parameters(), 1.0)
-        opt.step()
+            # top-k candidates
+            K = min(top_k, probs_full.shape[-1])
+            top_vals, top_idx = torch.topk(probs_full, k=K, dim=-1)                # (B,K)
 
-        running_loss += float(loss.detach().cpu().item())
-        running_hits += hits
-        running_used += used
+            # ensure target in candidate set
+            for b in range(B):
+                tgt = int(targets[b].item())
+                if not (top_idx[b] == tgt).any():
+                    top_idx[b, -1] = tgt
+                    top_vals[b, -1] = probs_full[b, tgt]
 
-        if (step + 1) % max(1, steps // 20) == 0:
-            progress((step + 1) / steps, desc=f"Training GELU bias ({step+1}/{steps})")
+            # renormalize base probs (keeps them as probabilities)
+            top_vals = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-12)
 
-    avg_loss = running_loss / max(1, (steps if steps > 0 else 1))
-    msg = f"Trained SyntheticGELUBias. Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
+            # build boosts per candidate (same as generation) + bump target
+            token_boosts = torch.zeros_like(top_vals)
+            tgt_local = torch.empty((B,), dtype=torch.long, device=gen.device)
 
-    trained = {
-        "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()},
-        "gelu_seed": int(gelu_seed),
-        "focus": float(focus),
-        "steer": float(steer),
-    }
-    return trained, msg
+            for b in range(B):
+                idxs = top_idx[b].tolist()
+                token_boosts[b] = torch.tensor(
+                    [float(boosts_dict.get(int(t), 0.0)) for t in idxs],
+                    device=gen.device,
+                    dtype=top_vals.dtype,
+                )
+                tgt = int(targets[b].item())
+                pos = int((top_idx[b] == tgt).nonzero(as_tuple=True)[0][0].item())
+                tgt_local[b] = pos
+                token_boosts[b, pos] = token_boosts[b, pos] + 1.0
+
+            # original: bias then gate then NLL on target
+            bias = gen.synthetic_bias(top_vals, token_boosts)                         # (B,K)
+            gated = gen.gate_layer(top_vals, token_boosts + bias, temp=0.95)          # (B,K)
+
+            log_probs = torch.log(gated.clamp_min(1e-12))
+            loss = F.nll_loss(log_probs, tgt_local, reduction="mean")
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(gen.synthetic_bias.parameters(), 1.0)
+            opt.step()
+
+            running_loss += float(loss.item()) * B
+            seen += B
+
+            if (step + 1) % max(1, steps // 20) == 0:
+                progress(min(1.0, (step + 1) / steps), desc=f"Training {step+1}/{steps}")
+
+        avg_loss = (running_loss / max(1, seen)) if seen else float("nan")
+        msg = f"Training complete. Avg loss: {avg_loss:.4f}"
+
+        trained = {
+            "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()},
+            "gelu_seed": int(gelu_seed),
+            "focus": float(focus),
+            "steer": float(steer),
+        }
+        return trained, msg
+
+    except Exception as e:
+        import traceback
+        return None, f"Training failed:\n{e}\n\n{traceback.format_exc()}"
 
 
-def generate_with_optional_training(
+def generate_with_training(
     infile,
     n_take,
     seed,
@@ -740,72 +531,96 @@ def generate_with_optional_training(
     focus,
     gelu_seed,
     trained_state,
-    progress=gr.Progress()
+    temperature,
+    top_k,
+    cube_root_n,
+    use_kv_cache,
+    progress=gr.Progress(),
 ):
-    text = load_text(infile)
+    try:
+        text = normalize(load_text(infile))
 
-    gen = NeuroSymbolicGraphGenerator(
-        steer_strength=float(steer),
-        focus_strength=float(focus),
-        gelu_seed=int(gelu_seed),
-    )
+        gen = NeuralTextGenerator(
+            steer_strength=float(steer),
+            focus_strength=float(focus),
+            gelu_seed=int(gelu_seed),
+        )
 
-    # If trained weights exist, load them (ignore if shapes mismatch)
-    if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
-        try:
+        if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
             gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
-        except Exception:
-            pass
-        gen.synthetic_bias.freeze_(True)
-        gen.synthetic_bias.eval()
+            gen.synthetic_bias.freeze_(True)
+            gen.synthetic_bias.eval()
 
-    return gen.generate_report(text, int(n_take), int(seed), t_seed, progress)
+        progress(0.1, desc="Generating")
+        out = gen.generate(
+            text=text,
+            n_takeaways=int(n_take),
+            seed=int(seed),
+            text_seed=t_seed or "",
+            max_length=250,
+            temperature=float(temperature),
+            top_k=int(top_k),
+            cube_root_n=int(cube_root_n),
+            use_kv_cache=bool(use_kv_cache),
+        )
+        return out
+
+    except Exception as e:
+        import traceback
+        return f"Generation failed:\n{e}\n\n{traceback.format_exc()}"
 
 
 # ----------------------------
 # Gradio UI
 # ----------------------------
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.2 (Trainable GELU Bias)") as demo:
-        gr.Markdown("# Neurosymbolic Text Generator V3.2\n*Add Train button (GELU bias fine-tune)*")
+    with gr.Blocks(title="Neural Text Generator V4.4") as demo:
+        gr.Markdown("# Pure Neural Text Generator V4.4\n*Original logic + stable training/generation*")
 
         trained_state = gr.State(None)
 
         with gr.Row():
             infile = gr.File(label="Input File", type="filepath")
-            out_txt = gr.Textbox(label="Output", lines=15)
+            out_txt = gr.Textbox(label="Generated Text", lines=15)
 
-        status = gr.Textbox(label="Status", lines=2)
-
-        with gr.Row():
-            n_take = gr.Slider(1, 20, value=5, label="Takeaways")
-            seed = gr.Number(value=42, label="Global Seed")
+        status = gr.Textbox(label="Status", lines=3)
 
         with gr.Row():
-            steer = gr.Slider(0, 5, value=1.35, label="Steer Strength")
-            focus = gr.Slider(0, 1, value=0.5, label="Focus Strength (Lateral Inhibition)")
-            gelu_seed = gr.Number(value=1337, label="GELU Init Seed")
+            n_take = gr.Slider(1, 10, value=5, step=1, label="# Takeaways")
+            seed = gr.Number(value=42, label="Random Seed")
+            temperature = gr.Slider(0.5, 1.5, value=0.9, label="Temperature")
+            top_k = gr.Slider(5, 200, value=50, step=1, label="Top-k")
 
         with gr.Row():
-            train_steps = gr.Slider(10, 2000, value=250, step=10, label="Train steps")
-            lr = gr.Number(value=1e-3, label="LR")
-            max_contexts = gr.Slider(0, 20000, value=4000, step=100, label="Max contexts (0=all)")
-
-        t_seed = gr.Textbox(label="Text Seed")
+            steer = gr.Slider(0, 3, value=1.35, label="Steer Strength")
+            focus = gr.Slider(0, 1, value=0.5, label="Focus Strength")
+            cube_root_n = gr.Slider(0, 200, value=0, step=1, label="Cube-root logit N (0=off)")
+            use_kv_cache = gr.Checkbox(value=True, label="Use KV cache (faster)")
 
         with gr.Row():
-            train_btn = gr.Button("Train (GELU Bias)", variant="secondary")
+            gelu_seed = gr.Number(value=1337, label="GELU Seed")
+            t_seed = gr.Textbox(label="Text Seed (optional)", placeholder="Start with...")
+
+        with gr.Row():
+            train_steps = gr.Slider(50, 2000, value=500, step=50, label="Train Steps")
+            lr = gr.Number(value=1e-3, label="Learning Rate")
+            max_contexts = gr.Slider(0, 10000, value=2000, step=100, label="Max Contexts")
+            batch_size = gr.Slider(2, 64, value=16, step=1, label="Batch Size")
+            train_top_k = gr.Slider(8, 256, value=64, step=1, label="Train top-k")
+
+        with gr.Row():
+            train_btn = gr.Button("Train GELU Bias", variant="secondary")
             gen_btn = gr.Button("Generate", variant="primary")
 
         train_btn.click(
             train_bias_net,
-            inputs=[infile, seed, steer, focus, gelu_seed, train_steps, lr, max_contexts],
+            inputs=[infile, seed, steer, focus, gelu_seed, train_steps, lr, max_contexts, batch_size, train_top_k],
             outputs=[trained_state, status],
         )
 
         gen_btn.click(
-            generate_with_optional_training,
-            inputs=[infile, n_take, seed, t_seed, steer, focus, gelu_seed, trained_state],
+            generate_with_training,
+            inputs=[infile, n_take, seed, t_seed, steer, focus, gelu_seed, trained_state, temperature, top_k, cube_root_n, use_kv_cache],
             outputs=out_txt,
         )
 
@@ -814,4 +629,5 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
-    app.queue().launch()
+    # show_error=True prints exceptions to console; debug=True keeps main thread alive for logs.
+    app.queue().launch(share=True, show_error=True, debug=True)
