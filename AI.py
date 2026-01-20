@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.2: Shape-safe + Synthetic GELU Bias + TRAIN BUTTON
+V3.4: Mechanistic forward (no rng.choice) + pruning-shape-safe + fail-safe generation
 
 Training button:
 - Trains ONLY the SyntheticGELUBias (GELU MLP) on your input file.
@@ -13,8 +13,10 @@ Dependencies:
 """
 
 from __future__ import annotations
+
 import re
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -31,6 +33,12 @@ from sklearn.decomposition import TruncatedSVD
 import networkx as nx
 from networkx.algorithms import isomorphism as iso
 from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
+
+
+# ----------------------------
+# Warnings: keep console clean
+# ----------------------------
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn.decomposition._truncated_svd")
 
 
 # ----------------------------
@@ -93,14 +101,12 @@ class SyntheticGELUBias(nn.Module):
     """
     def __init__(self, hidden=32, approximate="tanh", vocab_size=None, **kwargs):
         super().__init__()
-        # 3 input features now
         self.fc1 = nn.Linear(3, int(hidden))
         self.act = nn.GELU(approximate=approximate)
         self.fc2 = nn.Linear(int(hidden), 1)
 
     @staticmethod
     def _cbrt(x: torch.Tensor) -> torch.Tensor:
-        # sign-safe cubic root so negatives are valid too
         return torch.sign(x) * torch.abs(x).pow(1.0 / 3.0)
 
     def reset_seed(self, seed: int):
@@ -127,6 +133,76 @@ class SyntheticGELUBias(nn.Module):
         x = torch.stack([x1, x2, x3], dim=-1)  # [V,3]
         h = self.act(self.fc1(x))
         return self.fc2(h).squeeze(-1)         # [V]
+
+
+# ----------------------------
+# Mechanistic forward (deterministic)
+# ----------------------------
+class MechanisticForward(nn.Module):
+    """
+    Deterministic next-token selection.
+    - Works with pruned bars (binding_W.shape[1] can change).
+    - No fixed Linear layer shapes (so no matmul shape explosions).
+    - Uses a context-prototype in nodelet space + cosine similarity.
+
+    Inputs:
+      context_idx: [3] indices into state.vocab100, or -1 for OOV
+      binding_W:  [K, B] nodelet->bar weights (post-prune)
+      bar_probs:  [B] bar distribution (post-prune)
+      cand_probs: [C] LM+gate distribution over candidate list (already normalized)
+      cand_idx:   [C] indices into state.vocab100, or -1 for OOV
+    """
+    def __init__(self, w_geom=0.55, w_lm=0.30, w_bar=0.15):
+        super().__init__()
+        self.w_geom = float(w_geom)
+        self.w_lm = float(w_lm)
+        self.w_bar = float(w_bar)
+
+    @staticmethod
+    def _safe_cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # a,b: [K]
+        na = torch.norm(a) + 1e-12
+        nb = torch.norm(b) + 1e-12
+        return (a @ b) / (na * nb)
+
+    def forward(
+        self,
+        context_idx: torch.Tensor,
+        binding_W: torch.Tensor,
+        bar_probs: torch.Tensor,
+        cand_probs: torch.Tensor,
+        cand_idx: torch.Tensor
+    ) -> int:
+        K, B = binding_W.shape
+        cand_probs = cand_probs.view(-1)
+        cand_idx = cand_idx.view(-1)
+
+        # Build context prototype in nodelet space
+        proto = torch.zeros(K, dtype=binding_W.dtype, device=binding_W.device)
+        used = 0
+        for t in context_idx.view(-1).tolist():
+            if 0 <= int(t) < B:
+                proto = proto + binding_W[:, int(t)]
+                used += 1
+        if used > 0:
+            proto = proto / used
+
+        # Score candidates deterministically
+        scores = torch.empty_like(cand_probs)
+        for i in range(cand_probs.numel()):
+            j = int(cand_idx[i].item())
+            lm = float(cand_probs[i].item())
+
+            if 0 <= j < B:
+                v = binding_W[:, j]
+                geom = float(self._safe_cos(proto, v).item()) if used > 0 else 0.0
+                bar = float(bar_probs[j].item())
+                scores[i] = self.w_geom * geom + self.w_lm * lm + self.w_bar * bar
+            else:
+                # OOV fallback: pure LM
+                scores[i] = lm
+
+        return int(torch.argmax(scores).item())
 
 
 # ----------------------------
@@ -234,15 +310,15 @@ class QuadgramLM:
 
     def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
         cont = []
-        for (a, b, c, d), count in self.quad.items():
+        for (a, b, c, d), _count in self.quad.items():
             if a == w1 and b == w2 and c == w3:
                 cont.append(d)
         if not cont:
-            for (a, b, c), count in self.tri.items():
+            for (a, b, c), _count in self.tri.items():
                 if a == w2 and b == w3:
                     cont.append(c)
         if not cont:
-            for (a, b), count in self.bi.items():
+            for (a, b), _count in self.bi.items():
                 if a == w3:
                     cont.append(b)
         if not cont:
@@ -338,11 +414,11 @@ class NeuroSymbolicGraphGenerator:
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
 
-        # NOTE: accepts vocab_size/kwargs even if caller passes it
         self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh", vocab_size=None)
         self.synthetic_bias.reset_seed(int(gelu_seed))
-        self.synthetic_bias.freeze_(True)  # default frozen unless training button used
+        self.synthetic_bias.freeze_(True)
 
+        self.forward_pass = MechanisticForward()
         self.pruner: Optional[SynapticPruner] = None
 
     def _token_class(self, tok: str) -> str:
@@ -353,8 +429,7 @@ class NeuroSymbolicGraphGenerator:
         L = len(tok)
         return "S" if L <= 3 else "M" if L <= 7 else "L"
 
-    def _pick_initial_context(self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]) -> Tuple[str, str, str]:
-        # Use last 3 word-like seed tokens if provided, else fall back to corpus vocab.
+    def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
         if len(sw) >= 3:
             return (sw[-3], sw[-2], sw[-1])
@@ -417,10 +492,13 @@ class NeuroSymbolicGraphGenerator:
         return True
 
     def _synaptic_prune(self, W: torch.Tensor, energies: torch.Tensor, vocab100: List[str], progress=None):
-        if not self.rfe_enabled or self.rfe_iterations <= 0:
+        if (not self.rfe_enabled) or self.rfe_iterations <= 0:
             return W, vocab100
 
         k, bars_n = W.shape
+        if bars_n < 12:
+            return W, vocab100
+
         self.pruner = SynapticPruner(bars_n)
 
         W_curr = W.detach().clone().requires_grad_(True)
@@ -431,17 +509,22 @@ class NeuroSymbolicGraphGenerator:
                 progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
 
             W_modulated = self.pruner(W_curr)
-            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * torch.var(W_modulated, dim=0).sum()
+
+            # correction=0 avoids DoF warnings on small tensors
+            var_term = torch.var(W_modulated, dim=0, correction=0).sum()
+            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * var_term
             loss.backward()
 
             with torch.no_grad():
+                if W_curr.grad is None:
+                    break
                 grads = W_curr.grad.abs().sum(dim=0)
                 weights = W_curr.abs().sum(dim=0)
                 importance = 0.6 * weights + 0.4 * grads
                 importance = importance / (importance.max() + 1e-12)
 
                 n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
-                if n_keep < 10:
+                if n_keep < 12:
                     break
 
                 active = torch.where(kept_mask)[0]
@@ -465,9 +548,24 @@ class NeuroSymbolicGraphGenerator:
             progress(0, desc="Normalizing")
         text = normalize(text)
 
-        vec = TfidfVectorizer(stop_words="english", max_features=8000, ngram_range=(1, 2))
-        X = vec.fit_transform(re.split(r"\n\s*\n", text)[:500])
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        if len(paragraphs) < 2:
+            # fall back to line chunks
+            paragraphs = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(paragraphs) < 2:
+            raise ValueError("Input too short: need at least 2 non-empty paragraphs/lines.")
+
+        vec = TfidfVectorizer(
+            stop_words="english",
+            max_features=8000,
+            ngram_range=(1, 2),
+            min_df=1,
+        )
+        X = vec.fit_transform(paragraphs[:500])
         vocab = np.array(vec.get_feature_names_out())
+
+        if X.shape[1] == 0:
+            raise ValueError("No TF-IDF features extracted (try longer / more varied text).")
 
         top_idx = np.argsort(-np.asarray(X.sum(axis=0)).ravel())[:self.bars_n]
         vocab100 = vocab[top_idx].tolist()
@@ -475,7 +573,13 @@ class NeuroSymbolicGraphGenerator:
         X_svd = X[:, top_idx]
         n_rows, n_cols = X_svd.shape
         max_rank = min(n_rows, n_cols)
-        k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
+
+        # Make sure TruncatedSVD has a sensible component count
+        if max_rank <= 1:
+            k = 1
+        else:
+            k = min(self.nodelets_n, 10, max_rank - 1)
+            k = max(1, k)
 
         svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
         svd.fit(X_svd)
@@ -486,7 +590,7 @@ class NeuroSymbolicGraphGenerator:
             eng = float(np.linalg.norm(comp))
             nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
 
-        W = torch.tensor(svd.components_, dtype=torch.float32)
+        W = torch.tensor(svd.components_, dtype=torch.float32)  # [k, bars]
         W = F.relu(W)
         W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
@@ -515,8 +619,8 @@ class NeuroSymbolicGraphGenerator:
         return ModelState(
             nodelets=nodelets,
             vocab100=vocab100,
-            binding_W=W,
-            bar_probs=probs,
+            binding_W=W,                 # [k, bars_actual]
+            bar_probs=probs,             # [bars_actual]
             token_boost=token_boost,
             pillar_weights=torch.zeros_like(probs),
             geometric_bias=torch.zeros_like(probs),
@@ -548,6 +652,7 @@ class NeuroSymbolicGraphGenerator:
         boosts = torch.tensor([token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
         bias = self.synthetic_bias(base_p, boosts).view(-1)
 
+        # gate_layer includes Dropout; must be in eval() mode for determinism
         final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9)
         return cand, final_probs
 
@@ -559,21 +664,32 @@ class NeuroSymbolicGraphGenerator:
         text_seed: str = "",
         progress=None,
         overlap_tokens: int = 3,
-        max_steps_min: int = 800,
-        max_steps_max: int = 900,
+        max_steps_min: int = 250,
+        max_steps_max: int = 400,
     ) -> str:
-        rng = np.random.default_rng(int(seed))
+        # Determinism controls
+        np_rng = np.random.default_rng(int(seed))
+        torch.manual_seed(int(seed))
+
+        # disable dropout noise for reproducibility
+        self.gate_layer.eval()
+        self.synthetic_bias.eval()
+
         state = self.build_state(text, progress)
 
         tokens = basic_tokenize(text)
+        if len(tokens) < 20:
+            raise ValueError("Not enough tokens to generate. Provide a longer file.")
+
         lm = QuadgramLM(self.lm_add_k)
         lm.ingest(tokens)
 
         ref_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(text)))
         seed_words = basic_tokenize(text_seed) if text_seed else []
+        w1, w2, w3 = self._pick_initial_context(lm, seed_words)
 
-        # persistent cross-fold context across takeaways
-        w1, w2, w3 = self._pick_initial_context(lm, rng, seed_words)
+        # Use pruned vocab list (post-prune), not original 100
+        vocab_to_idx = {w: i for i, w in enumerate(state.vocab100)}
 
         takeaways: List[str] = []
         overlap_tokens = int(max(0, min(16, overlap_tokens)))
@@ -585,40 +701,91 @@ class NeuroSymbolicGraphGenerator:
             best_sent_tokens: List[str] = []
             best_tail = (w1, w2, w3)
 
-            for _attempt in range(10):
+            # A few attempts: if automorphism check fails, accept best anyway
+            attempts = 0
+            max_attempts = 4
+
+            while attempts < max_attempts:
+                attempts += 1
+
                 tokens_out = [w1, w2, w3] if overlap_tokens >= 3 else [w3]
                 cw1, cw2, cw3 = w1, w2, w3
 
-                for _step in range(int(rng.integers(max_steps_min, max_steps_max))):
+                # deterministic steps given seed, but vary length a bit (seeded)
+                steps = int(np_rng.integers(max_steps_min, max_steps_max))
+
+                # Anti-stall tracking
+                rep_hits = 0
+
+                for step in range(steps):
                     cand, probs = self._final_probs_for_context(lm, state.token_boost, cw1, cw2, cw3)
 
-                    p = probs.detach().cpu().numpy()
-                    p = p / (p.sum() + 1e-12)
+                    # emergency fallback if anything degenerate happens
+                    if len(cand) == 0 or probs.numel() == 0 or not torch.isfinite(probs).all():
+                        cand = lm.vocab[:50] if lm.vocab else ["the", "is", "a", "of", "and"]
+                        probs = torch.ones(len(cand), dtype=torch.float32) / len(cand)
 
-                    nxt = rng.choice(cand, p=p)
+                    # map candidate tokens to pruned bars indices; OOV -> -1
+                    cand_idx = torch.tensor([vocab_to_idx.get(c, -1) for c in cand], dtype=torch.long)
+
+                    # context indices; OOV -> -1
+                    ctx_idx = torch.tensor(
+                        [vocab_to_idx.get(cw1, -1), vocab_to_idx.get(cw2, -1), vocab_to_idx.get(cw3, -1)],
+                        dtype=torch.long
+                    )
+
+                    # mechanistic deterministic selection (fallback to argmax on exceptions)
+                    try:
+                        next_i = self.forward_pass(ctx_idx, state.binding_W, state.bar_probs, probs, cand_idx)
+                        nxt = cand[next_i]
+                    except Exception:
+                        nxt = cand[int(torch.argmax(probs).item())]
+
                     tokens_out.append(nxt)
                     cw1, cw2, cw3 = cw2, cw3, nxt
 
-                    if nxt in [".", "!", "?"] and len([t for t in tokens_out if t.isalpha()]) > 200:
+                    # repetition stall guard
+                    if len(tokens_out) >= 24:
+                        tail = tokens_out[-24:]
+                        if len(set(tail)) <= 6:
+                            rep_hits += 1
+                    if rep_hits >= 8:
                         break
+
+                    # stop when a sentence closes and we have enough words
+                    alpha_count = sum(1 for t in tokens_out if t.isalpha())
+                    if nxt in [".", "!", "?"] and alpha_count >= 60:
+                        break
+
+                # force close sentence if no punctuation
+                if tokens_out and tokens_out[-1] not in [".", "!", "?"]:
+                    tokens_out.append(".")
 
                 sent = detokenize(tokens_out)
                 out_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(sent)))
 
+                # acceptance
                 if self._passes_automorphism_checks(ref_sig, out_sig):
                     best_sent_tokens = tokens_out
                     best_tail = (cw1, cw2, cw3)
                     break
 
+                # keep last attempt as fallback
                 best_sent_tokens = tokens_out
                 best_tail = (cw1, cw2, cw3)
 
+            # update rolling context
             w1, w2, w3 = best_tail
 
+            # overlap management
             if i == 0 or overlap_tokens <= 0:
                 printable = best_sent_tokens
             else:
                 printable = best_sent_tokens[overlap_tokens:] if len(best_sent_tokens) > overlap_tokens else best_sent_tokens
+
+            # absolute emergency: never return empty blocks
+            if len(printable) < 8:
+                printable = [w1, w2, w3, "is", "a", "key", "idea", "."]
 
             takeaways.append(detokenize(printable))
 
@@ -639,6 +806,9 @@ def train_bias_net(
     max_contexts,
     progress=gr.Progress()
 ):
+    if not infile:
+        return None, "Please upload a file."
+
     text = load_text(infile)
 
     gen = NeuroSymbolicGraphGenerator(
@@ -651,8 +821,8 @@ def train_bias_net(
     state = gen.build_state(text, progress)
 
     tokens = basic_tokenize(text)
-    if len(tokens) < 10:
-        return None, "Not enough tokens to train."
+    if len(tokens) < 50:
+        return None, "Not enough tokens to train (need longer text)."
 
     lm = QuadgramLM(gen.lm_add_k)
     lm.ingest(tokens)
@@ -661,12 +831,13 @@ def train_bias_net(
     gen.synthetic_bias.reset_seed(int(gelu_seed))
     gen.synthetic_bias.freeze_(False)
     gen.synthetic_bias.train()
+
+    # Keep generation gate deterministic during training (no dropout noise)
     gen.gate_layer.eval()
     gen.focus_layer.eval()
 
     opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
 
-    # choose training positions: contexts are tokens[i-3:i] -> predict tokens[i]
     positions = list(range(3, len(tokens)))
     if max_contexts and int(max_contexts) > 0:
         positions = positions[: min(len(positions), int(max_contexts))]
@@ -678,6 +849,7 @@ def train_bias_net(
     batch_size = 24
 
     running_loss = 0.0
+    running_batches = 0
     running_used = 0
 
     steps = int(train_steps)
@@ -712,13 +884,14 @@ def train_bias_net(
         opt.step()
 
         running_loss += float(loss.detach().cpu().item())
+        running_batches += 1
         running_used += used
 
         if (step + 1) % max(1, steps // 20) == 0:
             progress((step + 1) / steps, desc=f"Training GELU bias ({step+1}/{steps})")
 
-    avg_loss = running_loss / max(1, (steps if steps > 0 else 1))
-    msg = f"Trained SyntheticGELUBias (3-feature incl. cbrt). Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
+    avg_loss = running_loss / max(1, running_batches)
+    msg = f"Trained SyntheticGELUBias. Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
 
     trained = {
         "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()},
@@ -740,6 +913,9 @@ def generate_with_optional_training(
     trained_state,
     progress=gr.Progress()
 ):
+    if not infile:
+        return "Please upload a file."
+
     text = load_text(infile)
 
     gen = NeuroSymbolicGraphGenerator(
@@ -748,7 +924,10 @@ def generate_with_optional_training(
         gelu_seed=int(gelu_seed),
     )
 
-    # If trained weights exist, load them (ignore if shapes mismatch)
+    # Determinism: disable dropout noise in gate
+    gen.gate_layer.eval()
+
+    # If trained weights exist, load them
     if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
         try:
             gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
@@ -764,8 +943,8 @@ def generate_with_optional_training(
 # Gradio UI
 # ----------------------------
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.2 (Trainable GELU Bias)") as demo:
-        gr.Markdown("# Neurosymbolic Text Generator V3.2\n*Add Train button (GELU bias fine-tune)*")
+    with gr.Blocks(title="Neurosymbolic V3.4 (Mechanistic Forward)") as demo:
+        gr.Markdown("# Neurosymbolic Text Generator V3.4\nMechanistic forward (no rng.choice) + pruning-safe + fail-safes")
 
         trained_state = gr.State(None)
 
