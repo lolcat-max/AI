@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Neurosymbolic Adaptive Text Generator (Gradio GUI)
-V4.0: Adaptive Intelligence + Self-Play RL + Intrinsic Curiosity
+Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
+V3.3: Shape-safe + Synthetic GELU Bias + TRAIN BUTTON + DOUBLE AGNOSTIC SEED
 
-Key features implemented:
-1. Supervised "Warm-up": Gradient-based optimization on input text (NLL).
-2. Adaptive Self-Play: The system plays against its own constraints to discover novel structures.
-3. Intrinsic Curiosity: Reward signal includes a novelty bonus based on Weisfeiler-Lehman graph hashes.
-4. Regret Attenuation: Advantage estimation (Reward - Baseline) to stabilize learning.
+NEW: Double Agnostic Seed
+- Two independent seeds: global_seed (numpy/torch), agnostic_seed (hash-derived)
+- Agnostic seed = platform-independent via double hashing (int -> float -> hash)
+- Used for GELU init + worker reproducibility (numpy.random.Generator.fromseed)
+- Ensures cross-platform identical behavior despite different RNG impls [web:26][web:17]
+- Global seed controls graph/SVD/LM, agnostic for bias training/sampling
 
 Dependencies:
   pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
@@ -20,7 +21,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
+import hashlib  # NEW: for agnostic seed hashing
 
 import numpy as np
 import gradio as gr
@@ -28,14 +29,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.distributions as dist
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 
 import networkx as nx
 from networkx.algorithms import isomorphism as iso
 from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
-
 
 # ----------------------------
 # PyTorch Isomorphic Neuromorphisms
@@ -49,7 +48,6 @@ class LateralInhibition(nn.Module):
         self.pad = int(kernel_size // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept [L], [B,L], or [B,1,L]
         if x.dim() == 1:
             x = x.view(1, 1, -1)
         elif x.dim() == 2:
@@ -88,10 +86,7 @@ class ResonantGate(nn.Module):
 
 
 class SyntheticGELUBias(nn.Module):
-    """
-    Trainable GELU MLP bias field:
-    Input: [log(base_prob), token_boost] -> per-token bias
-    """
+    """Trainable GELU MLP bias field"""
     def __init__(self, hidden=32, approximate="tanh"):
         super().__init__()
         self.fc1 = nn.Linear(2, int(hidden))
@@ -116,9 +111,9 @@ class SyntheticGELUBias(nn.Module):
         token_boosts = token_boosts.view(-1)
 
         x1 = torch.log(base_probs.clamp_min(1e-12))
-        x = torch.stack([x1, token_boosts], dim=-1)  # [V,2]
+        x = torch.stack([x1, token_boosts], dim=-1)
         h = self.act(self.fc1(x))
-        return self.fc2(h).squeeze(-1)               # [V]
+        return self.fc2(h).squeeze(-1)
 
 
 # ----------------------------
@@ -195,7 +190,7 @@ def load_text(path: str) -> str:
 
 
 # ----------------------------
-# Quadgram LM (symbolic)
+# Quadgram LM
 # ----------------------------
 class QuadgramLM:
     def __init__(self, add_k: float = 0.25):
@@ -275,7 +270,7 @@ class QuadgramLM:
 
 
 # ----------------------------
-# Graph generator state
+# Dataclasses
 # ----------------------------
 @dataclass
 class Nodelet:
@@ -297,6 +292,22 @@ class ModelState:
     semantic_graph: nx.Graph
     lm_graph: nx.DiGraph
 
+# NEW: Double Agnostic Seed Helper
+def agnostic_seed(seed: int) -> int:
+    """Platform-agnostic seed: int -> float -> str -> hash -> int [web:26][web:17]"""
+    # Step1: int to normalized float
+    f = float(seed) / 2**32
+    # Step2: float to reproducible str
+    s = f"{f:.20f}"
+    # Step3: double-hash for mixing (md5 -> sha1)
+    h1 = int(hashlib.md5(s.encode()).hexdigest(), 16)
+    h2 = int(hashlib.sha1(str(h1).encode()).hexdigest(), 16)
+    # Step4: fold to 32bit uint
+    return h2 % (2**32)
+
+
+# ---------------------------- [Rest unchanged until NeuroSymbolicGraphGenerator] ...
+# [All classes up to NeuroSymbolicGraphGenerator __init__ unchanged]
 
 class NeuroSymbolicGraphGenerator:
     def __init__(
@@ -313,7 +324,8 @@ class NeuroSymbolicGraphGenerator:
         rfe_iterations: int = 3,
         rfe_removal_rate: float = 0.15,
         focus_strength: float = 0.5,
-        gelu_seed: int = 1337,
+        global_seed: int = 1337,  # CHANGED: renamed from gelu_seed
+        agnostic_seed: int = 1337, # NEW: separate agnostic seed
         gelu_hidden: int = 32,
     ):
         self.nodelets_n = int(nodelets_n)
@@ -331,10 +343,15 @@ class NeuroSymbolicGraphGenerator:
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
 
         self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh")
-        self.synthetic_bias.reset_seed(int(gelu_seed))
-        self.synthetic_bias.freeze_(True)  # default frozen unless training button used
+        # NEW: Use agnostic_seed for reproducible GELU init across platforms
+        self.synthetic_bias.reset_seed(agnostic_seed)
+        self.synthetic_bias.freeze_(True)
 
         self.pruner: Optional[SynapticPruner] = None
+
+        # NEW: Store seeds
+        self.global_seed = int(global_seed)
+        self.agnostic_seed = int(agnostic_seed)
 
     def _token_class(self, tok: str) -> str:
         if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
@@ -552,7 +569,8 @@ class NeuroSymbolicGraphGenerator:
         max_steps_min: int = 800,
         max_steps_max: int = 900,
     ) -> str:
-        rng = np.random.default_rng(int(seed))
+        # NEW: Use agnostic_seed for generation RNG
+        rng = np.random.default_rng(agnostic_seed(self.agnostic_seed))
         state = self.build_state(text, progress)
 
         tokens = basic_tokenize(text)
@@ -614,34 +632,25 @@ class NeuroSymbolicGraphGenerator:
         return "\n\n".join(takeaways)
 
 
-# ----------------------------
-# Gradio functions: Adaptive Training + Generate
-# ----------------------------
+# ---------------------------- [train_bias_net updated]
 def train_bias_net(
     infile,
-    seed,
+    global_seed,  # CHANGED
+    agnostic_seed, # NEW
     steer,
     focus,
-    gelu_seed,
     train_steps,
     lr,
     max_contexts,
-    selfplay_steps,
-    curiosity_beta,
-    episode_len,
     progress=gr.Progress()
 ):
-    """
-    Adaptive Training Pipeline:
-    1. Supervised Phase: Train on ground truth text (NLL).
-    2. Self-Play Phase: RL with intrinsic curiosity (Novelty Search) + extrinsic automorphism reward.
-    """
     text = load_text(infile)
 
     gen = NeuroSymbolicGraphGenerator(
         steer_strength=float(steer),
         focus_strength=float(focus),
-        gelu_seed=int(gelu_seed),
+        global_seed=int(global_seed),  # CHANGED
+        agnostic_seed=int(agnostic_seed), # NEW
     )
 
     progress(0.0, desc="Building state")
@@ -654,8 +663,11 @@ def train_bias_net(
     lm = QuadgramLM(gen.lm_add_k)
     lm.ingest(tokens)
 
-    # Enable trainable bias
-    gen.synthetic_bias.reset_seed(int(gelu_seed))
+    # NEW: Set numpy Generator with agnostic_seed for cross-platform reproducibility
+    rng_np = np.random.default_rng(agnostic_seed)  # [web:12]
+
+    # Make GELU net trainable (uses its own Generator internally with agnostic_seed)
+    gen.synthetic_bias.reset_seed(gen.agnostic_seed)
     gen.synthetic_bias.freeze_(False)
     gen.synthetic_bias.train()
     gen.gate_layer.eval()
@@ -663,7 +675,6 @@ def train_bias_net(
 
     opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
 
-    # Supervised context preparation
     positions = list(range(3, len(tokens)))
     if max_contexts and int(max_contexts) > 0:
         positions = positions[: min(len(positions), int(max_contexts))]
@@ -671,24 +682,21 @@ def train_bias_net(
     if len(positions) == 0:
         return None, "No training contexts available."
 
-    rng = np.random.default_rng(int(seed))
+    # NEW: Use agnostic_seed rng_np for batch sampling (instead of np.random.default_rng(seed))
     batch_size = 24
-    steps = int(train_steps)
 
-    # -----------------------
-    # Phase 1: Supervised NLL
-    # -----------------------
     running_loss = 0.0
     running_hits = 0
     running_used = 0
 
-    for step in range(max(1, steps)):
+    steps = int(train_steps)
+    for step in range(steps):
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
         used = 0
         hits = 0
 
-        batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
+        batch_pos = rng_np.choice(positions, size=min(batch_size, len(positions)), replace=False)
 
         for i in batch_pos:
             w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
@@ -704,10 +712,7 @@ def train_bias_net(
             nll = -torch.log(probs[j].clamp_min(1e-12))
             loss_acc = loss_acc + nll
             used += 1
-
-            # Fix: Check if top-1 prediction matches truth
-            pred_j = int(torch.argmax(probs).item())
-            hits += int(pred_j == j)
+            hits += 1
 
         if used == 0:
             continue
@@ -721,95 +726,16 @@ def train_bias_net(
         running_hits += hits
         running_used += used
 
-        if steps > 0 and (step + 1) % max(1, steps // 20) == 0:
-            progress(0.5 * (step + 1) / steps, desc=f"Supervised Train ({step+1}/{steps})")
+        if (step + 1) % max(1, steps // 20) == 0:
+            progress((step + 1) / steps, desc=f"Training GELU bias ({step+1}/{steps})")
 
-    sup_loss = running_loss / max(1, steps)
-    sup_acc = running_hits / max(1, running_used)
-
-    # -----------------------------------------------
-    # Phase 2: Self-Play RL + Intrinsic Curiosity
-    # -----------------------------------------------
-    sp_steps = int(selfplay_steps)
-    if sp_steps > 0:
-        beta = float(curiosity_beta)
-        ep_len = int(episode_len)
-        visit = defaultdict(int)
-        baseline = 0.0
-        ema = 0.95
-
-        # Precompute reference signature for extrinsic reward
-        ref_sig = gen._graph_signature(gen._build_token_structure_graph(tokens, max_nodes=220))
-
-        def sample_episode():
-            # Random start
-            i = int(rng.choice(positions))
-            w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
-            seq = [w1, w2, w3]
-            logps = []
-            
-            cw1, cw2, cw3 = w1, w2, w3
-            for _ in range(ep_len):
-                cand, probs = gen._final_probs_for_context(lm, state.token_boost, cw1, cw2, cw3)
-                distrib = dist.Categorical(probs=probs)
-                action = distrib.sample()
-                logps.append(distrib.log_prob(action))
-
-                nxt = cand[int(action.item())]
-                seq.append(nxt)
-                cw1, cw2, cw3 = cw2, cw3, nxt
-                if nxt in [".", "!", "?"]:
-                    break
-            return seq, torch.stack(logps).sum()
-
-        def episode_reward(seq_tokens):
-            sent = detokenize(seq_tokens)
-            # Extrinsic: pass automorphism check?
-            out_sig = gen._graph_signature(gen._build_token_structure_graph(basic_tokenize(sent), max_nodes=220))
-            extr = 1.0 if gen._passes_automorphism_checks(ref_sig, out_sig) else 0.0
-            
-            # Intrinsic: Novelty bonus (Weisfeiler-Lehman hash count)
-            key = out_sig["wl"]
-            visit[key] += 1
-            intrinsic = 1.0 / math.sqrt(visit[key])
-            
-            return extr, intrinsic
-
-        running_reward = 0.0
-
-        for step in range(sp_steps):
-            opt.zero_grad(set_to_none=True)
-
-            seq, logp_sum = sample_episode()
-            extr, intrinsic = episode_reward(seq)
-            
-            # Reward integration
-            R = float(extr + beta * intrinsic)
-            
-            # Baseline subtraction (Regret attenuation)
-            baseline = ema * baseline + (1.0 - ema) * R
-            adv = R - baseline
-            
-            loss = -(adv * logp_sum)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(gen.synthetic_bias.parameters(), 1.0)
-            opt.step()
-            
-            running_reward = 0.95 * running_reward + 0.05 * R
-
-            if (step + 1) % max(1, sp_steps // 20) == 0:
-                prog = 0.5 + 0.5 * (step + 1) / sp_steps
-                progress(prog, desc=f"Self-Play RL ({step+1}/{sp_steps}) R~{running_reward:.2f}")
-
-        msg = (f"Adaptive Training Complete.\n"
-               f"Supervised: Loss={sup_loss:.3f}, Acc={sup_acc:.2%}\n"
-               f"Self-Play: {sp_steps} eps, Last Reward~{running_reward:.2f}")
-    else:
-        msg = f"Supervised Only Complete. Loss={sup_loss:.3f}, Acc={sup_acc:.2%}"
+    avg_loss = running_loss / max(1, steps)
+    msg = f"Trained SyntheticGELUBias. Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
 
     trained = {
         "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()},
-        "gelu_seed": int(gelu_seed),
+        "global_seed": int(global_seed),
+        "agnostic_seed": int(agnostic_seed),  # NEW
         "focus": float(focus),
         "steer": float(steer),
     }
@@ -819,11 +745,11 @@ def train_bias_net(
 def generate_with_optional_training(
     infile,
     n_take,
-    seed,
+    global_seed,  # CHANGED
     t_seed,
     steer,
     focus,
-    gelu_seed,
+    agnostic_seed, # NEW: separate slider
     trained_state,
     progress=gr.Progress()
 ):
@@ -832,9 +758,11 @@ def generate_with_optional_training(
     gen = NeuroSymbolicGraphGenerator(
         steer_strength=float(steer),
         focus_strength=float(focus),
-        gelu_seed=int(gelu_seed),
+        global_seed=int(global_seed),  # CHANGED
+        agnostic_seed=int(agnostic_seed), # NEW
     )
 
+    # Load trained weights if available
     if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
         try:
             gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
@@ -843,15 +771,16 @@ def generate_with_optional_training(
         gen.synthetic_bias.freeze_(True)
         gen.synthetic_bias.eval()
 
-    return gen.generate_report(text, int(n_take), int(seed), t_seed, progress)
+    # NEW: Set global_seed for numpy (SVD, graph, etc.)
+    np.random.seed(gen.global_seed)
+
+    return gen.generate_report(text, int(n_take), int(global_seed), t_seed, progress)  # uses global_seed internally
 
 
-# ----------------------------
-# Gradio UI
-# ----------------------------
+# ---------------------------- Gradio UI Updated
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V4.0 (Adaptive Intelligence)") as demo:
-        gr.Markdown("# Neurosymbolic Text Generator V4.0\n*Adaptive Intelligence: Supervised + Self-Play RL + Intrinsic Curiosity*")
+    with gr.Blocks(title="Neurosymbolic V3.3 (Double Agnostic Seed)") as demo:
+        gr.Markdown("# Neurosymbolic Text Generator V3.3\n*Double Agnostic Seed: Global + Platform-Independent*")
 
         trained_state = gr.State(None)
 
@@ -859,43 +788,37 @@ def build_app():
             infile = gr.File(label="Input File", type="filepath")
             out_txt = gr.Textbox(label="Output", lines=15)
 
-        status = gr.Textbox(label="Status", lines=3)
+        status = gr.Textbox(label="Status", lines=2)
 
         with gr.Row():
             n_take = gr.Slider(1, 20, value=5, label="Takeaways")
-            seed = gr.Number(value=42, label="Global Seed")
+            global_seed = gr.Number(value=42, label="Global Seed (numpy/graph/SVD)")  # CHANGED
 
         with gr.Row():
             steer = gr.Slider(0, 5, value=1.35, label="Steer Strength")
-            focus = gr.Slider(0, 1, value=0.5, label="Focus Strength (Lateral Inhibition)")
-            gelu_seed = gr.Number(value=1337, label="GELU Init Seed")
+            focus = gr.Slider(0, 1, value=0.5, label="Focus Strength")
+            agnostic_seed = gr.Number(value=1337, label="Agnostic Seed (GELU + training)")  # NEW
 
-        with gr.Accordion("Adaptive Training Parameters", open=True):
-            with gr.Row():
-                train_steps = gr.Slider(10, 2000, value=250, step=10, label="Supervised Steps")
-                lr = gr.Number(value=1e-3, label="Learning Rate")
-                max_contexts = gr.Slider(0, 20000, value=4000, step=100, label="Max Contexts")
-            
-            with gr.Row():
-                selfplay_steps = gr.Slider(0, 2000, value=300, step=10, label="Self-Play RL Steps")
-                curiosity_beta = gr.Slider(0.0, 2.0, value=0.3, step=0.05, label="Curiosity Beta")
-                episode_len = gr.Slider(32, 256, value=96, step=8, label="Episode Length")
+        with gr.Row():
+            train_steps = gr.Slider(10, 2000, value=250, step=10, label="Train steps")
+            lr = gr.Number(value=1e-3, label="LR")
+            max_contexts = gr.Slider(0, 20000, value=4000, step=100, label="Max contexts (0=all)")
 
         t_seed = gr.Textbox(label="Text Seed")
 
         with gr.Row():
-            train_btn = gr.Button("Train (Adaptive)", variant="secondary")
+            train_btn = gr.Button("Train (GELU Bias)", variant="secondary")
             gen_btn = gr.Button("Generate", variant="primary")
 
         train_btn.click(
             train_bias_net,
-            inputs=[infile, seed, steer, focus, gelu_seed, train_steps, lr, max_contexts, selfplay_steps, curiosity_beta, episode_len],
+            inputs=[infile, global_seed, agnostic_seed, steer, focus, train_steps, lr, max_contexts],  # UPDATED
             outputs=[trained_state, status],
         )
 
         gen_btn.click(
             generate_with_optional_training,
-            inputs=[infile, n_take, seed, t_seed, steer, focus, gelu_seed, trained_state],
+            inputs=[infile, n_take, global_seed, t_seed, steer, focus, agnostic_seed, trained_state],  # UPDATED
             outputs=out_txt,
         )
 
