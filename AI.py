@@ -86,13 +86,22 @@ class ResonantGate(nn.Module):
 class SyntheticGELUBias(nn.Module):
     """
     Trainable GELU MLP bias field:
-    Input: [log(base_prob), token_boost] -> per-token bias
+    Input features per token:
+      [log(base_prob), token_boost, cbrt(token_boost)] -> per-token bias
+
+    NOTE: accepts vocab_size / **kwargs for backwards compatibility with older call sites.
     """
-    def __init__(self, hidden=32, approximate="tanh"):
+    def __init__(self, hidden=32, approximate="tanh", vocab_size=None, **kwargs):
         super().__init__()
-        self.fc1 = nn.Linear(2, int(hidden))
+        # 3 input features now
+        self.fc1 = nn.Linear(3, int(hidden))
         self.act = nn.GELU(approximate=approximate)
         self.fc2 = nn.Linear(int(hidden), 1)
+
+    @staticmethod
+    def _cbrt(x: torch.Tensor) -> torch.Tensor:
+        # sign-safe cubic root so negatives are valid too
+        return torch.sign(x) * torch.abs(x).pow(1.0 / 3.0)
 
     def reset_seed(self, seed: int):
         g = torch.Generator()
@@ -112,9 +121,12 @@ class SyntheticGELUBias(nn.Module):
         token_boosts = token_boosts.view(-1)
 
         x1 = torch.log(base_probs.clamp_min(1e-12))
-        x = torch.stack([x1, token_boosts], dim=-1)  # [V,2]
+        x2 = token_boosts
+        x3 = self._cbrt(token_boosts)
+
+        x = torch.stack([x1, x2, x3], dim=-1)  # [V,3]
         h = self.act(self.fc1(x))
-        return self.fc2(h).squeeze(-1)               # [V]
+        return self.fc2(h).squeeze(-1)         # [V]
 
 
 # ----------------------------
@@ -326,7 +338,8 @@ class NeuroSymbolicGraphGenerator:
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
 
-        self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh")
+        # NOTE: accepts vocab_size/kwargs even if caller passes it
+        self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh", vocab_size=None)
         self.synthetic_bias.reset_seed(int(gelu_seed))
         self.synthetic_bias.freeze_(True)  # default frozen unless training button used
 
@@ -339,6 +352,7 @@ class NeuroSymbolicGraphGenerator:
             return "OTHER"
         L = len(tok)
         return "S" if L <= 3 else "M" if L <= 7 else "L"
+
     def _pick_initial_context(self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]) -> Tuple[str, str, str]:
         # Use last 3 word-like seed tokens if provided, else fall back to corpus vocab.
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
@@ -350,6 +364,7 @@ class NeuroSymbolicGraphGenerator:
             return (sw[-1], sw[-1], sw[-1])
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
+
     def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> nx.DiGraph:
         toks = tokens[:max_nodes]
         G = nx.DiGraph()
@@ -543,7 +558,7 @@ class NeuroSymbolicGraphGenerator:
         seed: int = 7,
         text_seed: str = "",
         progress=None,
-        overlap_tokens: int = 3,         # NEW: how many tokens to overlap across takes
+        overlap_tokens: int = 3,
         max_steps_min: int = 800,
         max_steps_max: int = 900,
     ) -> str:
@@ -557,7 +572,7 @@ class NeuroSymbolicGraphGenerator:
         ref_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(text)))
         seed_words = basic_tokenize(text_seed) if text_seed else []
 
-        # NEW: persistent cross-fold context across takeaways
+        # persistent cross-fold context across takeaways
         w1, w2, w3 = self._pick_initial_context(lm, rng, seed_words)
 
         takeaways: List[str] = []
@@ -570,16 +585,13 @@ class NeuroSymbolicGraphGenerator:
             best_sent_tokens: List[str] = []
             best_tail = (w1, w2, w3)
 
-            # rejection loop stays the same, but each attempt starts from current (w1,w2,w3)
             for _attempt in range(10):
                 tokens_out = [w1, w2, w3] if overlap_tokens >= 3 else [w3]
                 cw1, cw2, cw3 = w1, w2, w3
 
-                # generate
                 for _step in range(int(rng.integers(max_steps_min, max_steps_max))):
                     cand, probs = self._final_probs_for_context(lm, state.token_boost, cw1, cw2, cw3)
 
-                    # numpy Generator.choice requires p to be 1-D and match cand length; keep it normalized. [web:119][web:106]
                     p = probs.detach().cpu().numpy()
                     p = p / (p.sum() + 1e-12)
 
@@ -590,7 +602,6 @@ class NeuroSymbolicGraphGenerator:
                     if nxt in [".", "!", "?"] and len([t for t in tokens_out if t.isalpha()]) > 200:
                         break
 
-                # evaluate graph gate
                 sent = detokenize(tokens_out)
                 out_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(sent)))
 
@@ -599,14 +610,11 @@ class NeuroSymbolicGraphGenerator:
                     best_tail = (cw1, cw2, cw3)
                     break
 
-                # fallback keep last attempt
                 best_sent_tokens = tokens_out
                 best_tail = (cw1, cw2, cw3)
 
-            # NEW: update cross-fold context for next takeaway
             w1, w2, w3 = best_tail
 
-            # NEW: when printing, remove the overlapped prefix to avoid visible duplication
             if i == 0 or overlap_tokens <= 0:
                 printable = best_sent_tokens
             else:
@@ -615,7 +623,6 @@ class NeuroSymbolicGraphGenerator:
             takeaways.append(detokenize(printable))
 
         return "\n\n".join(takeaways)
-
 
 
 # ----------------------------
@@ -659,8 +666,7 @@ def train_bias_net(
 
     opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
 
-    # choose training positions
-    # contexts are tokens[i-3:i] -> predict tokens[i]
+    # choose training positions: contexts are tokens[i-3:i] -> predict tokens[i]
     positions = list(range(3, len(tokens)))
     if max_contexts and int(max_contexts) > 0:
         positions = positions[: min(len(positions), int(max_contexts))]
@@ -672,7 +678,6 @@ def train_bias_net(
     batch_size = 24
 
     running_loss = 0.0
-    running_hits = 0
     running_used = 0
 
     steps = int(train_steps)
@@ -680,9 +685,7 @@ def train_bias_net(
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
         used = 0
-        hits = 0
 
-        # sample a mini-batch of positions
         batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
 
         for i in batch_pos:
@@ -691,20 +694,16 @@ def train_bias_net(
 
             cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
 
-            # supervised only when true is in candidate set (keeps it simple + fast)
             try:
                 j = cand.index(true_next)
             except ValueError:
                 continue
 
-            # NLL
             nll = -torch.log(probs[j].clamp_min(1e-12))
             loss_acc = loss_acc + nll
             used += 1
-            hits += 1
 
         if used == 0:
-            # nothing to learn from this batch
             continue
 
         loss = loss_acc / used
@@ -713,14 +712,13 @@ def train_bias_net(
         opt.step()
 
         running_loss += float(loss.detach().cpu().item())
-        running_hits += hits
         running_used += used
 
         if (step + 1) % max(1, steps // 20) == 0:
             progress((step + 1) / steps, desc=f"Training GELU bias ({step+1}/{steps})")
 
     avg_loss = running_loss / max(1, (steps if steps > 0 else 1))
-    msg = f"Trained SyntheticGELUBias. Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
+    msg = f"Trained SyntheticGELUBias (3-feature incl. cbrt). Avg batch loss={avg_loss:.4f}. Used={running_used} samples."
 
     trained = {
         "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()},
