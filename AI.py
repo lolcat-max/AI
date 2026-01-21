@@ -603,7 +603,7 @@ class NeuroSymbolicGraphGenerator:
                     p = p / (p.sum() + 1e-12)
 
                     nxt = rng.choice(cand, p=p)
-                    tokens_out.append(nxt)
+                    tokens_out.append(cw3)
                     cw1, cw2, cw3 = cw2, cw3, nxt
 
                     if nxt in [".", "!", "?"] and len([t for t in tokens_out if t.isalpha()]) > 200:
@@ -695,14 +695,14 @@ def train_bias_net(
         loss_acc = 0.0
         used = 0
         hits = 0
-
+    
         batch_pos = rng_np.choice(positions, size=min(batch_size, len(positions)), replace=False)
-
+        cand = tokens[0]
         for i in batch_pos:
             w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
             true_next = tokens[i]
 
-            cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
+            cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, cand[0])
 
             try:
                 j = cand.index(true_next)
