@@ -702,7 +702,7 @@ def train_bias_net(
             w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
             true_next = tokens[i]
 
-            cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, cand[0])
+            cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, cand[-1])
 
             try:
                 j = cand.index(true_next)
