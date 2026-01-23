@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.2: Shape-safe + Synthetic GELU Bias + TRAIN BUTTON
+V3.2 + "SGLang-like" structured program layer (no sglang library)
 
 Training button:
 - Trains ONLY the SyntheticGELUBias (GELU MLP) on your input file.
 - Stores learned weights in gr.State, then Generate loads them for sampling.
+
+SGLang-like button:
+- Implements minimal primitives (extend/+=, gen, select, fork, join) in pure Python
+- Runs a structured program: fork takeaways -> join -> summarize
 
 Dependencies:
   pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
@@ -339,6 +343,7 @@ class NeuroSymbolicGraphGenerator:
             return "OTHER"
         L = len(tok)
         return "S" if L <= 3 else "M" if L <= 7 else "L"
+
     def _pick_initial_context(self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]) -> Tuple[str, str, str]:
         # Use last 3 word-like seed tokens if provided, else fall back to corpus vocab.
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
@@ -350,6 +355,7 @@ class NeuroSymbolicGraphGenerator:
             return (sw[-1], sw[-1], sw[-1])
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
+
     def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> nx.DiGraph:
         toks = tokens[:max_nodes]
         G = nx.DiGraph()
@@ -543,7 +549,7 @@ class NeuroSymbolicGraphGenerator:
         seed: int = 7,
         text_seed: str = "",
         progress=None,
-        overlap_tokens: int = 3,         # NEW: how many tokens to overlap across takes
+        overlap_tokens: int = 3,
         max_steps_min: int = 800,
         max_steps_max: int = 900,
     ) -> str:
@@ -557,7 +563,7 @@ class NeuroSymbolicGraphGenerator:
         ref_sig = self._graph_signature(self._build_token_structure_graph(basic_tokenize(text)))
         seed_words = basic_tokenize(text_seed) if text_seed else []
 
-        # NEW: persistent cross-fold context across takeaways
+        # persistent cross-fold context across takeaways
         w1, w2, w3 = self._pick_initial_context(lm, rng, seed_words)
 
         takeaways: List[str] = []
@@ -570,7 +576,7 @@ class NeuroSymbolicGraphGenerator:
             best_sent_tokens: List[str] = []
             best_tail = (w1, w2, w3)
 
-            # rejection loop stays the same, but each attempt starts from current (w1,w2,w3)
+            # rejection loop; each attempt starts from current (w1,w2,w3)
             for _attempt in range(10):
                 tokens_out = [w1, w2, w3] if overlap_tokens >= 3 else [w3]
                 cw1, cw2, cw3 = w1, w2, w3
@@ -579,7 +585,6 @@ class NeuroSymbolicGraphGenerator:
                 for _step in range(int(rng.integers(max_steps_min, max_steps_max))):
                     cand, probs = self._final_probs_for_context(lm, state.token_boost, cw1, cw2, cw3)
 
-                    # numpy Generator.choice requires p to be 1-D and match cand length; keep it normalized. [web:119][web:106]
                     p = probs.detach().cpu().numpy()
                     p = p / (p.sum() + 1e-12)
 
@@ -603,10 +608,10 @@ class NeuroSymbolicGraphGenerator:
                 best_sent_tokens = tokens_out
                 best_tail = (cw1, cw2, cw3)
 
-            # NEW: update cross-fold context for next takeaway
+            # update cross-fold context for next takeaway
             w1, w2, w3 = best_tail
 
-            # NEW: when printing, remove the overlapped prefix to avoid visible duplication
+            # remove overlapped prefix to avoid visible duplication
             if i == 0 or overlap_tokens <= 0:
                 printable = best_sent_tokens
             else:
@@ -616,6 +621,155 @@ class NeuroSymbolicGraphGenerator:
 
         return "\n\n".join(takeaways)
 
+
+# ----------------------------
+# Minimal "SGLang-like" DSL (no external libs)
+# ----------------------------
+class SGPrompt:
+    """
+    Minimal prompt-state object with += behavior.
+    """
+    def __init__(self, text: str = ""):
+        self.text = str(text)
+
+    def __iadd__(self, other: str):
+        self.text += str(other)
+        return self
+
+    def __str__(self):
+        return self.text
+
+
+class SGContext:
+    """
+    Bridges SGPrompt <-> NeuroSymbolicGraphGenerator.
+    """
+    def __init__(
+        self,
+        corpus_text: str,
+        generator: NeuroSymbolicGraphGenerator,
+        seed: int = 7,
+    ):
+        self.corpus_text = normalize(corpus_text)
+        self.generator = generator
+        self.seed = int(seed)
+
+    def clone(self, seed_offset: int) -> "SGContext":
+        return SGContext(
+            corpus_text=self.corpus_text,
+            generator=self.generator,
+            seed=self.seed + int(seed_offset),
+        )
+
+
+def sg_gen(
+    ctx: SGContext,
+    prompt: SGPrompt,
+    max_tokens: int = 240,
+    seed_offset: int = 0,
+) -> str:
+    """
+    "gen": use prompt.text as text_seed and generate 1 takeaway.
+    """
+    steps_min = max(120, int(max_tokens) * 2)
+    steps_max = max(180, int(max_tokens) * 3)
+
+    out = ctx.generator.generate_report(
+        ctx.corpus_text,
+        n_takeaways=1,
+        seed=ctx.seed + int(seed_offset),
+        text_seed=prompt.text,
+        progress=None,
+        overlap_tokens=3,
+        max_steps_min=steps_min,
+        max_steps_max=steps_max,
+    )
+    return out.strip()
+
+
+def sg_select(options: List[str], scores: Optional[List[float]] = None) -> str:
+    """
+    "select": deterministic argmax selection on scores; otherwise first option.
+    """
+    if not options:
+        return ""
+    if not scores or len(scores) != len(options):
+        return options[0]
+    idx = max(range(len(options)), key=lambda i: float(scores[i]))
+    return options[idx]
+
+
+def sg_fork(ctx: SGContext, prompt: SGPrompt, n: int) -> List[Tuple[SGContext, SGPrompt]]:
+    """
+    "fork": create N prompt-state clones (synchronous).
+    """
+    out: List[Tuple[SGContext, SGPrompt]] = []
+    n = int(max(1, n))
+    for i in range(n):
+        out.append((ctx.clone(seed_offset=1000 + i), SGPrompt(prompt.text)))
+    return out
+
+
+def sg_join(prompts: List[SGPrompt], joiner: str = "\n\n") -> SGPrompt:
+    """
+    "join": merge prompt texts into one.
+    """
+    merged = SGPrompt("")
+    merged.text = joiner.join(p.text for p in prompts)
+    return merged
+
+
+def run_sglang_style_program(
+    infile: str,
+    n_take: int,
+    seed: int,
+    steer: float,
+    focus: float,
+    gelu_seed: int,
+    trained_state: Optional[dict] = None,
+) -> str:
+    """
+    A structured program:
+      1) fork N branches to generate takeaways
+      2) join the results
+      3) generate a short summary based on the joined text
+    """
+    corpus_text = load_text(infile)
+
+    gen = NeuroSymbolicGraphGenerator(
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        gelu_seed=int(gelu_seed),
+    )
+
+    # load trained GELU bias weights if present
+    if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
+        try:
+            gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
+        except Exception:
+            pass
+        gen.synthetic_bias.freeze_(True)
+        gen.synthetic_bias.eval()
+
+    ctx = SGContext(corpus_text, gen, seed=int(seed))
+
+    root = SGPrompt("Generate a technical takeaway based on the document.\n\n")
+    branches = sg_fork(ctx, root, n=int(n_take))
+
+    take_prompts: List[SGPrompt] = []
+    for i, (bctx, bp) in enumerate(branches):
+        bp += f"[Takeaway {i+1}] "
+        bp += sg_gen(bctx, bp, max_tokens=220, seed_offset=i)
+        take_prompts.append(bp)
+
+    merged = sg_join(take_prompts, joiner="\n\n")
+
+    summary = SGPrompt(
+        "Summarize these takeaways in 1–2 compact paragraphs, preserving technical terms:\n\n"
+        + merged.text
+        + "\n\nSummary:"
+    )
+    return sg_gen(ctx, summary, max_tokens=260, seed_offset=999)
 
 
 # ----------------------------
@@ -659,7 +813,6 @@ def train_bias_net(
 
     opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
 
-    # choose training positions
     # contexts are tokens[i-3:i] -> predict tokens[i]
     positions = list(range(3, len(tokens)))
     if max_contexts and int(max_contexts) > 0:
@@ -672,7 +825,6 @@ def train_bias_net(
     batch_size = 24
 
     running_loss = 0.0
-    running_hits = 0
     running_used = 0
 
     steps = int(train_steps)
@@ -680,9 +832,7 @@ def train_bias_net(
         opt.zero_grad(set_to_none=True)
         loss_acc = 0.0
         used = 0
-        hits = 0
 
-        # sample a mini-batch of positions
         batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
 
         for i in batch_pos:
@@ -691,7 +841,7 @@ def train_bias_net(
 
             cand, probs = gen._final_probs_for_context(lm, state.token_boost, w1, w2, w3)
 
-            # supervised only when true is in candidate set (keeps it simple + fast)
+            # supervised only when true is in candidate set
             try:
                 j = cand.index(true_next)
             except ValueError:
@@ -701,10 +851,8 @@ def train_bias_net(
             nll = -torch.log(probs[j].clamp_min(1e-12))
             loss_acc = loss_acc + nll
             used += 1
-            hits += 1
 
         if used == 0:
-            # nothing to learn from this batch
             continue
 
         loss = loss_acc / used
@@ -713,7 +861,6 @@ def train_bias_net(
         opt.step()
 
         running_loss += float(loss.detach().cpu().item())
-        running_hits += hits
         running_used += used
 
         if (step + 1) % max(1, steps // 20) == 0:
@@ -762,12 +909,32 @@ def generate_with_optional_training(
     return gen.generate_report(text, int(n_take), int(seed), t_seed, progress)
 
 
+def sglang_style_button(
+    infile,
+    n_take,
+    seed,
+    steer,
+    focus,
+    gelu_seed,
+    trained_state,
+):
+    return run_sglang_style_program(
+        infile=infile,
+        n_take=int(n_take),
+        seed=int(seed),
+        steer=float(steer),
+        focus=float(focus),
+        gelu_seed=int(gelu_seed),
+        trained_state=trained_state,
+    )
+
+
 # ----------------------------
 # Gradio UI
 # ----------------------------
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.2 (Trainable GELU Bias)") as demo:
-        gr.Markdown("# Neurosymbolic Text Generator V3.2\n*Add Train button (GELU bias fine-tune)*")
+    with gr.Blocks(title="Neurosymbolic V3.2 (Trainable GELU Bias + SGLang-like)") as demo:
+        gr.Markdown("# Neurosymbolic Text Generator V3.2\n*Add Train button (GELU bias fine-tune) + SGLang-like program layer*")
 
         trained_state = gr.State(None)
 
@@ -795,7 +962,7 @@ def build_app():
 
         with gr.Row():
             train_btn = gr.Button("Train (GELU Bias)", variant="secondary")
-            gen_btn = gr.Button("Generate", variant="primary")
+            sg_btn = gr.Button("SGLang-style Program", variant="primary")
 
         train_btn.click(
             train_bias_net,
@@ -806,6 +973,12 @@ def build_app():
         gen_btn.click(
             generate_with_optional_training,
             inputs=[infile, n_take, seed, t_seed, steer, focus, gelu_seed, trained_state],
+            outputs=out_txt,
+        )
+
+        sg_btn.click(
+            sglang_style_button,
+            inputs=[infile, n_take, seed, steer, focus, gelu_seed, trained_state],
             outputs=out_txt,
         )
 
