@@ -962,7 +962,7 @@ def build_app():
 
         with gr.Row():
             train_btn = gr.Button("Train (GELU Bias)", variant="secondary")
-            sg_btn = gr.Button("SGLang-style Program", variant="primary")
+            sg_btn = gr.Button("Generate", variant="primary")
 
         train_btn.click(
             train_bias_net,
