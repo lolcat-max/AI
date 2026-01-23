@@ -970,18 +970,13 @@ def build_app():
             outputs=[trained_state, status],
         )
 
-        gen_btn.click(
+        sg_btn.click(
             generate_with_optional_training,
             inputs=[infile, n_take, seed, t_seed, steer, focus, gelu_seed, trained_state],
             outputs=out_txt,
         )
 
-        sg_btn.click(
-            sglang_style_button,
-            inputs=[infile, n_take, seed, steer, focus, gelu_seed, trained_state],
-            outputs=out_txt,
-        )
-
+      
     return demo
 
 
