@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.3 + SGLang-like Neural Runtime (Continuous Batching, Radix Cache, Speculative Decoding)
+V3.4 + "SGLang-like" Runtime + Editable Prompts
 
-New in V3.3:
-- Full "Continuous Batching" inference engine (no simple loops).
-- "RadixLRUCache" reuses expensive neural distributions across shared prefixes.
-- "Speculative Decoding" (propose n-gram, verify with gated GELU) inside the batch loop.
-- SGLang-style primitives (fork, join, gen, select) backed by the batched runtime.
+New in V3.4:
+- Added "Editable Prompts" section in UI (Accordion).
+- Users can modify the "Takeaway Prompt" (prefix) and "Summary Prompt" (template).
+- Keeps the full Continuous Batching / RadixCache / Speculative Decoding backend.
 
 Dependencies:
   pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
@@ -759,6 +758,8 @@ def run_sglang_style_program(
     steer: float,
     focus: float,
     gelu_seed: int,
+    takeaway_prompt_str: str,
+    summary_prompt_tmpl: str,
     trained_state: Optional[dict] = None,
 ) -> str:
     corpus_text = load_text(infile)
@@ -781,8 +782,8 @@ def run_sglang_style_program(
     ctx = SGContext(corpus_text, gen, seed=int(seed))
     ctx.ensure_prepared()
 
-    # 1. Fork prompt
-    root = SGPrompt("Generate a technical takeaway based on the document.\n\n")
+    # 1. Fork prompt with User-Defined Prefix
+    root = SGPrompt(str(takeaway_prompt_str) + "\n\n") # Ensure spacing
     branches = sg_fork(ctx, root, n=int(n_take))
     
     # 2. Batched generation of takeaways
@@ -802,10 +803,9 @@ def run_sglang_style_program(
         
     merged = sg_join(branch_prompts, joiner="\n\n")
 
-    # 4. Summary (single stream)
-    summary_prompt = SGPrompt(
-        "explain these concepts in easy to read paragraphs:\n\n" + merged.text + "\n\nSummary:"
-    )
+    # 4. Summary (User-Defined Template)
+    final_sum_prompt = summary_prompt_tmpl.replace("{joined_takeaways}", merged.text)
+    summary_prompt = SGPrompt(final_sum_prompt)
     summary_text = sg_gen(ctx, summary_prompt, max_tokens=260)
     
     return summary_prompt.text + summary_text
@@ -881,8 +881,8 @@ def train_bias_net(
 
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.3 (SGLang Runtime)") as demo:
-        gr.Markdown("# Neurosymbolic V3.3: SGLang-like Runtime\n*Continuous Batching, RadixCache, Speculative Decoding*")
+    with gr.Blocks(title="Neurosymbolic V3.4 (SGLang Runtime + Editable Prompts)") as demo:
+        gr.Markdown("# Neurosymbolic V3.4: SGLang-like Runtime\n*Continuous Batching, RadixCache, Speculative Decoding*")
         
         trained_state = gr.State(None)
         
@@ -898,7 +898,20 @@ def build_app():
             steer = gr.Slider(0, 5, value=1.35, label="Steer")
             focus = gr.Slider(0, 1, value=0.5, label="Focus")
             gelu_seed = gr.Number(value=1337, label="GELU Seed")
-            
+        
+        # New Editable Prompts Section
+        with gr.Accordion("Editable Prompts", open=False):
+            p_takeaway = gr.Textbox(
+                label="Takeaway Prompt (Prefix)", 
+                value="",
+                lines=2
+            )
+            p_summary = gr.Textbox(
+                label="Prompt Template, {joined_takeaways} will be replaced", 
+                value="",
+                lines=4
+            )
+
         train_btn = gr.Button("Train GELU Bias (Optional)")
         run_btn = gr.Button("Run Structured Program (SGLang style)", variant="primary")
         status = gr.Textbox(label="Train Status")
@@ -911,7 +924,7 @@ def build_app():
         
         run_btn.click(
             run_sglang_style_program,
-            inputs=[infile, n_take, seed, steer, focus, gelu_seed, trained_state],
+            inputs=[infile, n_take, seed, steer, focus, gelu_seed, p_takeaway, p_summary, trained_state],
             outputs=out_txt
         )
         
