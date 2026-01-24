@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.4 + "SGLang-like" Runtime + Editable Prompts
+V3.6 + Gaspare (Seed-based Inference Sparsification)
 
-New in V3.4:
-- Added "Editable Prompts" section in UI (Accordion).
-- Users can modify the "Takeaway Prompt" (prefix) and "Summary Prompt" (template).
-- Keeps the full Continuous Batching / RadixCache / Speculative Decoding backend.
+New in V3.6:
+- "Gaspare" Logic: Uses np.where and random seed to sparsify 
+  probability distributions, reducing inference noise.
 
 Dependencies:
-  pip install gradio numpy scikit-learn networkx tqdm datasets pypdf python-docx torch
+  pip install gradio numpy torch
 """
 
 from __future__ import annotations
@@ -21,30 +20,239 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any, Callable
 from collections import OrderedDict, deque
-
 import numpy as np
 import gradio as gr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import TruncatedSVD
 
-import networkx as nx
-from networkx.algorithms import isomorphism as iso
-from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
+
+# ----------------------------
+# Pure-Python TF-IDF + SVD (no sklearn)
+# ----------------------------
+
+def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
+    """Pure NumPy TF-IDF."""
+    all_words = set()
+    for doc in docs:
+        words = re.findall(r"\b\w+\b", doc.lower())
+        all_words.update(words)
+
+    vocab = list(all_words)[:max_features]
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+
+    X = np.zeros((len(docs), len(vocab)))
+    doc_freq = np.zeros(len(vocab))
+
+    for i, doc in enumerate(docs):
+        word_counts = {}
+        for word in re.findall(r"\b\w+\b", doc.lower()):
+            word_counts[word] = word_counts.get(word, 0) + 1
+
+        for word, count in word_counts.items():
+            if word in word_to_idx:
+                j = word_to_idx[word]
+                tf = count / len(word_counts)
+                idf = math.log(len(docs) / (1 + sum(1 for d in docs if word in d.lower())))
+                X[i, j] = tf * idf
+                doc_freq[j] += 1
+
+    return X, vocab
+
+
+def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42) -> Any:
+    """Pure NumPy truncated SVD (no sklearn)."""
+    np.random.seed(random_state)
+    m, n = X.shape
+    k = min(n_components, min(m, n))
+
+    Q = np.random.randn(n, k)
+    Q, _ = np.linalg.qr(Q)
+
+    for _ in range(10):
+        B = X.T @ X @ Q
+        Q, _ = np.linalg.qr(B)
+
+    B = X @ Q
+    U, S, Vt = np.linalg.svd(B, full_matrices=False)
+    return type("SVD", (), {"components_": Vt[:k]})()
+
+
+# ----------------------------
+# Helper Functions (Global)
+# ----------------------------
+
+def _token_class(tok: str) -> str:
+    """Classifies a token for graph node attributes."""
+    if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
+        return "PUNC"
+    if not re.match(r"[a-z]", tok):
+        return "OTHER"
+    L = len(tok)
+    return "S" if L <= 3 else "M" if L <= 7 else "L"
+
+
+# ----------------------------
+# Pure-Python Graph (Gaspare-style, no networkx)
+# ----------------------------
+
+@dataclass
+class SimpleGraph:
+    nodes: List[Dict[str, Any]]
+    edges: List[Tuple[int, int, Dict[str, Any]]]
+
+    @classmethod
+    def from_token_sequence(cls, tokens: List[str], max_nodes: int = 220):
+        toks = tokens[:max_nodes]
+        nodes = [{"id": i, "cls": _token_class(t)} for i, t in enumerate(toks)]
+        edges = []
+        for i in range(len(toks) - 1):
+            edges.append((i, i + 1, {"rel": "adj"}))
+        for i in range(len(toks) - 2):
+            edges.append((i, i + 2, {"rel": "skip"}))
+        return cls(nodes, edges)
+
+    def degree_histogram(self, max_bins: int = 16) -> np.ndarray:
+        degrees = [0] * max_bins
+        node_deg = {node["id"]: 0 for node in self.nodes}
+        for u, v, _ in self.edges:
+            node_deg[u] += 1
+            node_deg[v] += 1
+        for d in node_deg.values():
+            if d < max_bins:
+                degrees[d] += 1
+        return np.array(degrees)
+
+    def weisfeiler_lehman_hash(self, iterations: int = 3, digest_size: int = 16) -> str:
+        labels = {node["id"]: node["cls"] for node in self.nodes}
+        adj = {node["id"]: [] for node in self.nodes}
+        for u, v, _ in self.edges:
+            adj[u].append(v)
+            adj[v].append(u)
+
+        for _ in range(iterations):
+            new_labels = {}
+            for node_id in labels:
+                neighbors = sorted([labels[n] for n in adj[node_id]])
+                combined = (labels[node_id],) + tuple(neighbors)
+                new_hash = hash(combined) % (10**digest_size)
+                new_labels[node_id] = f"{labels[node_id]}_{new_hash}"
+            labels = new_labels
+
+        final_hash = sum(hash((k, labels[k])) for k in labels) % (10**digest_size)
+        return f"{final_hash:0{digest_size}d}"
+
+    def automorphism_estimate(self, max_count: int = 150) -> int:
+        labels = {node["id"]: node["cls"] for node in self.nodes}
+        label_counts = {}
+        for label in labels.values():
+            label_counts[label] = label_counts.get(label, 0) + 1
+        prod = 1
+        for cnt in label_counts.values():
+            prod *= cnt
+        return min(max_count, prod)
+
+
+def graph_signature(G: SimpleGraph) -> Dict[str, object]:
+    deg_hist = G.degree_histogram()
+    wl = G.weisfeiler_lehman_hash()
+    aut_est = G.automorphism_estimate()
+    return {"deg_hist": deg_hist, "wl": wl, "aut_est": aut_est}
+
+
+def passes_automorphism_checks(ref_sig, out_sig, geometric_strength: float = 0.3) -> bool:
+    strict = max(0.0, min(2.0, geometric_strength))
+    ref = ref_sig["deg_hist"].astype(float)
+    ref = ref / (ref.sum() + 1e-12)
+    out = out_sig["deg_hist"].astype(float)
+    out = out / (out.sum() + 1e-12)
+    if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict):
+        return False
+    ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
+    band = max(1.3, 3.5 - 1.2 * min(1.0, geometric_strength / 2.0))
+    if not (1.0 / band <= ratio <= band):
+        return False
+    if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]:
+        return False
+    return True
+
+
+# ----------------------------
+# STOPWORDS + Normalization + Tokenization
+# ----------------------------
+
+STOPWORDS = set(
+    """
+    a an and are as at be by for from has have he her hers him his i in is it its me my
+    of on or our ours she so that the their them they this to was we were what when where
+    which who will with you your yours
+    """.split()
+)
+
+
+def normalize(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def basic_tokenize(text: str) -> List[str]:
+    text = text.replace("\n", " ")
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
+    out = []
+    for t in tokens:
+        if re.match(r"[A-Za-z]", t):
+            out.append(t.lower())
+        else:
+            out.append(t)
+    return out
+
+
+def detokenize(tokens: List[str]) -> str:
+    out = []
+    for t in tokens:
+        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
+            if t in ["(", ")"]:
+                out.append(t)
+            else:
+                if out:
+                    out[-1] += t
+                else:
+                    out.append(t)
+        else:
+            if out and out[-1].endswith("("):
+                out[-1] += t
+            else:
+                out.append(t)
+    s = " ".join(out)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
+    return s
+
+
+def load_text(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+    ext = p.suffix.lower()
+    if ext in [".txt", ".md"]:
+        return p.read_text(encoding="utf-8", errors="replace")
+    if ext in [".pdf", ".docx"]:
+        raise ValueError(
+            f"Unsupported file extension: {ext}. "
+            "Please convert to .txt or .md first (no pypdf / python-docx)."
+        )
+    raise ValueError(f"Unsupported file extension: {ext}")
 
 
 # ----------------------------
 # SGLang-like Runtime Components
 # ----------------------------
+
 class RadixLRUCache:
-    """
-    Stores per-context decoding results (neural distributions) to emulate
-    Prefix KV Cache reuse.
-    Key: (cache_version, w1, w2, w3) -> Value: (candidates, probs_tensor)
-    """
     def __init__(self, max_items: int = 25000):
         self.max_items = int(max(256, max_items))
         self._od: "OrderedDict[Tuple[int, str, str, str], Tuple[List[str], torch.Tensor]]" = OrderedDict()
@@ -68,9 +276,6 @@ class RadixLRUCache:
 
 @dataclass
 class DecodeStream:
-    """
-    Represents a single active generation request (like a 'sequence' in SGLang).
-    """
     stream_id: int
     tokens_out: List[str]
     w1: str
@@ -80,12 +285,13 @@ class DecodeStream:
     alpha_count: int = 0
     max_steps: int = 1000
     stop_tokens: set = field(default_factory=lambda: {".", "!", "?"})
-    min_alpha: int = 200  # min alpha tokens before stopping on punctuation
+    min_alpha: int = 200
 
 
 # ----------------------------
 # PyTorch Neural Modules
 # ----------------------------
+
 class LateralInhibition(nn.Module):
     def __init__(self, kernel_size=7, strength=0.5):
         super().__init__()
@@ -120,7 +326,7 @@ class ResonantGate(nn.Module):
         self.steer_strength = float(steer_strength)
         self.noise_injector = nn.Dropout(p=0.05)
 
-    def forward(self, lm_probs: torch.Tensor, token_boosts: torch.Tensor, temp=0.95) -> torch.Tensor:
+    def forward(self, lm_probs: torch.Tensor, token_boosts: torch.Tensor, temp=0.7) -> torch.Tensor:
         lm_probs = lm_probs.view(-1)
         token_boosts = token_boosts.view(-1)
         potentials = torch.log(lm_probs.clamp_min(1e-12))
@@ -160,68 +366,9 @@ class SyntheticGELUBias(nn.Module):
 
 
 # ----------------------------
-# Utils & Preprocessing
-# ----------------------------
-STOPWORDS = set("""
-a an and are as at be by for from has have he her hers him his i in is it its me my
-of on or our ours she so that the their them they this to was we were what when where
-which who will with you your yours
-""".split())
-
-def normalize(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-def basic_tokenize(text: str) -> List[str]:
-    text = text.replace("\n", " ")
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
-    out = []
-    for t in tokens:
-        if re.match(r"[A-Za-z]", t):
-            out.append(t.lower())
-        else:
-            out.append(t)
-    return out
-
-def detokenize(tokens: List[str]) -> str:
-    out = []
-    for t in tokens:
-        if t in [".", ",", ";", ":", "!", "?", ")", "("]:
-            if t in ["(", ")"]:
-                out.append(t)
-            else:
-                if out: out[-1] += t
-                else: out.append(t)
-        else:
-            if out and out[-1].endswith("("): out[-1] += t
-            else: out.append(t)
-    s = " ".join(out)
-    s = re.sub(r"\(\s+", "(", s)
-    s = re.sub(r"\s+\)", ")", s)
-    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
-    return s
-
-def load_text(path: str) -> str:
-    p = Path(path)
-    if not p.exists(): raise FileNotFoundError(f"File not found: {p}")
-    ext = p.suffix.lower()
-    if ext in [".txt", ".md"]: return p.read_text(encoding="utf-8", errors="replace")
-    if ext == ".docx":
-        import docx
-        d = docx.Document(str(p))
-        return "\n".join([para.text for para in d.paragraphs])
-    if ext == ".pdf":
-        from pypdf import PdfReader
-        reader = PdfReader(str(p))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    raise ValueError(f"Unsupported file extension: {ext}")
-
-
-# ----------------------------
 # Quadgram LM
 # ----------------------------
+
 class QuadgramLM:
     def __init__(self, add_k: float = 0.25):
         self.add_k = float(add_k)
@@ -233,7 +380,10 @@ class QuadgramLM:
         self.total = 0
 
     def ingest(self, tokens: List[str]) -> None:
-        self.uni.clear(); self.bi.clear(); self.tri.clear(); self.quad.clear()
+        self.uni.clear()
+        self.bi.clear()
+        self.tri.clear()
+        self.quad.clear()
         self.total = 0
         for t in tokens:
             self.uni[t] = self.uni.get(t, 0) + 1
@@ -252,17 +402,21 @@ class QuadgramLM:
     def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
         cont = []
         for (a, b, c, d), count in self.quad.items():
-            if a == w1 and b == w2 and c == w3: cont.append(d)
+            if a == w1 and b == w2 and c == w3:
+                cont.append(d)
         if not cont:
             for (a, b, c), count in self.tri.items():
-                if a == w2 and b == w3: cont.append(c)
+                if a == w2 and b == w3:
+                    cont.append(c)
         if not cont:
             for (a, b), count in self.bi.items():
-                if a == w3: cont.append(b)
+                if a == w3:
+                    cont.append(b)
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
-        seen = set(); cand = []
+        seen = set()
+        cand = []
         for w in cont:
             if w not in seen:
                 seen.add(w)
@@ -275,13 +429,16 @@ class QuadgramLM:
         def get_prob(w4: str) -> float:
             c123 = self.tri.get((w1, w2, w3), 0)
             c1234 = self.quad.get((w1, w2, w3, w4), 0)
-            if c123 > 0: return (c1234 + add_k) / (c123 + add_k * V)
+            if c123 > 0:
+                return (c1234 + add_k) / (c123 + add_k * V)
             c12 = self.bi.get((w2, w3), 0)
             c123_tri = self.tri.get((w2, w3, w4), 0)
-            if c12 > 0: return (c123_tri + add_k) / (c12 + add_k * V)
+            if c12 > 0:
+                return (c123_tri + add_k) / (c12 + add_k * V)
             c1 = self.uni.get(w3, 0)
             c12_bi = self.bi.get((w3, w4), 0)
-            if c1 > 0: return (c12_bi + add_k) / (c1 + add_k * V)
+            if c1 > 0:
+                return (c12_bi + add_k) / (c1 + add_k * V)
             return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
 
         probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
@@ -290,14 +447,16 @@ class QuadgramLM:
 
 
 # ----------------------------
-# System State & Preparation
+# Nodelets & Model State
 # ----------------------------
+
 @dataclass
 class Nodelet:
     idx: int
     top_terms: List[Tuple[str, float]]
     energy: float
     narrative: str
+
 
 @dataclass
 class ModelState:
@@ -308,8 +467,9 @@ class ModelState:
     token_boost: Dict[str, float]
     pillar_weights: torch.Tensor
     geometric_bias: torch.Tensor
-    semantic_graph: nx.Graph
-    lm_graph: nx.DiGraph
+    semantic_graph: SimpleGraph
+    lm_graph: Any
+
 
 @dataclass
 class PreparedCorpus:
@@ -318,6 +478,11 @@ class PreparedCorpus:
     lm: QuadgramLM
     state: ModelState
     ref_sig: Dict[str, object]
+
+
+# ----------------------------
+# NeuroSymbolicGraphGenerator
+# ----------------------------
 
 class NeuroSymbolicGraphGenerator:
     def __init__(
@@ -357,7 +522,6 @@ class NeuroSymbolicGraphGenerator:
         self.synthetic_bias.freeze_(True)
         self.pruner: Optional[SynapticPruner] = None
 
-        # SGLang runtime state
         self.cache_version = 0
         self.radix_cache = RadixLRUCache(max_items=int(radix_cache_items))
         self.speculative_accept_topk = int(speculative_accept_topk)
@@ -366,71 +530,54 @@ class NeuroSymbolicGraphGenerator:
         self.cache_version += 1
         self.radix_cache.clear()
 
-    def _token_class(self, tok: str) -> str:
-        if tok in [".", ",", ";", ":", "!", "?", "(", ")"]: return "PUNC"
-        if not re.match(r"[a-z]", tok): return "OTHER"
-        L = len(tok)
-        return "S" if L <= 3 else "M" if L <= 7 else "L"
-
-    def _pick_initial_context(self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]) -> Tuple[str, str, str]:
+    def _pick_initial_context(
+        self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]
+    ) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
-        if len(sw) >= 3: return (sw[-3], sw[-2], sw[-1])
-        if len(sw) == 2: return (sw[-2], sw[-1], sw[-1])
-        if len(sw) == 1: return (sw[-1], sw[-1], sw[-1])
+        if len(sw) >= 3:
+            return (sw[-3], sw[-2], sw[-1])
+        if len(sw) == 2:
+            return (sw[-2], sw[-1], sw[-1])
+        if len(sw) == 1:
+            return (sw[-1], sw[-1], sw[-1])
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
 
-    def _build_token_structure_graph(self, tokens: List[str], max_nodes: int = 220) -> nx.DiGraph:
-        toks = tokens[:max_nodes]
-        G = nx.DiGraph()
-        for i, t in enumerate(toks):
-            G.add_node(i, cls=self._token_class(t))
-        for i in range(len(toks) - 1):
-            G.add_edge(i, i + 1, rel="adj")
-        for i in range(len(toks) - 2):
-            G.add_edge(i, i + 2, rel="skip")
-        return G
+    def _build_token_structure_graph(
+        self, tokens: List[str], max_nodes: int = 220
+    ) -> SimpleGraph:
+        return SimpleGraph.from_token_sequence(tokens, max_nodes)
 
-    def _graph_signature(self, G: nx.Graph) -> Dict[str, object]:
-        deg = [d for _, d in G.degree()]
-        wl_mode = G.to_undirected() if G.is_directed() else G
-        node_attr = "cls" if G.is_directed() else None
-        wl = weisfeiler_lehman_graph_hash(wl_mode, node_attr=node_attr, iterations=3, digest_size=16)
-
-        match_kwargs = (
-            {"node_match": iso.categorical_node_match("cls", None),
-             "edge_match": iso.categorical_edge_match("rel", None)}
-            if G.is_directed() else {}
-        )
-        GM = iso.DiGraphMatcher(G, G, **match_kwargs) if G.is_directed() else iso.GraphMatcher(G, G, **match_kwargs)
-        cnt = 0
-        for _ in GM.isomorphisms_iter():
-            cnt += 1
-            if cnt >= 150: break
-        return {"deg_hist": np.bincount(deg, minlength=16)[:16], "wl": wl, "aut_est": cnt}
+    def _graph_signature(self, G: SimpleGraph) -> Dict[str, object]:
+        return graph_signature(G)
 
     def _passes_automorphism_checks(self, ref_sig, out_sig) -> bool:
-        strict = max(0.0, min(2.0, self.geometric_strength))
-        ref = ref_sig["deg_hist"].astype(float); ref /= (ref.sum() + 1e-12)
-        out = out_sig["deg_hist"].astype(float); out /= (out.sum() + 1e-12)
-        if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict): return False
-        ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
-        band = max(1.3, 3.5 - 1.2 * min(1.0, self.gate_layer.steer_strength / 2.0))
-        if not (1.0 / band <= ratio <= band): return False
-        if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]: return False
-        return True
+        return passes_automorphism_checks(ref_sig, out_sig, self.geometric_strength)
 
-    def _synaptic_prune(self, W: torch.Tensor, energies: torch.Tensor, vocab100: List[str], progress=None):
-        if not self.rfe_enabled or self.rfe_iterations <= 0: return W, vocab100
+    def _synaptic_prune(
+        self,
+        W: torch.Tensor,
+        energies: torch.Tensor,
+        vocab100: List[str],
+        progress=None,
+    ):
+        if not self.rfe_enabled or self.rfe_iterations <= 0:
+            return W, vocab100
         k, bars_n = W.shape
         self.pruner = SynapticPruner(bars_n)
         W_curr = W.detach().clone().requires_grad_(True)
         kept_mask = torch.ones(bars_n, dtype=torch.bool)
 
         for iteration in range(self.rfe_iterations):
-            if progress: progress(0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)), desc=f"Synaptic Pruning {iteration+1}")
+            if progress:
+                progress(
+                    0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)),
+                    desc=f"Synaptic Pruning {iteration+1}",
+                )
             W_modulated = self.pruner(W_curr)
-            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * torch.var(W_modulated, dim=0).sum()
+            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * torch.var(
+                W_modulated, dim=0
+            ).sum()
             loss.backward()
             with torch.no_grad():
                 grads = W_curr.grad.abs().sum(dim=0)
@@ -438,10 +585,13 @@ class NeuroSymbolicGraphGenerator:
                 importance = 0.6 * weights + 0.4 * grads
                 importance = importance / (importance.max() + 1e-12)
                 n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
-                if n_keep < 10: break
+                if n_keep < 10:
+                    break
                 active = torch.where(kept_mask)[0]
                 local_importance = importance[active]
-                _, top_local = torch.topk(local_importance, k=min(n_keep, local_importance.numel()))
+                _, top_local = torch.topk(
+                    local_importance, k=min(n_keep, local_importance.numel())
+                )
                 new_mask = torch.zeros_like(kept_mask)
                 new_mask[active[top_local]] = True
                 kept_mask = new_mask
@@ -454,25 +604,29 @@ class NeuroSymbolicGraphGenerator:
         return W_final, vocab_final
 
     def build_state(self, text: str, progress=None) -> ModelState:
-        if progress: progress(0, desc="Normalizing")
+        if progress:
+            progress(0, desc="Normalizing")
         text = normalize(text)
-        vec = TfidfVectorizer(stop_words="english", max_features=8000, ngram_range=(1, 2))
-        X = vec.fit_transform(re.split(r"\n\s*\n", text)[:500])
-        vocab = np.array(vec.get_feature_names_out())
 
-        top_idx = np.argsort(-np.asarray(X.sum(axis=0)).ravel())[:self.bars_n]
-        vocab100 = vocab[top_idx].tolist()
+        docs = re.split(r"\n\s*\n", text)[:500]
+        X, vocab = pure_tfidf(docs, max_features=8000)
+
+        top_idx = np.argsort(-X.sum(axis=0))[: self.bars_n]
+        vocab100 = [vocab[i] for i in top_idx]
         X_svd = X[:, top_idx]
+
         n_rows, n_cols = X_svd.shape
         max_rank = min(n_rows, n_cols)
         k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
 
-        svd = TruncatedSVD(n_components=k, random_state=self.svd_random_state)
-        svd.fit(X_svd)
+        svd = pure_truncated_svd(X_svd, n_components=k, random_state=self.svd_random_state)
 
         nodelets = []
         for i, comp in enumerate(svd.components_):
-            terms = sorted([(vocab100[j], float(comp[j])) for j in range(len(comp))], key=lambda x: -abs(x[1]))[:10]
+            terms = sorted(
+                [(vocab100[j], float(comp[j])) for j in range(len(comp))],
+                key=lambda x: -abs(x[1]),
+            )[:10]
             eng = float(np.linalg.norm(comp))
             nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
 
@@ -480,7 +634,9 @@ class NeuroSymbolicGraphGenerator:
         W = F.relu(W)
         W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
-        energies = torch.tensor([n.energy for n in nodelets], dtype=torch.float32)
+        energies = torch.tensor(
+            [n.energy for n in nodelets], dtype=torch.float32
+        )
         energies = energies / (energies.max() + 1e-12)
         W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
 
@@ -492,18 +648,22 @@ class NeuroSymbolicGraphGenerator:
         for w, p in zip(vocab100, probs.detach().cpu().tolist()):
             for subw in w.split():
                 if len(subw) > 2 and subw not in STOPWORDS:
-                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
+                    token_boost[subw] = max(
+                        token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0
+                    )
 
-        G_sem = nx.Graph()
-        W_np = W.detach().cpu().numpy()
-        for i in range(W_np.shape[0]):
-            for j in range(W_np.shape[1]):
-                if W_np[i, j] > 0.05: G_sem.add_edge(f"N{i}", f"B{j}", weight=float(W_np[i, j]))
+        G_sem = SimpleGraph(nodes=[], edges=[])  # dummy semantic graph
 
         return ModelState(
-            nodelets=nodelets, vocab100=vocab100, binding_W=W, bar_probs=probs,
-            token_boost=token_boost, pillar_weights=torch.zeros_like(probs),
-            geometric_bias=torch.zeros_like(probs), semantic_graph=G_sem, lm_graph=nx.DiGraph()
+            nodelets=nodelets,
+            vocab100=vocab100,
+            binding_W=W,
+            bar_probs=probs,
+            token_boost=token_boost,
+            pillar_weights=torch.zeros_like(probs),
+            geometric_bias=torch.zeros_like(probs),
+            semantic_graph=G_sem,
+            lm_graph=None,
         )
 
     def prepare_corpus(self, text: str, progress=None) -> PreparedCorpus:
@@ -512,20 +672,21 @@ class NeuroSymbolicGraphGenerator:
         tokens = basic_tokenize(text)
         lm = QuadgramLM(self.lm_add_k)
         lm.ingest(tokens)
-        ref_sig = self._graph_signature(self._build_token_structure_graph(tokens))
-        return PreparedCorpus(text=text, tokens=tokens, lm=lm, state=state, ref_sig=ref_sig)
 
-    # ----------------------------
-    # Neural Runtime Methods
-    # ----------------------------
+        G = self._build_token_structure_graph(tokens)
+        ref_sig = self._graph_signature(G)
+
+        return PreparedCorpus(
+            text=text, tokens=tokens, lm=lm, state=state, ref_sig=ref_sig
+        )
+
     def _final_probs_for_context_cached(
         self,
         prep: PreparedCorpus,
-        w1: str, w2: str, w3: str
+        w1: str,
+        w2: str,
+        w3: str,
     ) -> Tuple[List[str], torch.Tensor]:
-        """
-        Computes neural gated probs. Uses RadixLRUCache to reuse results for same prefix.
-        """
         key = (int(self.cache_version), str(w1), str(w2), str(w3))
         cached = self.radix_cache.get(key)
         if cached is not None:
@@ -545,7 +706,10 @@ class NeuroSymbolicGraphGenerator:
         base_p = base_p / (base_p.sum() + 1e-12)
         base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
 
-        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32).view(-1)
+        boosts = torch.tensor(
+            [prep.state.token_boost.get(w, 0.0) for w in cand],
+            dtype=torch.float32,
+        ).view(-1)
         bias = self.synthetic_bias(base_p, boosts).view(-1)
         final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9).view(-1)
 
@@ -556,13 +720,8 @@ class NeuroSymbolicGraphGenerator:
 # ----------------------------
 # Continuous Batching Decoder
 # ----------------------------
+
 class ContinuousBatchDecoder:
-    """
-    SGLang-like Inference Scheduler.
-    - Manages multiple DecodeStreams.
-    - Groups them by prefix to exploit RadixCache.
-    - Runs batched Speculative Decoding (Propose -> Verify).
-    """
     def __init__(
         self,
         gen: "NeuroSymbolicGraphGenerator",
@@ -579,34 +738,51 @@ class ContinuousBatchDecoder:
 
     def _sample_from_probs(self, cand: List[str], probs: torch.Tensor) -> str:
         p = probs.detach().cpu().numpy()
-        p = p / (p.sum() + 1e-12)
-        return self.rng.choice(cand, p=p)
+        
+        # GASPARE UPDATE: Use seed (self.rng) to determine a sparse cutoff
+        # "np.where high probs to lower inference" -> We prune low probability tails
+        # dynamically based on the random seed state.
+        
+        # Calculate a dynamic cutoff based on the distribution stats + random seed
+        cutoff = np.mean(p) + (self.rng.random() * np.std(p))
+        
+        # np.where: Keep p if p > cutoff, else 0
+        p_sparse = np.where(p > cutoff, p, 0.0)
+        
+        # Safety: if we pruned everything, revert to original
+        if p_sparse.sum() < 1e-12:
+            p_sparse = p
+            
+        # Renormalize
+        p_sparse = p_sparse / (p_sparse.sum() + 1e-12)
+        
+        return self.rng.choice(cand, p=p_sparse)
 
     def _propose_token_base(self, w1: str, w2: str, w3: str) -> str:
         cand, base_probs = self.prep.lm.next_distribution(w1, w2, w3)
-        if not cand: return w3
+        if not cand:
+            return w3
         p = base_probs.detach().cpu().numpy()
         p = p / (p.sum() + 1e-12)
         return self.rng.choice(cand, p=p)
 
     def step_round(self, streams: List[DecodeStream]) -> None:
         active = [s for s in streams if not s.done]
-        if not active: return
+        if not active:
+            return
 
-        # Sort by prefix to maximize cache hits (emulates RadixAttention tree traversal)
         active.sort(key=lambda s: (s.w1, s.w2, s.w3))
         active = active[: min(len(active), self.token_budget_per_round)]
 
-        # Group by identical prefixes
         groups: Dict[Tuple[str, str, str], List[DecodeStream]] = {}
         for s in active:
             groups.setdefault((s.w1, s.w2, s.w3), []).append(s)
 
         for (w1, w2, w3), bucket in groups.items():
-            # Neural step (expensive, possibly cached)
-            cand, final_probs = self.gen._final_probs_for_context_cached(self.prep, w1, w2, w3)
+            cand, final_probs = self.gen._final_probs_for_context_cached(
+                self.prep, w1, w2, w3
+            )
 
-            # Precompute acceptance set for speculative decoding
             if self.speculative:
                 topk = min(self.gen.speculative_accept_topk, len(cand))
                 _, idx = torch.topk(final_probs, k=topk)
@@ -615,16 +791,15 @@ class ContinuousBatchDecoder:
             for s in bucket:
                 nxt = None
                 if self.speculative:
-                    # Propose cheaply
                     proposed = self._propose_token_base(s.w1, s.w2, s.w3)
-                    try: j = cand.index(proposed)
-                    except ValueError: j = -1
+                    try:
+                        j = cand.index(proposed)
+                    except ValueError:
+                        j = -1
 
-                    # Verify
                     if j >= 0 and j in topk_set:
                         nxt = proposed
                     else:
-                        # Fallback to expensive sample
                         nxt = self._sample_from_probs(cand, final_probs)
                 else:
                     nxt = self._sample_from_probs(cand, final_probs)
@@ -634,7 +809,6 @@ class ContinuousBatchDecoder:
                     s.alpha_count += 1
                 s.w1, s.w2, s.w3 = s.w2, s.w3, nxt
 
-                # Stop conditions
                 if s.alpha_count >= s.max_steps:
                     s.done = True
                 elif nxt in s.stop_tokens and s.alpha_count > s.min_alpha:
@@ -644,6 +818,7 @@ class ContinuousBatchDecoder:
 # ----------------------------
 # SGLang-like DSL & Primitives
 # ----------------------------
+
 class SGPrompt:
     def __init__(self, text: str = ""):
         self.text = str(text)
@@ -653,9 +828,14 @@ class SGPrompt:
         self.text += str(other)
         return self
 
-    def __getitem__(self, key: str) -> str: return self.fields.get(key, "")
-    def __setitem__(self, key: str, value: str): self.fields[str(key)] = str(value)
-    def __str__(self): return self.text
+    def __getitem__(self, key: str) -> str:
+        return self.fields.get(key, "")
+
+    def __setitem__(self, key: str, value: str):
+        self.fields[str(key)] = str(value)
+
+    def __str__(self):
+        return self.text
 
 
 class SGContext:
@@ -680,7 +860,7 @@ class SGContext:
             corpus_text=self.corpus_text,
             generator=self.generator,
             seed=self.seed + int(seed_offset),
-            prepared=self.prepared
+            prepared=self.prepared,
         )
 
 
@@ -689,12 +869,10 @@ def sg_gen_batched(
     prompts: List[SGPrompt],
     max_tokens: int = 240,
     seed_offsets: Optional[List[int]] = None,
-    stop_at_punc: bool = True
+    stop_at_punc: bool = True,
 ) -> List[str]:
-    """
-    Batched 'gen' primitive.
-    """
-    if not ctxs: return []
+    if not ctxs:
+        return []
     gen = ctxs[0].generator
     prep = ctxs[0].prepared
     if prep is None:
@@ -707,36 +885,48 @@ def sg_gen_batched(
     for i, (ctx, prompt) in enumerate(zip(ctxs, prompts)):
         off = seed_offsets[i] if seed_offsets else i
         local_rng = np.random.default_rng(ctx.seed + off)
-        
+
         seed_words = basic_tokenize(prompt.text)
         w1, w2, w3 = gen._pick_initial_context(prep.lm, local_rng, seed_words)
-        
-        streams.append(DecodeStream(
-            stream_id=i, tokens_out=[w1, w2, w3], w1=w1, w2=w2, w3=w3,
-            max_steps=max_tokens, min_alpha=max_tokens // 2 if stop_at_punc else 99999
-        ))
 
-    decoder = ContinuousBatchDecoder(gen, prep, rng, token_budget_per_round=64, speculative=True)
+        streams.append(
+            DecodeStream(
+                stream_id=i,
+                tokens_out=[w1, w2, w3],
+                w1=w1,
+                w2=w2,
+                w3=w3,
+                max_steps=max_tokens,
+                min_alpha=max_tokens // 2 if stop_at_punc else 99999,
+            )
+        )
 
-    # Decode loop
+    decoder = ContinuousBatchDecoder(
+        gen, prep, rng, token_budget_per_round=64, speculative=True
+    )
+
     for _ in range(max_tokens * 2):
-        if all(s.done for s in streams): break
+        if all(s.done for s in streams):
+            break
         decoder.step_round(streams)
 
     results = []
     for s in streams:
-        # trim initial context
         out_toks = s.tokens_out[3:] if len(s.tokens_out) > 3 else []
         results.append(detokenize(out_toks))
     return results
 
 
-def sg_gen(ctx: SGContext, prompt: SGPrompt, max_tokens=240, seed_offset=0) -> str:
+def sg_gen(
+    ctx: SGContext, prompt: SGPrompt, max_tokens=240, seed_offset=0
+) -> str:
     res = sg_gen_batched([ctx], [prompt], max_tokens, [seed_offset])
     return res[0]
 
 
-def sg_fork(ctx: SGContext, prompt: SGPrompt, n: int) -> List[Tuple[SGContext, SGPrompt]]:
+def sg_fork(
+    ctx: SGContext, prompt: SGPrompt, n: int
+) -> List[Tuple[SGContext, SGPrompt]]:
     n = int(max(1, n))
     ctx.ensure_prepared()
     out = []
@@ -773,8 +963,12 @@ def run_sglang_style_program(
     )
 
     if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
-        try: gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
-        except Exception: pass
+        try:
+            gen.synthetic_bias.load_state_dict(
+                trained_state["gelu_state_dict"], strict=True
+            )
+        except Exception:
+            pass
         gen.synthetic_bias.freeze_(True)
         gen.synthetic_bias.eval()
         gen.bump_cache_version()
@@ -782,54 +976,66 @@ def run_sglang_style_program(
     ctx = SGContext(corpus_text, gen, seed=int(seed))
     ctx.ensure_prepared()
 
-    # 1. Fork prompt with User-Defined Prefix
-    root = SGPrompt(str(takeaway_prompt_str) + "\n\n") # Ensure spacing
+    root = SGPrompt(str(takeaway_prompt_str) + "\n\n")
     branches = sg_fork(ctx, root, n=int(n_take))
-    
-    # 2. Batched generation of takeaways
+
     branch_ctxs = [b[0] for b in branches]
     branch_prompts = [b[1] for b in branches]
-    
-    # Add labels
+
     for i, bp in enumerate(branch_prompts):
         bp += f"[Takeaway {i+1}] "
 
-    # Run inference in one batched engine
-    take_texts = sg_gen_batched(branch_ctxs, branch_prompts, max_tokens=220, stop_at_punc=True)
+    take_texts = sg_gen_batched(
+        branch_ctxs, branch_prompts, max_tokens=220, stop_at_punc=True
+    )
 
-    # 3. Join
     for i, txt in enumerate(take_texts):
         branch_prompts[i] += txt
-        
+
     merged = sg_join(branch_prompts, joiner="\n\n")
 
-    # 4. Summary (User-Defined Template)
-    final_sum_prompt = summary_prompt_tmpl.replace("{joined_takeaways}", merged.text)
+    final_sum_prompt = summary_prompt_tmpl.replace(
+        "{joined_takeaways}", merged.text
+    )
     summary_prompt = SGPrompt(final_sum_prompt)
     summary_text = sg_gen(ctx, summary_prompt, max_tokens=260)
-    
+
     return summary_prompt.text + summary_text
 
 
 # ----------------------------
 # Gradio Training & App
 # ----------------------------
+
 def train_bias_net(
-    infile, seed, steer, focus, gelu_seed, train_steps, lr, max_contexts, progress=gr.Progress()
+    infile,
+    seed,
+    steer,
+    focus,
+    gelu_seed,
+    train_steps,
+    lr,
+    max_contexts,
+    progress=gr.Progress(),
 ):
     text = load_text(infile)
-    gen = NeuroSymbolicGraphGenerator(steer_strength=float(steer), focus_strength=float(focus), gelu_seed=int(gelu_seed))
-    
+    gen = NeuroSymbolicGraphGenerator(
+        steer_strength=float(steer),
+        focus_strength=float(focus),
+        gelu_seed=int(gelu_seed),
+    )
+
     progress(0.0, desc="Building state")
     prep = gen.prepare_corpus(text)
     tokens = prep.tokens
-    
-    if len(tokens) < 10: return None, "Not enough tokens."
+
+    if len(tokens) < 10:
+        return None, "Not enough tokens."
 
     gen.synthetic_bias.reset_seed(int(gelu_seed))
     gen.synthetic_bias.freeze_(False)
     gen.synthetic_bias.train()
-    
+
     opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
     positions = list(range(3, len(tokens)))
     if max_contexts and int(max_contexts) > 0:
@@ -838,31 +1044,40 @@ def train_bias_net(
     rng = np.random.default_rng(int(seed))
     batch_size = 24
     running_loss = 0.0
-    
+
     steps = int(train_steps)
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
-        loss_acc = 0.0; used = 0
-        batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
+        loss_acc = 0.0
+        used = 0
+        batch_pos = rng.choice(
+            positions,
+            size=min(batch_size, len(positions)),
+            replace=False,
+        )
 
         for i in batch_pos:
-            w1, w2, w3 = tokens[i-3], tokens[i-2], tokens[i-1]
+            w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
             true_next = tokens[i]
-            
-            # Direct forward (no cache)
+
             cand, base_probs = prep.lm.next_distribution(w1, w2, w3)
-            if not cand: continue
-            
+            if not cand:
+                continue
+
             base_p = base_probs.detach().clone().to(dtype=torch.float32)
             base_p = base_p / (base_p.sum() + 1e-12)
             base_p = gen.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
-            boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand]).view(-1)
+            boosts = torch.tensor(
+                [prep.state.token_boost.get(w, 0.0) for w in cand]
+            ).view(-1)
             bias = gen.synthetic_bias(base_p, boosts).view(-1)
             probs = gen.gate_layer(base_p, boosts + bias, temp=0.9)
 
-            try: j = cand.index(true_next)
-            except ValueError: continue
-            
+            try:
+                j = cand.index(true_next)
+            except ValueError:
+                continue
+
             loss_acc -= torch.log(probs[j].clamp_min(1e-12))
             used += 1
 
@@ -872,63 +1087,94 @@ def train_bias_net(
             opt.step()
             running_loss += float(loss.item())
 
-        if (step+1) % max(1, steps//10) == 0:
-            progress((step+1)/steps, desc=f"Training {step+1}/{steps}")
+        if (step + 1) % max(1, steps // 10) == 0:
+            progress(
+                (step + 1) / steps,
+                desc=f"Training {step+1}/{steps}",
+            )
 
     return {
-        "gelu_state_dict": {k: v.detach().cpu() for k,v in gen.synthetic_bias.state_dict().items()}
+        "gelu_state_dict": {
+            k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()
+        }
     }, f"Trained. Avg loss={running_loss/max(1,steps):.4f}"
 
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic V3.4 (SGLang Runtime + Editable Prompts)") as demo:
-        gr.Markdown("# Neurosymbolic V3.4: SGLang-like Runtime\n*Continuous Batching, RadixCache, Speculative Decoding*")
-        
+    with gr.Blocks(
+        title="Neurosymbolic V3.6 (Gaspare + Seed-based Sparsification)"
+    ) as demo:
+        gr.Markdown(
+            "# Neurosymbolic V3.6: Gaspare-style Graphs + SGLang Runtime\n"
+            "*Continuous Batching, RadixCache, Speculative Decoding*"
+        )
+
         trained_state = gr.State(None)
-        
+
         with gr.Row():
-            infile = gr.File(label="Input File")
+            infile = gr.File(label="Input File (txt/md only)")
             out_txt = gr.Textbox(label="Structured Output", lines=20)
-            
+
         with gr.Row():
             n_take = gr.Slider(1, 10, value=4, label="Parallel Forks (Batch Size)")
             seed = gr.Number(value=42, label="Seed")
-            
+
         with gr.Row():
             steer = gr.Slider(0, 5, value=1.35, label="Steer")
             focus = gr.Slider(0, 1, value=0.5, label="Focus")
             gelu_seed = gr.Number(value=1337, label="GELU Seed")
-        
-        # New Editable Prompts Section
+
         with gr.Accordion("Editable Prompts", open=False):
             p_takeaway = gr.Textbox(
-                label="Takeaway Prompt (Prefix)", 
+                label="Takeaway Prompt (Prefix)",
                 value="",
-                lines=2
+                lines=2,
             )
             p_summary = gr.Textbox(
-                label="Prompt Template, {joined_takeaways} will be replaced", 
-                value="explain the technical nature of this?\n\n{joined_takeaways}\n\ntakeover plan:",
-                lines=4
+                label="Prompt Template, {joined_takeaways} will be replaced",
+                value="explain the nature of this?\n\n{joined_takeaways}\n\\nplan:",
+                lines=4,
             )
 
         train_btn = gr.Button("Train GELU Bias (Optional)")
-        run_btn = gr.Button("Run Structured Program (SGLang style)", variant="primary")
+        run_btn = gr.Button(
+            "Run Structured Program (SGLang style)", variant="primary"
+        )
         status = gr.Textbox(label="Train Status")
-        
+
         train_btn.click(
             train_bias_net,
-            inputs=[infile, seed, steer, focus, gelu_seed, gr.Number(100, visible=False), gr.Number(0.001, visible=False), gr.Number(0, visible=False)],
-            outputs=[trained_state, status]
+            inputs=[
+                infile,
+                seed,
+                steer,
+                focus,
+                gelu_seed,
+                gr.Number(100, visible=False),
+                gr.Number(0.001, visible=False),
+                gr.Number(0, visible=False),
+            ],
+            outputs=[trained_state, status],
         )
-        
+
         run_btn.click(
             run_sglang_style_program,
-            inputs=[infile, n_take, seed, steer, focus, gelu_seed, p_takeaway, p_summary, trained_state],
-            outputs=out_txt
+            inputs=[
+                infile,
+                n_take,
+                seed,
+                steer,
+                focus,
+                gelu_seed,
+                p_takeaway,
+                p_summary,
+                trained_state,
+            ],
+            outputs=out_txt,
         )
-        
+
     return demo
+
 
 if __name__ == "__main__":
     app = build_app()
