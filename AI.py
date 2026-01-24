@@ -1132,7 +1132,7 @@ def build_app():
             )
             p_summary = gr.Textbox(
                 label="Prompt Template, {joined_takeaways} will be replaced",
-                value="explain the nature of this?\n\n{joined_takeaways}\n\\nplan:",
+                value="explain the nature of this?\n\n{joined_takeaways}\n\nplan:",
                 lines=4,
             )
 
