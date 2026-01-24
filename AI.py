@@ -903,12 +903,12 @@ def build_app():
         with gr.Accordion("Editable Prompts", open=False):
             p_takeaway = gr.Textbox(
                 label="Takeaway Prompt (Prefix)", 
-                value="",
+                value="the meaning of life?",
                 lines=2
             )
             p_summary = gr.Textbox(
                 label="Prompt Template, {joined_takeaways} will be replaced", 
-                value="",
+                value="explain the technical nature of this?\n\n{joined_takeaways}\n\ntakeover plan:",
                 lines=4
             )
 
