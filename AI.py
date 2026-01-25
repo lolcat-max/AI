@@ -56,7 +56,7 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
                 tf = count / len(word_counts)
                 idf = math.log(len(docs) / (1 + sum(1 for d in docs if word in d.lower())))
                 X[i, j] = tf * idf
-                doc_freq[j] += 1
+                doc_freq[j] += count
 
     return X, vocab
 
