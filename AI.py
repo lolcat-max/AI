@@ -1105,7 +1105,7 @@ def train_bias_net(
             loss_acc = loss_acc - torch.log(probs[j].clamp_min(1e-12))
             used += 1
 
-        if used > 0:
+        if used > 0.5:
             loss = loss_acc / used
             loss.backward()
             opt.step()
@@ -1155,7 +1155,7 @@ def build_app():
             )
 
         with gr.Accordion("Editable Prompts", open=False):
-            p_takeaway = gr.Textbox(label="Takeaway Prompt (Prefix)", value="", lines=2)
+            p_takeaway = gr.Textbox(label="Takeaway Prompt (Prefix)", value="this is", lines=2)
             p_summary = gr.Textbox(
                 label="Prompt Template, {joined_takeaways} will be replaced",
                 value="explain the nature of this?\n\n{joined_takeaways}\n\nplan:",
