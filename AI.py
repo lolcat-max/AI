@@ -740,23 +740,34 @@ class ContinuousBatchDecoder:
         p = probs.detach().cpu().numpy()
         
         # GASPARE UPDATE: Use seed (self.rng) to determine a sparse cutoff
-        # "np.where high probs to lower inference" -> We prune low probability tails
-        # dynamically based on the random seed state.
-        
-        # Calculate a dynamic cutoff based on the distribution stats + random seed
         cutoff = np.mean(p) + (self.rng.random() * np.std(p))
-        
-        # np.where: Keep p if p > cutoff, else 0
         p_sparse = np.where(p > cutoff, p, 0.0)
-        
+
         # Safety: if we pruned everything, revert to original
         if p_sparse.sum() < 1e-12:
             p_sparse = p
-            
+
         # Renormalize
         p_sparse = p_sparse / (p_sparse.sum() + 1e-12)
-        
+
+        # --- Your requested operation: convert to binary, then subtract ---
+        # Convert to binary (0/1)
+        b = (p_sparse > 0).astype(int)
+
+        # Count 0s and 1s
+        num_zeros = np.count_nonzero(b == 0)
+        num_ones = np.count_nonzero(b == 1)
+
+        # Total length
+        total = b.size
+
+        # Subtract counts of 0s and 1s from total
+        result = total - (num_zeros + num_ones)
+        # result will always be 0 here, since b is only 0 or 1
+
+        # Continue with sampling as before
         return self.rng.choice(cand, p=p_sparse)
+
 
     def _propose_token_base(self, w1: str, w2: str, w3: str) -> str:
         cand, base_probs = self.prep.lm.next_distribution(w1, w2, w3)
