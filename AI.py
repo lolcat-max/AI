@@ -752,7 +752,7 @@ class ContinuousBatchDecoder:
 
         # --- Your requested operation: convert to binary, then subtract ---
         # Convert to binary (0/1)
-        b = (p_sparse > 0).astype(int)
+        b = (p_sparse > 0.5).astype(int)
 
         # Count 0s and 1s
         num_zeros = np.count_nonzero(b == 0)
