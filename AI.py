@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Neurosymbolic Text Generator (Gradio GUI) - Enhanced with Contextual Grid
-Gaspare sparsification + Menger-curvature + Contextual Grid Associationality
+Neurosymbolic Text Generator (Gradio GUI) - compact (<1000 lines)
+Gaspare sparsification + Menger-curvature-inspired sampling + Top-K CoT reranking.
 
 Deps:
   pip install gradio numpy torch
@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import re
 import math
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Any, Set
-from collections import OrderedDict, defaultdict
+from typing import List, Dict, Tuple, Optional, Any
+from collections import OrderedDict
 
 import numpy as np
 import gradio as gr
@@ -100,7 +101,6 @@ def load_text(infile: Any) -> str:
 # ----------------------------
 
 def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
-    # Build doc term counts
     doc_tokens: List[List[str]] = []
     df: Dict[str, int] = {}
     tf_counts: List[Dict[str, int]] = []
@@ -116,13 +116,11 @@ def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, L
                 seen.add(w)
         tf_counts.append(counts)
 
-    # vocab by DF (simple + deterministic)
     vocab = sorted(df.keys(), key=lambda w: (-df[w], w))[:max_features]
     word_to_idx = {w: i for i, w in enumerate(vocab)}
 
     X = np.zeros((len(docs), len(vocab)), dtype=np.float64)
     N = max(1, len(docs))
-
     for i, counts in enumerate(tf_counts):
         denom = max(1, len(counts))
         for w, c in counts.items():
@@ -148,160 +146,8 @@ def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42,
         Q, _ = np.linalg.qr(XtX @ Q)
 
     B = X @ Q
-    U, S, Vt = np.linalg.svd(B, full_matrices=False)
+    _U, _S, Vt = np.linalg.svd(B, full_matrices=False)
     return type("SVD", (), {"components_": Vt[:k]})()
-
-
-# ----------------------------
-# Contextual Grid Structure
-# ----------------------------
-
-@dataclass
-class GridCell:
-    """Represents a cell in the contextual grid with associational links."""
-    word: str
-    position: Tuple[int, int]  # (row, col) in grid
-    frequency: float
-    neighbors: Set[str] = field(default_factory=set)
-    semantic_layer: int = 0  # depth in association hierarchy
-    activation: float = 0.0
-
-class ContextualGrid:
-    """
-    Multi-dimensional grid structure for candidate organization.
-    Words are placed in a grid based on:
-    - Frequency (vertical axis)
-    - Semantic similarity (horizontal axis)
-    - Contextual co-occurrence (depth/layer)
-    """
-    
-    def __init__(self, grid_size: int = 20, semantic_layers: int = 3):
-        self.grid_size = int(grid_size)
-        self.semantic_layers = int(semantic_layers)
-        self.cells: Dict[Tuple[int, int, int], GridCell] = {}  # (row, col, layer) -> cell
-        self.word_to_pos: Dict[str, Tuple[int, int, int]] = {}
-        self.association_graph: Dict[str, Dict[str, float]] = defaultdict(dict)
-        
-    def add_word(self, word: str, freq: float, semantic_vec: Optional[np.ndarray] = None) -> None:
-        """Add word to grid based on frequency and semantic properties."""
-        # Frequency determines vertical position
-        row = int(min(self.grid_size - 1, freq * self.grid_size))
-        
-        # Semantic vector determines horizontal position
-        if semantic_vec is not None and len(semantic_vec) > 0:
-            col = int(abs(hash(tuple(semantic_vec[:3]))) % self.grid_size)
-        else:
-            col = int(abs(hash(word)) % self.grid_size)
-            
-        # Find available layer
-        layer = 0
-        while (row, col, layer) in self.cells and layer < self.semantic_layers:
-            layer += 1
-            
-        pos = (row, col, layer)
-        cell = GridCell(
-            word=word,
-            position=pos,
-            frequency=freq,
-            semantic_layer=layer
-        )
-        
-        self.cells[pos] = cell
-        self.word_to_pos[word] = pos
-        
-    def add_association(self, word1: str, word2: str, strength: float) -> None:
-        """Add associational link between words."""
-        self.association_graph[word1][word2] = strength
-        self.association_graph[word2][word1] = strength
-        
-        # Update neighbor sets
-        if word1 in self.word_to_pos and word2 in self.word_to_pos:
-            pos1 = self.word_to_pos[word1]
-            pos2 = self.word_to_pos[word2]
-            if pos1 in self.cells:
-                self.cells[pos1].neighbors.add(word2)
-            if pos2 in self.cells:
-                self.cells[pos2].neighbors.add(word1)
-    
-    def get_neighborhood(self, word: str, radius: int = 2) -> List[str]:
-        """Get words in spatial neighborhood of given word."""
-        if word not in self.word_to_pos:
-            return []
-            
-        row, col, layer = self.word_to_pos[word]
-        neighbors = []
-        
-        for r in range(max(0, row - radius), min(self.grid_size, row + radius + 1)):
-            for c in range(max(0, col - radius), min(self.grid_size, col + radius + 1)):
-                for l in range(self.semantic_layers):
-                    if (r, c, l) in self.cells:
-                        cell = self.cells[(r, c, l)]
-                        if cell.word != word:
-                            neighbors.append(cell.word)
-        
-        return neighbors
-    
-    def activate_region(self, center_words: List[str], decay: float = 0.7) -> Dict[str, float]:
-        """
-        Spread activation from center words through the grid.
-        Returns activation levels for all words.
-        """
-        activations: Dict[str, float] = defaultdict(float)
-        
-        # Initialize center words
-        for w in center_words:
-            activations[w] = 1.0
-            
-        # Spread activation through association graph
-        for _ in range(3):  # Multiple passes
-            new_activations = activations.copy()
-            
-            for word, activation in activations.items():
-                if activation > 0.01:  # Only spread from active nodes
-                    for neighbor, strength in self.association_graph.get(word, {}).items():
-                        new_activations[neighbor] = max(
-                            new_activations[neighbor],
-                            activation * decay * strength
-                        )
-            
-            activations = new_activations
-            
-        return dict(activations)
-    
-    def get_candidates_by_activation(
-        self, 
-        context: List[str], 
-        base_candidates: List[str],
-        top_k: int = 100
-    ) -> List[Tuple[str, float]]:
-        """
-        Select candidates using grid-based activation spreading.
-        Returns list of (word, score) tuples.
-        """
-        # Activate regions around context words
-        activations = self.activate_region(context)
-        
-        # Score candidates
-        scored = []
-        for cand in base_candidates:
-            score = activations.get(cand, 0.0)
-            
-            # Boost by neighborhood density
-            neighbors = self.get_neighborhood(cand, radius=1)
-            neighborhood_score = sum(1 for n in neighbors if n in base_candidates) / max(1, len(neighbors))
-            
-            # Boost by association strength with context
-            context_score = 0.0
-            for ctx_word in context:
-                context_score += self.association_graph.get(cand, {}).get(ctx_word, 0.0)
-            context_score /= max(1, len(context))
-            
-            final_score = score + 0.3 * neighborhood_score + 0.4 * context_score
-            scored.append((cand, final_score))
-        
-        # Sort and return top-k
-        scored.sort(key=lambda x: -x[1])
-        return scored[:top_k]
 
 
 # ----------------------------
@@ -314,10 +160,6 @@ def menger_probs_transform(
     seed: int = 42,
     strength: float = 1.5,
 ) -> np.ndarray:
-    """
-    Discrete "curvature" weighting on index triples.
-    Uses 1/R (circumradius) from triangle side lengths; collinear => 0.
-    """
     rng = np.random.default_rng(int(seed))
     p = np.asarray(p, dtype=np.float64)
     p = p / (p.sum() + 1e-12)
@@ -455,22 +297,18 @@ class SyntheticGELUBias(nn.Module):
 
 
 # ----------------------------
-# Enhanced Quadgram LM with Grid
+# Quadgram LM
 # ----------------------------
 
 class QuadgramLM:
-    def __init__(self, add_k: float = 0.25, use_grid: bool = True, grid_size: int = 20):
+    def __init__(self, add_k: float = 0.25):
         self.add_k = float(add_k)
-        self.use_grid = bool(use_grid)
         self.uni: Dict[str, int] = {}
         self.bi: Dict[Tuple[str, str], int] = {}
         self.tri: Dict[Tuple[str, str, str], int] = {}
         self.quad: Dict[Tuple[str, str, str, str], int] = {}
         self.vocab: List[str] = []
         self.total = 0
-        
-        # Contextual grid for associational candidate selection
-        self.grid: Optional[ContextualGrid] = ContextualGrid(grid_size=grid_size) if use_grid else None
 
     def ingest(self, tokens: List[str]) -> None:
         self.uni.clear(); self.bi.clear(); self.tri.clear(); self.quad.clear()
@@ -493,47 +331,10 @@ class QuadgramLM:
             self.quad[k] = self.quad.get(k, 0) + 1
 
         self.vocab = list(self.uni.keys())
-        
-        # Build contextual grid
-        if self.grid is not None:
-            self._build_grid(tokens)
-
-    def _build_grid(self, tokens: List[str]) -> None:
-        """Build contextual grid from token sequence."""
-        if self.grid is None:
-            return
-            
-        # Add words to grid based on frequency
-        max_freq = max(self.uni.values()) if self.uni else 1
-        for word, count in self.uni.items():
-            if word not in STOPWORDS and len(word) > 2:
-                norm_freq = count / max_freq
-                self.grid.add_word(word, norm_freq)
-        
-        # Build association graph from co-occurrence
-        window_size = 5
-        for i in range(len(tokens)):
-            center = tokens[i]
-            if center in STOPWORDS or len(center) <= 2:
-                continue
-                
-            # Look at surrounding context
-            start = max(0, i - window_size)
-            end = min(len(tokens), i + window_size + 1)
-            
-            for j in range(start, end):
-                if i != j:
-                    neighbor = tokens[j]
-                    if neighbor not in STOPWORDS and len(neighbor) > 2:
-                        # Co-occurrence strength based on distance
-                        distance = abs(i - j)
-                        strength = 1.0 / (1.0 + distance)
-                        self.grid.add_association(center, neighbor, strength)
 
     def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
         cont: List[str] = []
 
-        # Gather candidates from n-gram contexts
         for (a, b, c, d), _count in self.quad.items():
             if a == w1 and b == w2 and c == w3:
                 cont.append(d)
@@ -551,7 +352,6 @@ class QuadgramLM:
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
-        # Deduplicate
         seen = set()
         cand = []
         for w in cont:
@@ -559,30 +359,6 @@ class QuadgramLM:
                 seen.add(w)
                 cand.append(w)
         cand = cand[:500]
-        
-        # Use grid for associational reranking
-        if self.grid is not None and len(cand) > 0:
-            context_words = [w for w in [w1, w2, w3] if w in self.grid.word_to_pos]
-            if context_words:
-                grid_scored = self.grid.get_candidates_by_activation(
-                    context_words, 
-                    cand, 
-                    top_k=min(300, len(cand))
-                )
-                
-                # Blend grid scores with original order
-                grid_dict = {word: score for word, score in grid_scored}
-                cand_reranked = []
-                for w in cand:
-                    if w in grid_dict:
-                        cand_reranked.append(w)
-                
-                # Add back any missing candidates
-                for w in cand:
-                    if w not in cand_reranked:
-                        cand_reranked.append(w)
-                
-                cand = cand_reranked[:500]
 
         V = len(self.vocab) + 1
         add_k = self.add_k
@@ -615,12 +391,6 @@ class QuadgramLM:
 # ----------------------------
 
 @dataclass
-class Nodelet:
-    idx: int
-    top_terms: List[Tuple[str, float]]
-    energy: float
-
-@dataclass
 class ModelState:
     vocab_top: List[str]
     bar_probs: torch.Tensor
@@ -647,16 +417,12 @@ class NeuroSymbolicGraphGenerator:
         gelu_hidden: int = 32,
         radix_cache_items: int = 25000,
         speculative_accept_topk: int = 10,
-        use_contextual_grid: bool = True,
-        grid_size: int = 20,
     ):
         self.nodelets_n = int(nodelets_n)
         self.bars_n = int(bars_n)
         self.svd_random_state = int(svd_random_state)
         self.softmax_temp = float(softmax_temp)
         self.lm_add_k = float(lm_add_k)
-        self.use_contextual_grid = bool(use_contextual_grid)
-        self.grid_size = int(grid_size)
 
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
@@ -708,22 +474,12 @@ class NeuroSymbolicGraphGenerator:
 
         svd = pure_truncated_svd(X_svd, n_components=k, random_state=self.svd_random_state)
 
-        # Nodelet energies from component norms
-        nodelets: List[Nodelet] = []
-        for i, comp in enumerate(svd.components_):
-            terms = sorted(
-                [(vocab_top[j], float(comp[j])) for j in range(len(comp))],
-                key=lambda x: -abs(x[1]),
-            )[:10]
-            eng = float(np.linalg.norm(comp))
-            nodelets.append(Nodelet(i, terms, eng))
-
-        energies = np.array([n.energy for n in nodelets], dtype=np.float64)
-        if energies.size == 0:
-            energies = np.ones(1, dtype=np.float64)
+        # Component energies -> logits over vocab_top
+        comps = svd.components_
+        energies = np.linalg.norm(comps, axis=1)
         energies = energies / (energies.max() + 1e-12)
 
-        W = torch.tensor(svd.components_, dtype=torch.float32)
+        W = torch.tensor(comps, dtype=torch.float32)
         W = F.relu(W)
         W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
@@ -745,11 +501,7 @@ class NeuroSymbolicGraphGenerator:
         text = normalize(text)
         state = self.build_state(text, progress)
         tokens = basic_tokenize(text)
-        lm = QuadgramLM(
-            self.lm_add_k, 
-            use_grid=self.use_contextual_grid,
-            grid_size=self.grid_size
-        )
+        lm = QuadgramLM(self.lm_add_k)
         lm.ingest(tokens)
         return PreparedCorpus(text=text, tokens=tokens, lm=lm, state=state)
 
@@ -975,6 +727,32 @@ def sg_join(prompts: List[SGPrompt], joiner: str = "\n\n") -> SGPrompt:
 
 
 # ----------------------------
+# Top-K CoT reranking (K candidate summaries, pick best by LM score)
+# ----------------------------
+
+def score_text_under_lm(lm: QuadgramLM, text: str) -> float:
+    toks = basic_tokenize(text)
+    if len(toks) < 6:
+        return -1e9
+    logp = 0.0
+    n = 0
+    for i in range(3, len(toks)):
+        w1, w2, w3 = toks[i - 3], toks[i - 2], toks[i - 1]
+        true_next = toks[i]
+        cand, probs = lm.next_distribution(w1, w2, w3)
+        if not cand:
+            continue
+        try:
+            j = cand.index(true_next)
+            p = float(probs[j].item())
+        except ValueError:
+            p = 1e-12
+        logp += math.log(max(p, 1e-12))
+        n += 1
+    return logp / max(1, n)
+
+
+# ----------------------------
 # Program + training
 # ----------------------------
 
@@ -985,11 +763,10 @@ def run_program(
     steer: float,
     focus: float,
     gelu_seed: int,
-    use_grid: bool,
-    grid_size: int,
     takeaway_prefix: str,
     summary_prompt_tmpl: str,
     trained_state: Optional[dict] = None,
+    cot_k: int = 1,                 # NEW: Top-K CoT
 ) -> str:
     corpus_text = load_text(infile)
 
@@ -999,8 +776,6 @@ def run_program(
         gelu_seed=int(gelu_seed),
         radix_cache_items=30000,
         speculative_accept_topk=10,
-        use_contextual_grid=bool(use_grid),
-        grid_size=int(grid_size),
     )
 
     if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
@@ -1014,7 +789,10 @@ def run_program(
 
     ctx = SGContext(corpus_text, gen, seed=int(seed))
     ctx.ensure_prepared()
+    assert ctx.prepared is not None
+    prep = ctx.prepared
 
+    # Takeaways (parallel)
     root = SGPrompt(str(takeaway_prefix).strip() + "\n\n")
     branches = sg_fork(ctx, root, n=int(n_take))
     branch_ctxs = [b[0] for b in branches]
@@ -1028,10 +806,35 @@ def run_program(
         branch_prompts[i] += txt
 
     merged = sg_join(branch_prompts, joiner="\n\n")
-    final_sum_prompt = summary_prompt_tmpl.replace("{joined_takeaways}", merged.text)
-    summary_prompt = SGPrompt(final_sum_prompt)
-    summary_text = sg_gen(ctx, summary_prompt, max_tokens=260)
-    return summary_prompt.text + summary_text
+
+    base_prompt_text = summary_prompt_tmpl.replace("{joined_takeaways}", merged.text)
+    base_prompt = SGPrompt(base_prompt_text)
+
+    # NEW: Top-K CoT reranking for the final summary
+    cot_k = int(max(1, cot_k))
+    if cot_k == 1:
+        summary_text = sg_gen(ctx, base_prompt, max_tokens=260)
+        return base_prompt.text + summary_text
+
+    cot_ctxs = [ctx.clone(seed_offset=5000 + i) for i in range(cot_k)]
+    cot_prompts: List[SGPrompt] = []
+    for i in range(cot_k):
+        # Keep it simple: encourage intermediate reasoning, but you control the template anyway.
+        cot_prompts.append(SGPrompt(base_prompt_text + f"\n\n[CoT Path {i+1}] think step-by-step, then finalize:\n"))
+
+    cand_summaries = sg_gen_batched(cot_ctxs, cot_prompts, max_tokens=260, stop_at_punc=False)
+    scores = [score_text_under_lm(prep.lm, s) for s in cand_summaries]
+    best_i = int(np.argmax(np.asarray(scores, dtype=np.float64)))
+
+    # Return prompt + best candidate
+    return cot_prompts[best_i].text + cand_summaries[best_i]
+
+def run_program_safe(*args, **kwargs):
+    try:
+        return run_program(*args, **kwargs)
+    except Exception as e:
+        traceback.print_exc()
+        raise gr.Error(f"{type(e).__name__}: {e}")
 
 def train_bias_net(
     infile: Any,
@@ -1039,8 +842,6 @@ def train_bias_net(
     steer: float,
     focus: float,
     gelu_seed: int,
-    use_grid: bool,
-    grid_size: int,
     train_steps: int,
     lr: float,
     max_contexts: int,
@@ -1051,8 +852,6 @@ def train_bias_net(
         steer_strength=float(steer),
         focus_strength=float(focus),
         gelu_seed=int(gelu_seed),
-        use_contextual_grid=bool(use_grid),
-        grid_size=int(grid_size),
     )
 
     progress(0.0, desc="Preparing")
@@ -1105,7 +904,7 @@ def train_bias_net(
             loss_acc = loss_acc - torch.log(probs[j].clamp_min(1e-12))
             used += 1
 
-        if used > 0.5:
+        if used > 0:
             loss = loss_acc / used
             loss.backward()
             opt.step()
@@ -1123,12 +922,10 @@ def train_bias_net(
 # ----------------------------
 
 def build_app():
-    with gr.Blocks(title="Neurosymbolic Enhanced (Grid + Associations)") as demo:
+    with gr.Blocks(title="Neurosymbolic Compact (Gaspare + Menger + Top-K CoT)") as demo:
         gr.Markdown(
-            "# Neurosymbolic Enhanced\n"
-            "*Gaspare + Menger + Contextual Grid with Associational Networks*\n\n"
-            "**New Feature**: Contextual grid structures organize candidates spatially by frequency "
-            "and semantic similarity, with associational links that spread activation through the vocabulary space."
+            "# Neurosymbolic Compact\n"
+            "*Gaspare sparsification + Menger sampling + Top-K CoT reranking*"
         )
 
         trained_state = gr.State(None)
@@ -1138,24 +935,19 @@ def build_app():
             out_txt = gr.Textbox(label="Structured Output", lines=20)
 
         with gr.Row():
-            n_take = gr.Slider(1, 10, value=4, step=1, label="Parallel Forks (Batch Size)")
-            seed = gr.Number(value=42, label="Seed", precision=0)
+            n_take = gr.Slider(1, 10, value=4, label="Parallel Forks (Takeaways)", step=1)
+            seed = gr.Number(value=42, label="Seed")
 
         with gr.Row():
             steer = gr.Slider(0, 5, value=1.35, label="Steer")
             focus = gr.Slider(0, 1, value=0.5, label="Focus")
-            gelu_seed = gr.Number(value=1337, label="GELU Seed", precision=0)
+            gelu_seed = gr.Number(value=1337, label="GELU Seed")
 
-        with gr.Accordion("Contextual Grid Settings", open=True):
-            use_grid = gr.Checkbox(value=True, label="Enable Contextual Grid")
-            grid_size = gr.Slider(10, 40, value=20, step=1, label="Grid Size (spatial resolution)")
-            gr.Markdown(
-                "*Grid organizes vocabulary by frequency and semantic clustering, "
-                "enabling associational spreading activation for candidate selection.*"
-            )
+        with gr.Row():
+            cot_k = gr.Slider(1, 16, value=4, label="Top-K CoT (final summary)", step=1)
 
         with gr.Accordion("Editable Prompts", open=False):
-            p_takeaway = gr.Textbox(label="Takeaway Prompt (Prefix)", value="this is", lines=2)
+            p_takeaway = gr.Textbox(label="Takeaway Prompt (Prefix)", value="", lines=2)
             p_summary = gr.Textbox(
                 label="Prompt Template, {joined_takeaways} will be replaced",
                 value="explain the nature of this?\n\n{joined_takeaways}\n\nplan:",
@@ -1174,8 +966,6 @@ def build_app():
                 steer,
                 focus,
                 gelu_seed,
-                use_grid,
-                grid_size,
                 gr.Number(100, visible=False),
                 gr.Number(0.001, visible=False),
                 gr.Number(0, visible=False),
@@ -1184,7 +974,7 @@ def build_app():
         )
 
         run_btn.click(
-            run_program,
+            run_program_safe,
             inputs=[
                 infile,
                 n_take,
@@ -1192,11 +982,10 @@ def build_app():
                 steer,
                 focus,
                 gelu_seed,
-                use_grid,
-                grid_size,
                 p_takeaway,
                 p_summary,
                 trained_state,
+                cot_k,  # NEW
             ],
             outputs=out_txt,
         )
@@ -1205,4 +994,5 @@ def build_app():
 
 if __name__ == "__main__":
     app = build_app()
-    app.queue().launch(debug=True, show_error=True)
+    # show_error/debug are launch() parameters documented by Gradio Blocks. [web:32]
+    app.queue().launch(show_error=True, debug=True)
