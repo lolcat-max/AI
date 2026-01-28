@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
-V3.6 + Gaspare (Seed-based Inference Sparsification)
+V3.6 + Gaspare (Seed-based Inference Sparsification) + SNAKE FOLD
 
-New in V3.6:
+New in V3.6-SNAKE:
 - "Gaspare" Logic: Uses np.where and random seed to sparsify 
   probability distributions, reducing inference noise.
+- SNAKE FOLD: Rearranges probability VALUES without changing vocab indices
+  Creates a weaving pattern through the distribution
 
 Dependencies:
   pip install gradio numpy torch
@@ -289,16 +291,81 @@ class DecodeStream:
 
 
 # ----------------------------
-# PyTorch Neural Modules
+# PyTorch Neural Modules (WITH SNAKE FOLD)
 # ----------------------------
 
 class LateralInhibition(nn.Module):
-    def __init__(self, kernel_size=7, strength=0.5):
+    def __init__(self, kernel_size=7, strength=0.5, snake_fold=False):
         super().__init__()
         self.strength = float(strength)
+        self.snake_fold = bool(snake_fold)
         k = torch.tensor([-0.95, -0.9, -0.1, 0.3, -1.4, -1.2, -1.05], dtype=torch.float32)
         self.register_buffer("kernel", k.view(1, 1, -1))
         self.pad = int(kernel_size // 2)
+
+    def snake_fold_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Fold the probability distribution like a snake, alternating direction.
+        
+        The vocab indices STAY THE SAME (0,1,2,3,4,5...), but the PROBABILITY VALUES
+        get shuffled to create a snake-like weaving pattern through the distribution.
+        
+        Think of it like this:
+        - Take the vocab and split it in half
+        - Reverse the second half (snake turns around)
+        - Interleave them (snake weaves back and forth)
+        
+        Example with 6 values [a,b,c,d,e,f]:
+        - Left half: [a,b,c]
+        - Right half reversed: [f,e,d]
+        - Interleaved result: [a,f,b,e,c,d]
+        
+        probs: (B,V) or (V,) where V is vocab size
+        """
+        original_shape = probs.shape
+        
+        if probs.dim() == 1:
+            V = probs.shape[0]
+            # Split into two halves
+            mid = V // 2
+            left = probs[:mid]  # First half
+            right = probs[mid:]  # Second half
+            
+            # Reverse the right half (snake turns around)
+            right_flipped = torch.flip(right, dims=[0])
+            
+            # Interleave: alternate between left and right_flipped
+            result = torch.empty_like(probs)
+            
+            # Fill even indices from left, odd indices from right_flipped
+            left_len = (V + 1) // 2
+            right_len = V // 2
+            result[0::2] = left[:left_len]
+            result[1::2] = right_flipped[:right_len]
+            
+            return result
+            
+        elif probs.dim() == 2:
+            B, V = probs.shape
+            mid = V // 2
+            left = probs[:, :mid]
+            right = probs[:, mid:]
+            
+            # Reverse the right half along vocab dimension
+            right_flipped = torch.flip(right, dims=[1])
+            
+            result = torch.empty_like(probs)
+            left_len = (V + 1) // 2
+            right_len = V // 2
+            
+            # Interleave along vocab dimension
+            result[:, 0::2] = left[:, :left_len]
+            result[:, 1::2] = right_flipped[:, :right_len]
+            
+            return result
+        else:
+            # For 3D or other dimensions, return as-is
+            return probs
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
@@ -308,7 +375,19 @@ class LateralInhibition(nn.Module):
         modulation = F.conv1d(x, self.kernel, padding=self.pad)
         out = x + self.strength * modulation
         out = F.relu(out)
-        return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
+        out = out / (out.sum(dim=-1, keepdim=True) + 1e-12)
+        
+        # Apply snake fold if enabled (before returning to original shape)
+        if self.snake_fold:
+            # Flatten to 2D for snake folding
+            B, C, V = out.shape
+            out_2d = out.view(B, V)
+            out_2d = self.snake_fold_probs(out_2d)
+            # Renormalize after folding
+            out_2d = out_2d / (out_2d.sum(dim=-1, keepdim=True) + 1e-12)
+            out = out_2d.view(B, 1, V)
+        
+        return out
 
 
 class SynapticPruner(nn.Module):
@@ -481,7 +560,7 @@ class PreparedCorpus:
 
 
 # ----------------------------
-# NeuroSymbolicGraphGenerator
+# NeuroSymbolicGraphGenerator (WITH SNAKE FOLD SUPPORT)
 # ----------------------------
 
 class NeuroSymbolicGraphGenerator:
@@ -503,6 +582,7 @@ class NeuroSymbolicGraphGenerator:
         gelu_hidden: int = 32,
         radix_cache_items: int = 25000,
         speculative_accept_topk: int = 10,
+        snake_fold: bool = False,
     ):
         self.nodelets_n = int(nodelets_n)
         self.bars_n = int(bars_n)
@@ -515,7 +595,7 @@ class NeuroSymbolicGraphGenerator:
         self.rfe_iterations = int(rfe_iterations)
         self.rfe_removal_rate = float(rfe_removal_rate)
 
-        self.focus_layer = LateralInhibition(strength=float(focus_strength))
+        self.focus_layer = LateralInhibition(strength=float(focus_strength), snake_fold=bool(snake_fold))
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
         self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh")
         self.synthetic_bias.reset_seed(int(gelu_seed))
@@ -962,6 +1042,7 @@ def run_sglang_style_program(
     takeaway_prompt_str: str,
     summary_prompt_tmpl: str,
     trained_state: Optional[dict] = None,
+    snake_fold: bool = False,
 ) -> str:
     corpus_text = load_text(infile)
 
@@ -971,6 +1052,7 @@ def run_sglang_style_program(
         gelu_seed=int(gelu_seed),
         radix_cache_items=30000,
         speculative_accept_topk=10,
+        snake_fold=bool(snake_fold),
     )
 
     if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
@@ -1015,7 +1097,7 @@ def run_sglang_style_program(
 
 
 # ----------------------------
-# Gradio Training & App
+# Gradio Training & App (WITH SNAKE FOLD UI)
 # ----------------------------
 
 def train_bias_net(
@@ -1027,6 +1109,7 @@ def train_bias_net(
     train_steps,
     lr,
     max_contexts,
+    snake_fold,
     progress=gr.Progress(),
 ):
     text = load_text(infile)
@@ -1034,6 +1117,7 @@ def train_bias_net(
         steer_strength=float(steer),
         focus_strength=float(focus),
         gelu_seed=int(gelu_seed),
+        snake_fold=bool(snake_fold),
     )
 
     progress(0.0, desc="Building state")
@@ -1113,11 +1197,11 @@ def train_bias_net(
 
 def build_app():
     with gr.Blocks(
-        title="Neurosymbolic V3.6 (Gaspare + Seed-based Sparsification)"
+        title="Neurosymbolic V3.6-SNAKE (Gaspare + Snake Fold)"
     ) as demo:
         gr.Markdown(
-            "# Neurosymbolic V3.6: Gaspare-style Graphs + SGLang Runtime\n"
-            "*Continuous Batching, RadixCache, Speculative Decoding*"
+            "# Neurosymbolic V3.6-SNAKE: Gaspare-style Graphs + SGLang Runtime + SNAKE FOLD\n"
+            "*Continuous Batching, RadixCache, Speculative Decoding, Snake Probability Folding*"
         )
 
         trained_state = gr.State(None)
@@ -1134,6 +1218,7 @@ def build_app():
             steer = gr.Slider(0, 5, value=1.35, label="Steer")
             focus = gr.Slider(0, 1, value=0.5, label="Focus")
             gelu_seed = gr.Number(value=1337, label="GELU Seed")
+            snake_fold = gr.Checkbox(value=False, label="Enable Snake Fold")
 
         with gr.Accordion("Editable Prompts", open=False):
             p_takeaway = gr.Textbox(
@@ -1143,7 +1228,7 @@ def build_app():
             )
             p_summary = gr.Textbox(
                 label="Prompt Template, {joined_takeaways} will be replaced",
-                value="explain the nature of this?\n\n{joined_takeaways}\n\nplan:",
+                value="explain the nature of life?",
                 lines=4,
             )
 
@@ -1164,6 +1249,7 @@ def build_app():
                 gr.Number(100, visible=False),
                 gr.Number(0.001, visible=False),
                 gr.Number(0, visible=False),
+                snake_fold,
             ],
             outputs=[trained_state, status],
         )
@@ -1180,6 +1266,7 @@ def build_app():
                 p_takeaway,
                 p_summary,
                 trained_state,
+                snake_fold,
             ],
             outputs=out_txt,
         )
