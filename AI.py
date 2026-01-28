@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Neurosymbolic Text Generator (Gradio GUI) - Enhanced with Contextual Grid
-Gaspare sparsification + Menger-curvature + Contextual Grid Associationality
+Graph-Theoretic Neurosymbolic Text Generator (Gradio GUI)
+V3.6 + Gaspare (Seed-based Inference Sparsification)
 
-Deps: pip install gradio numpy torch
+New in V3.6:
+- "Gaspare" Logic: Uses np.where and random seed to sparsify 
+  probability distributions, reducing inference noise.
+
+Dependencies:
+  pip install gradio numpy torch
 """
+
 from __future__ import annotations
 import re
 import math
+import heapq
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Any, Set
-from collections import OrderedDict, defaultdict
-
+from typing import List, Dict, Tuple, Optional, Any, Callable
+from collections import OrderedDict, deque
 import numpy as np
 import gradio as gr
 import torch
@@ -21,15 +27,167 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+
 # ----------------------------
-# Text utils
+# Pure-Python TF-IDF + SVD (no sklearn)
 # ----------------------------
+
+def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
+    """Pure NumPy TF-IDF."""
+    all_words = set()
+    for doc in docs:
+        words = re.findall(r"\b\w+\b", doc.lower())
+        all_words.update(words)
+
+    vocab = list(all_words)[:max_features]
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+
+    X = np.zeros((len(docs), len(vocab)))
+    doc_freq = np.zeros(len(vocab))
+
+    for i, doc in enumerate(docs):
+        word_counts = {}
+        for word in re.findall(r"\b\w+\b", doc.lower()):
+            word_counts[word] = word_counts.get(word, 0) + 1
+
+        for word, count in word_counts.items():
+            if word in word_to_idx:
+                j = word_to_idx[word]
+                tf = count / len(word_counts)
+                idf = math.log(len(docs) / (1 + sum(1 for d in docs if word in d.lower())))
+                X[i, j] = tf * idf
+                doc_freq[j] += count
+
+    return X, vocab
+
+
+def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42) -> Any:
+    """Pure NumPy truncated SVD (no sklearn)."""
+    np.random.seed(random_state)
+    m, n = X.shape
+    k = min(n_components, min(m, n))
+
+    Q = np.random.randn(n, k)
+    Q, _ = np.linalg.qr(Q)
+
+    for _ in range(10):
+        B = X.T @ X @ Q
+        Q, _ = np.linalg.qr(B)
+
+    B = X @ Q
+    U, S, Vt = np.linalg.svd(B, full_matrices=False)
+    return type("SVD", (), {"components_": Vt[:k]})()
+
+
+# ----------------------------
+# Helper Functions (Global)
+# ----------------------------
+
+def _token_class(tok: str) -> str:
+    """Classifies a token for graph node attributes."""
+    if tok in [".", ",", ";", ":", "!", "?", "(", ")"]:
+        return "PUNC"
+    if not re.match(r"[a-z]", tok):
+        return "OTHER"
+    L = len(tok)
+    return "S" if L <= 3 else "M" if L <= 7 else "L"
+
+
+# ----------------------------
+# Pure-Python Graph (Gaspare-style, no networkx)
+# ----------------------------
+
+@dataclass
+class SimpleGraph:
+    nodes: List[Dict[str, Any]]
+    edges: List[Tuple[int, int, Dict[str, Any]]]
+
+    @classmethod
+    def from_token_sequence(cls, tokens: List[str], max_nodes: int = 220):
+        toks = tokens[:max_nodes]
+        nodes = [{"id": i, "cls": _token_class(t)} for i, t in enumerate(toks)]
+        edges = []
+        for i in range(len(toks) - 1):
+            edges.append((i, i + 1, {"rel": "adj"}))
+        for i in range(len(toks) - 2):
+            edges.append((i, i + 2, {"rel": "skip"}))
+        return cls(nodes, edges)
+
+    def degree_histogram(self, max_bins: int = 16) -> np.ndarray:
+        degrees = [0] * max_bins
+        node_deg = {node["id"]: 0 for node in self.nodes}
+        for u, v, _ in self.edges:
+            node_deg[u] += 1
+            node_deg[v] += 1
+        for d in node_deg.values():
+            if d < max_bins:
+                degrees[d] += 1
+        return np.array(degrees)
+
+    def weisfeiler_lehman_hash(self, iterations: int = 3, digest_size: int = 16) -> str:
+        labels = {node["id"]: node["cls"] for node in self.nodes}
+        adj = {node["id"]: [] for node in self.nodes}
+        for u, v, _ in self.edges:
+            adj[u].append(v)
+            adj[v].append(u)
+
+        for _ in range(iterations):
+            new_labels = {}
+            for node_id in labels:
+                neighbors = sorted([labels[n] for n in adj[node_id]])
+                combined = (labels[node_id],) + tuple(neighbors)
+                new_hash = hash(combined) % (10**digest_size)
+                new_labels[node_id] = f"{labels[node_id]}_{new_hash}"
+            labels = new_labels
+
+        final_hash = sum(hash((k, labels[k])) for k in labels) % (10**digest_size)
+        return f"{final_hash:0{digest_size}d}"
+
+    def automorphism_estimate(self, max_count: int = 150) -> int:
+        labels = {node["id"]: node["cls"] for node in self.nodes}
+        label_counts = {}
+        for label in labels.values():
+            label_counts[label] = label_counts.get(label, 0) + 1
+        prod = 1
+        for cnt in label_counts.values():
+            prod *= cnt
+        return min(max_count, prod)
+
+
+def graph_signature(G: SimpleGraph) -> Dict[str, object]:
+    deg_hist = G.degree_histogram()
+    wl = G.weisfeiler_lehman_hash()
+    aut_est = G.automorphism_estimate()
+    return {"deg_hist": deg_hist, "wl": wl, "aut_est": aut_est}
+
+
+def passes_automorphism_checks(ref_sig, out_sig, geometric_strength: float = 0.3) -> bool:
+    strict = max(0.0, min(2.0, geometric_strength))
+    ref = ref_sig["deg_hist"].astype(float)
+    ref = ref / (ref.sum() + 1e-12)
+    out = out_sig["deg_hist"].astype(float)
+    out = out / (out.sum() + 1e-12)
+    if np.abs(ref - out).sum() > max(0.25, 1.10 - 0.35 * strict):
+        return False
+    ratio = max(1, out_sig["aut_est"]) / max(1, ref_sig["aut_est"])
+    band = max(1.3, 3.5 - 1.2 * min(1.0, geometric_strength / 2.0))
+    if not (1.0 / band <= ratio <= band):
+        return False
+    if strict >= 1.6 and out_sig["wl"] != ref_sig["wl"]:
+        return False
+    return True
+
+
+# ----------------------------
+# STOPWORDS + Normalization + Tokenization
+# ----------------------------
+
 STOPWORDS = set(
     """
-a an and are as at be by for from has have he her hers him his i in is it
-its me my of on or our ours she so that the their them they this to was we
-were what when where which who will with you your yours
-""".split()
+    a an and are as at be by for from has have he her hers him his i in is it its me my
+    of on or our ours she so that the their them they this to was we were what when where
+    which who will with you your yours
+    """.split()
 )
 
 
@@ -45,7 +203,10 @@ def basic_tokenize(text: str) -> List[str]:
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-']*|[.,;:!?()]", text)
     out = []
     for t in tokens:
-        out.append(t.lower() if re.match(r"[A-Za-z]", t) else t)
+        if re.match(r"[A-Za-z]", t):
+            out.append(t.lower())
+        else:
+            out.append(t)
     return out
 
 
@@ -68,461 +229,29 @@ def detokenize(tokens: List[str]) -> str:
     s = " ".join(out)
     s = re.sub(r"\(\s+", "(", s)
     s = re.sub(r"\s+\)", ")", s)
-    s = re.sub(
-        r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s
-    )
+    s = re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), s)
     return s
 
 
-def _file_to_path(infile: Any) -> str:
-    if infile is None:
-        raise ValueError("No file provided.")
-    if isinstance(infile, str):
-        return infile
-    if hasattr(infile, "name") and isinstance(infile.name, str):
-        return infile.name
-    if isinstance(infile, dict) and "path" in infile:
-        return str(infile["path"])
-    raise ValueError(f"Unsupported file input type: {type(infile)}")
-
-
-def load_text(infile: Any) -> str:
-    path = _file_to_path(infile)
+def load_text(path: str) -> str:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
     ext = p.suffix.lower()
     if ext in [".txt", ".md"]:
         return p.read_text(encoding="utf-8", errors="replace")
-    raise ValueError(f"Unsupported file extension: {ext} (txt/md only).")
+    if ext in [".pdf", ".docx"]:
+        raise ValueError(
+            f"Unsupported file extension: {ext}. "
+            "Please convert to .txt or .md first (no pypdf / python-docx)."
+        )
+    raise ValueError(f"Unsupported file extension: {ext}")
 
 
 # ----------------------------
-# Pure NumPy TF-IDF + randomized SVD
+# SGLang-like Runtime Components
 # ----------------------------
-def pure_tfidf(docs: List[str], max_features: int = 8000) -> Tuple[np.ndarray, List[str]]:
-    # Build doc term counts
-    doc_tokens: List[List[str]] = []
-    df: Dict[str, int] = {}
-    tf_counts: List[Dict[str, int]] = []
-    for doc in docs:
-        toks = re.findall(r"\b\w+\b", doc.lower())
-        doc_tokens.append(toks)
-        counts: Dict[str, int] = {}
-        seen = set()
-        for w in toks:
-            counts[w] = counts.get(w, 0) + 1
-            if w not in seen:
-                df[w] = df.get(w, 0) + 1
-                seen.add(w)
-        tf_counts.append(counts)
-    
-    # vocab by DF (simple + deterministic)
-    vocab = sorted(df.keys(), key=lambda w: (-df[w], w))[:max_features]
-    word_to_idx = {w: i for i, w in enumerate(vocab)}
-    
-    X = np.zeros((len(docs), len(vocab)), dtype=np.float64)
-    N = max(1, len(docs))
-    for i, counts in enumerate(tf_counts):
-        denom = max(1, len(counts))
-        for w, c in counts.items():
-            j = word_to_idx.get(w, None)
-            if j is None:
-                continue
-            tf = c / denom
-            idf = math.log(N / (1 + df.get(w, 0)))
-            X[i, j] = tf * idf
-    
-    return X, vocab
 
-
-def pure_truncated_svd(X: np.ndarray, n_components: int, random_state: int = 42, n_iter: int = 8):
-    np.random.seed(int(random_state))
-    m, n = X.shape
-    k = max(1, min(int(n_components), m, n))
-    Q = np.random.randn(n, k)
-    Q, _ = np.linalg.qr(Q)
-    XtX = X.T @ X
-    for _ in range(int(n_iter)):
-        Q, _ = np.linalg.qr(XtX @ Q)
-    B = X @ Q
-    U, S, Vt = np.linalg.svd(B, full_matrices=False)
-    return type("SVD", (), {"components_": Vt[:k]})()
-
-
-# ----------------------------
-# Contextual Grid Structure
-# ----------------------------
-@dataclass
-class GridCell:
-    """Represents a cell in the contextual grid with associational links."""
-
-    word: str
-    position: Tuple[int, int]  # (row, col) in grid
-    frequency: float
-    neighbors: Set[str] = field(default_factory=set)
-    semantic_layer: int = 0  # depth in association hierarchy
-    activation: float = 0.0
-
-
-class ContextualGrid:
-    """
-    Multi-dimensional grid structure for candidate organization.
-    Words are placed in a grid based on:
-    - Frequency (vertical axis)
-    - Semantic similarity (horizontal axis)
-    - Contextual co-occurrence (depth/layer)
-    """
-
-    def __init__(self, grid_size: int = 20, semantic_layers: int = 3):
-        self.grid_size = int(grid_size)
-        self.semantic_layers = int(semantic_layers)
-        self.cells: Dict[Tuple[int, int, int], GridCell] = {}  # (row, col, layer) -> cell
-        self.word_to_pos: Dict[str, Tuple[int, int, int]] = {}
-        self.association_graph: Dict[str, Dict[str, float]] = defaultdict(dict)
-
-    def add_word(self, word: str, freq: float, semantic_vec: Optional[np.ndarray] = None) -> None:
-        """Add word to grid based on frequency and semantic properties."""
-        # Frequency determines vertical position
-        row = int(min(self.grid_size - 1, freq * self.grid_size))
-
-        # Semantic vector determines horizontal position
-        if semantic_vec is not None and len(semantic_vec) > 0:
-            col = int(abs(hash(tuple(semantic_vec[:3]))) % self.grid_size)
-        else:
-            col = int(abs(hash(word)) % self.grid_size)
-
-        # Find available layer
-        layer = 0
-        while (row, col, layer) in self.cells and layer < self.semantic_layers:
-            layer += 1
-
-        pos = (row, col, layer)
-        cell = GridCell(word=word, position=pos, frequency=freq, semantic_layer=layer)
-        self.cells[pos] = cell
-        self.word_to_pos[word] = pos
-
-    def add_association(self, word1: str, word2: str, strength: float) -> None:
-        """Add associational link between words."""
-        self.association_graph[word1][word2] = strength
-        self.association_graph[word2][word1] = strength
-
-        # Update neighbor sets
-        if word1 in self.word_to_pos and word2 in self.word_to_pos:
-            pos1 = self.word_to_pos[word1]
-            pos2 = self.word_to_pos[word2]
-            if pos1 in self.cells:
-                self.cells[pos1].neighbors.add(word2)
-            if pos2 in self.cells:
-                self.cells[pos2].neighbors.add(word1)
-
-    def get_neighborhood(self, word: str, radius: int = 2) -> List[str]:
-        """Get words in spatial neighborhood of given word."""
-        if word not in self.word_to_pos:
-            return []
-
-        row, col, layer = self.word_to_pos[word]
-        neighbors = []
-
-        for r in range(max(0, row - radius), min(self.grid_size, row + radius + 1)):
-            for c in range(max(0, col - radius), min(self.grid_size, col + radius + 1)):
-                for l in range(self.semantic_layers):
-                    if (r, c, l) in self.cells:
-                        cell = self.cells[(r, c, l)]
-                        if cell.word != word:
-                            neighbors.append(cell.word)
-
-        return neighbors
-
-    def activate_region(self, center_words: List[str], decay: float = 0.7) -> Dict[str, float]:
-        """
-        Spread activation from center words through the grid.
-        Returns activation levels for all words.
-        """
-        activations: Dict[str, float] = defaultdict(float)
-
-        # Initialize center words
-        for w in center_words:
-            activations[w] = 1.0
-
-        # Spread activation through association graph
-        for _ in range(3):  # Multiple passes
-            new_activations = activations.copy()
-            for word, activation in activations.items():
-                if activation > 0.01:  # Only spread from active nodes
-                    for neighbor, strength in self.association_graph.get(word, {}).items():
-                        new_activations[neighbor] = max(
-                            new_activations[neighbor], activation * decay * strength
-                        )
-            activations = new_activations
-
-        return dict(activations)
-
-    def get_candidates_by_activation(
-        self, context: List[str], base_candidates: List[str], top_k: int = 100
-    ) -> List[Tuple[str, float]]:
-        """
-        Select candidates using grid-based activation spreading.
-        Returns list of (word, score) tuples.
-        """
-        # Activate regions around context words
-        activations = self.activate_region(context)
-
-        # Score candidates
-        scored = []
-        for cand in base_candidates:
-            score = activations.get(cand, 0.0)
-
-            # Boost by neighborhood density
-            neighbors = self.get_neighborhood(cand, radius=1)
-            neighborhood_score = sum(1 for n in neighbors if n in base_candidates) / max(
-                1, len(neighbors)
-            )
-
-            # Boost by association strength with context
-            context_score = 0.0
-            for ctx_word in context:
-                context_score += self.association_graph.get(cand, {}).get(ctx_word, 0.0)
-            context_score /= max(1, len(context))
-
-            final_score = score + 0.3 * neighborhood_score + 0.4 * context_score
-            scored.append((cand, final_score))
-
-        # Sort and return top-k
-        scored.sort(key=lambda x: -x[1])
-        return scored[:top_k]
-
-
-# ----------------------------
-# Menger-curvature reweighting for discrete probs
-# ----------------------------
-def menger_probs_transform(
-    p: np.ndarray,
-    n_triples: int = 500,
-    seed: int = 42,
-    strength: float = 1.5,
-) -> np.ndarray:
-    """
-    Discrete "curvature" weighting on index triples.
-    Uses 1/R (circumradius) from triangle side lengths; collinear => 0.
-    """
-    rng = np.random.default_rng(int(seed))
-    p = np.asarray(p, dtype=np.float64)
-    p = p / (p.sum() + 1e-12)
-    N = p.size
-    if N < 3:
-        return p
-
-    idx = np.arange(N, dtype=np.float64)
-    curv_sum = np.zeros(N, dtype=np.float64)
-    counts = np.zeros(N, dtype=np.float64)
-
-    T = int(max(1, n_triples))
-    for _ in range(T):
-        i, j, k = rng.choice(N, 3, replace=False)
-        x, y, z = idx[i], idx[j], idx[k]
-        a = abs(y - x)
-        b = abs(z - y)
-        c = abs(z - x)
-        if min(a, b, c) < 1e-12:
-            curv = 0.0
-        else:
-            s = (a + b + c) / 2.0
-            area2 = s * (s - a) * (s - b) * (s - c)
-            if area2 <= 1e-18:
-                curv = 0.0
-            else:
-                area = math.sqrt(area2)
-                R = (a * b * c) / (4.0 * area + 1e-12)
-                curv = 1.0 / (R + 1e-12)
-        curv_sum[i] += curv
-        counts[i] += 1.0
-        curv_sum[j] += curv
-        counts[j] += 1.0
-        curv_sum[k] += curv
-        counts[k] += 1.0
-
-    avg = curv_sum / np.maximum(counts, 1.0)
-    avg = np.maximum(avg, 1e-6)
-    avg = avg / (avg.max() + 1e-12)  # [0,1]
-    p2 = p * (avg ** float(strength))
-    return p2 / (p2.sum() + 1e-12)
-
-
-# ----------------------------
-# ML02450 Feature Extractor
-# ----------------------------
-class ML02450Extractor:
-    """
-    ML02450: Maximum Likelihood feature extraction with 24-bit precision
-    and 50-dimensional output space.
-    
-    A custom feature extraction technique that:
-    - Uses iterative power method for spectral decomposition
-    - Applies maximum likelihood weighting to features
-    - Operates in 24-bit fixed-point precision for efficiency
-    - Extracts exactly 50 informative dimensions
-    - No external ML libraries required
-    """
-    
-    def __init__(self, n_features: int = 50, n_iterations: int = 24, seed: int = 42):
-        self.n_features = int(n_features)  # Target: 50 features
-        self.n_iterations = int(n_iterations)  # Target: 24 iterations
-        self.seed = int(seed)
-        self.components_ = None
-        self.mean_ = None
-        self.scale_ = None
-        
-    def _quantize_24bit(self, x: np.ndarray) -> np.ndarray:
-        """Simulate 24-bit fixed-point precision."""
-        # Scale to 24-bit range: -2^23 to 2^23-1
-        scale = 2**23
-        x_scaled = x * scale
-        x_quantized = np.floor(x_scaled + 0.5).astype(np.int32)
-        x_quantized = np.clip(x_quantized, -scale, scale - 1)
-        return x_quantized.astype(np.float64) / scale
-    
-    def _power_iteration(self, A: np.ndarray, n_iter: int) -> Tuple[np.ndarray, float]:
-        """
-        Power iteration for dominant eigenvector.
-        Returns eigenvector and eigenvalue.
-        """
-        m, n = A.shape
-        # Initialize random vector
-        rng = np.random.default_rng(self.seed)
-        v = rng.normal(0, 1, n)
-        v = v / (np.linalg.norm(v) + 1e-12)
-        
-        for _ in range(n_iter):
-            # Matrix-vector product
-            Av = A.T @ (A @ v)
-            # Quantize to 24-bit
-            Av = self._quantize_24bit(Av)
-            # Normalize
-            eigenvalue = np.linalg.norm(Av)
-            if eigenvalue > 1e-12:
-                v = Av / eigenvalue
-            else:
-                break
-        
-        return v, eigenvalue
-    
-    def _deflate_matrix(self, A: np.ndarray, eigvec: np.ndarray, eigval: float) -> np.ndarray:
-        """Deflate matrix by removing component of dominant eigenvector."""
-        # Deflation: A' = A - λ * v * v^T * A
-        outer = np.outer(eigvec, eigvec)
-        deflated = A - eigval * (A @ outer)
-        return deflated
-    
-    def _maximum_likelihood_weights(self, X: np.ndarray) -> np.ndarray:
-        """
-        Compute ML weights for each feature dimension.
-        Higher weight for dimensions with better separation.
-        """
-        n_samples, n_dims = X.shape
-        
-        weights = np.zeros(n_dims)
-        for j in range(n_dims):
-            col = X[:, j]
-            # Estimate using empirical variance
-            var = np.var(col)
-            # ML weight inversely proportional to uncertainty
-            weights[j] = 1.0 / (var + 1e-6)
-        
-        # Normalize weights
-        weights = weights / (np.sum(weights) + 1e-12)
-        return weights
-    
-    def fit(self, X: np.ndarray) -> "ML02450Extractor":
-        """
-        Fit the ML02450 extractor to data.
-        
-        Args:
-            X: Input matrix (n_samples, n_features_in)
-            
-        Returns:
-            self
-        """
-        X = np.asarray(X, dtype=np.float64)
-        n_samples, n_dims_in = X.shape
-        
-        # Center and scale data
-        self.mean_ = np.mean(X, axis=0)
-        X_centered = X - self.mean_
-        self.scale_ = np.std(X_centered, axis=0)
-        self.scale_ = np.where(self.scale_ < 1e-12, 1.0, self.scale_)
-        X_normalized = X_centered / self.scale_
-        
-        # Apply 24-bit quantization
-        X_quantized = self._quantize_24bit(X_normalized)
-        
-        # Extract components using iterative power method
-        n_components = min(self.n_features, n_dims_in, n_samples - 1)
-        components = []
-        
-        A = X_quantized.copy()
-        for i in range(n_components):
-            # Extract dominant component
-            eigvec, eigval = self._power_iteration(A, self.n_iterations)
-            components.append(eigvec)
-            
-            # Deflate matrix for next iteration
-            A = self._deflate_matrix(A, eigvec, eigval)
-            
-            # Update seed for next iteration
-            self.seed += 1
-        
-        self.components_ = np.array(components)
-        
-        # Apply ML weighting to components
-        if self.components_.shape[0] > 0:
-            weights = self._maximum_likelihood_weights(X_quantized)
-            # Weight each component by feature importance
-            for i in range(self.components_.shape[0]):
-                self.components_[i] *= weights
-                # Re-normalize
-                norm = np.linalg.norm(self.components_[i])
-                if norm > 1e-12:
-                    self.components_[i] /= norm
-        
-        return self
-    
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        """
-        Transform data using fitted ML02450 components.
-        
-        Args:
-            X: Input matrix (n_samples, n_features_in)
-            
-        Returns:
-            Transformed matrix (n_samples, n_features=50)
-        """
-        if self.components_ is None:
-            raise ValueError("Extractor must be fitted before transform.")
-        
-        X = np.asarray(X, dtype=np.float64)
-        
-        # Apply same normalization as training
-        X_centered = X - self.mean_
-        X_normalized = X_centered / self.scale_
-        X_quantized = self._quantize_24bit(X_normalized)
-        
-        # Project onto components
-        X_transformed = X_quantized
-        
-        # Final 24-bit quantization
-        X_transformed = self._quantize_24bit(X_transformed)
-        
-        return X_transformed
-    
-    def fit_transform(self, X: np.ndarray) -> np.ndarray:
-        """Fit to data and transform it."""
-        return self.fit(X).transform(X)
-
-
-# ----------------------------
-# Tiny runtime cache
-# ----------------------------
 class RadixLRUCache:
     def __init__(self, max_items: int = 25000):
         self.max_items = int(max(256, max_items))
@@ -545,16 +274,31 @@ class RadixLRUCache:
         self._od.clear()
 
 
+@dataclass
+class DecodeStream:
+    stream_id: int
+    tokens_out: List[str]
+    w1: str
+    w2: str
+    w3: str
+    done: bool = False
+    alpha_count: int = 0
+    max_steps: int = 1000
+    stop_tokens: set = field(default_factory=lambda: {".", "!", "?"})
+    min_alpha: int = 200
+
+
 # ----------------------------
-# PyTorch neuro-ish modules
+# PyTorch Neural Modules
 # ----------------------------
+
 class LateralInhibition(nn.Module):
-    def __init__(self, strength=0.5):
+    def __init__(self, kernel_size=7, strength=0.5):
         super().__init__()
         self.strength = float(strength)
         k = torch.tensor([-0.95, -0.9, -0.1, 0.3, -1.4, -1.2, -1.05], dtype=torch.float32)
         self.register_buffer("kernel", k.view(1, 1, -1))
-        self.pad = 3
+        self.pad = int(kernel_size // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
@@ -565,6 +309,15 @@ class LateralInhibition(nn.Module):
         out = x + self.strength * modulation
         out = F.relu(out)
         return out / (out.sum(dim=-1, keepdim=True) + 1e-12)
+
+
+class SynapticPruner(nn.Module):
+    def __init__(self, n_features: int):
+        super().__init__()
+        self.gain = nn.Parameter(torch.ones(int(n_features)))
+
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        return W * self.gain.view(1, -1)
 
 
 class ResonantGate(nn.Module):
@@ -613,21 +366,18 @@ class SyntheticGELUBias(nn.Module):
 
 
 # ----------------------------
-# Enhanced Quadgram LM with Grid
+# Quadgram LM
 # ----------------------------
+
 class QuadgramLM:
-    def __init__(self, add_k: float = 0.25, use_grid: bool = True, grid_size: int = 20):
+    def __init__(self, add_k: float = 0.25):
         self.add_k = float(add_k)
-        self.use_grid = bool(use_grid)
         self.uni: Dict[str, int] = {}
         self.bi: Dict[Tuple[str, str], int] = {}
         self.tri: Dict[Tuple[str, str, str], int] = {}
         self.quad: Dict[Tuple[str, str, str, str], int] = {}
         self.vocab: List[str] = []
         self.total = 0
-
-        # Contextual grid for associational candidate selection
-        self.grid: Optional[ContextualGrid] = ContextualGrid(grid_size=grid_size) if use_grid else None
 
     def ingest(self, tokens: List[str]) -> None:
         self.uni.clear()
@@ -647,67 +397,24 @@ class QuadgramLM:
         for i in range(len(tokens) - 3):
             k = (tokens[i], tokens[i + 1], tokens[i + 2], tokens[i + 3])
             self.quad[k] = self.quad.get(k, 0) + 1
-
         self.vocab = list(self.uni.keys())
 
-        # Build contextual grid
-        if self.grid is not None:
-            self._build_grid(tokens)
-
-    def _build_grid(self, tokens: List[str]) -> None:
-        """Build contextual grid from token sequence."""
-        if self.grid is None:
-            return
-
-        # Add words to grid based on frequency
-        max_freq = max(self.uni.values()) if self.uni else 1
-        for word, count in self.uni.items():
-            if word not in STOPWORDS and len(word) > 2:
-                norm_freq = count / max_freq
-                self.grid.add_word(word, norm_freq)
-
-        # Build association graph from co-occurrence
-        window_size = 5
-        for i in range(len(tokens)):
-            center = tokens[i]
-            if center in STOPWORDS or len(center) <= 2:
-                continue
-
-            # Look at surrounding context
-            start = max(0, i - window_size)
-            end = min(len(tokens), i + window_size + 1)
-
-            for j in range(start, end):
-                if i != j:
-                    neighbor = tokens[j]
-                    if neighbor not in STOPWORDS and len(neighbor) > 2:
-                        # Co-occurrence strength based on distance
-                        distance = abs(i - j)
-                        strength = 1.0 / (1.0 + distance)
-                        self.grid.add_association(center, neighbor, strength)
-
     def next_distribution(self, w1: str, w2: str, w3: str) -> Tuple[List[str], torch.Tensor]:
-        cont: List[str] = []
-
-        # Gather candidates from n-gram contexts
-        for (a, b, c, d), _count in self.quad.items():
+        cont = []
+        for (a, b, c, d), count in self.quad.items():
             if a == w1 and b == w2 and c == w3:
                 cont.append(d)
-
         if not cont:
-            for (a, b, c), _count in self.tri.items():
+            for (a, b, c), count in self.tri.items():
                 if a == w2 and b == w3:
                     cont.append(c)
-
         if not cont:
-            for (a, b), _count in self.bi.items():
+            for (a, b), count in self.bi.items():
                 if a == w3:
                     cont.append(b)
-
         if not cont:
             cont = [w for w, _ in sorted(self.uni.items(), key=lambda x: x[1], reverse=True)[:200]]
 
-        # Deduplicate
         seen = set()
         cand = []
         for w in cont:
@@ -715,25 +422,6 @@ class QuadgramLM:
                 seen.add(w)
                 cand.append(w)
         cand = cand[:500]
-
-        # Use grid for associational reranking
-        if self.grid is not None and len(cand) > 0:
-            context_words = [w for w in [w1, w2, w3] if w in self.grid.word_to_pos]
-            if context_words:
-                grid_scored = self.grid.get_candidates_by_activation(
-                    context_words, cand, top_k=min(300, len(cand))
-                )
-                # Blend grid scores with original order
-                grid_dict = {word: score for word, score in grid_scored}
-                cand_reranked = []
-                for w in cand:
-                    if w in grid_dict:
-                        cand_reranked.append(w)
-                # Add back any missing candidates
-                for w in cand:
-                    if w not in cand_reranked:
-                        cand_reranked.append(w)
-                cand = cand_reranked[:500]
 
         V = len(self.vocab) + 1
         add_k = self.add_k
@@ -743,14 +431,14 @@ class QuadgramLM:
             c1234 = self.quad.get((w1, w2, w3, w4), 0)
             if c123 > 0:
                 return (c1234 + add_k) / (c123 + add_k * V)
-            c23 = self.bi.get((w2, w3), 0)
-            c234 = self.tri.get((w2, w3, w4), 0)
-            if c23 > 0:
-                return (c234 + add_k) / (c23 + add_k * V)
-            c3 = self.uni.get(w3, 0)
-            c34 = self.bi.get((w3, w4), 0)
-            if c3 > 0:
-                return (c34 + add_k) / (c3 + add_k * V)
+            c12 = self.bi.get((w2, w3), 0)
+            c123_tri = self.tri.get((w2, w3, w4), 0)
+            if c12 > 0:
+                return (c123_tri + add_k) / (c12 + add_k * V)
+            c1 = self.uni.get(w3, 0)
+            c12_bi = self.bi.get((w3, w4), 0)
+            if c1 > 0:
+                return (c12_bi + add_k) / (c1 + add_k * V)
             return (self.uni.get(w4, 0) + add_k) / (self.total + add_k * V)
 
         probs = torch.tensor([get_prob(w) for w in cand], dtype=torch.float32)
@@ -759,20 +447,28 @@ class QuadgramLM:
 
 
 # ----------------------------
-# Model state + generator
+# Nodelets & Model State
 # ----------------------------
+
 @dataclass
 class Nodelet:
     idx: int
     top_terms: List[Tuple[str, float]]
     energy: float
+    narrative: str
 
 
 @dataclass
 class ModelState:
-    vocab_top: List[str]
+    nodelets: List[Nodelet]
+    vocab100: List[str]
+    binding_W: torch.Tensor
     bar_probs: torch.Tensor
     token_boost: Dict[str, float]
+    pillar_weights: torch.Tensor
+    geometric_bias: torch.Tensor
+    semantic_graph: SimpleGraph
+    lm_graph: Any
 
 
 @dataclass
@@ -781,7 +477,12 @@ class PreparedCorpus:
     tokens: List[str]
     lm: QuadgramLM
     state: ModelState
+    ref_sig: Dict[str, object]
 
+
+# ----------------------------
+# NeuroSymbolicGraphGenerator
+# ----------------------------
 
 class NeuroSymbolicGraphGenerator:
     def __init__(
@@ -792,29 +493,34 @@ class NeuroSymbolicGraphGenerator:
         softmax_temp: float = 0.85,
         steer_strength: float = 1.35,
         lm_add_k: float = 0.25,
+        pillar_strength: float = 0.85,
+        geometric_strength: float = 0.3,
+        rfe_enabled: bool = True,
+        rfe_iterations: int = 3,
+        rfe_removal_rate: float = 0.15,
         focus_strength: float = 0.5,
         gelu_seed: int = 1337,
         gelu_hidden: int = 32,
         radix_cache_items: int = 25000,
         speculative_accept_topk: int = 10,
-        use_contextual_grid: bool = True,
-        grid_size: int = 20,
-        use_ml02450: bool = True,
     ):
         self.nodelets_n = int(nodelets_n)
         self.bars_n = int(bars_n)
         self.svd_random_state = int(svd_random_state)
         self.softmax_temp = float(softmax_temp)
         self.lm_add_k = float(lm_add_k)
-        self.use_contextual_grid = bool(use_contextual_grid)
-        self.grid_size = int(grid_size)
-        self.use_ml02450 = bool(use_ml02450)
+        self.pillar_strength = float(pillar_strength)
+        self.geometric_strength = float(geometric_strength)
+        self.rfe_enabled = bool(rfe_enabled)
+        self.rfe_iterations = int(rfe_iterations)
+        self.rfe_removal_rate = float(rfe_removal_rate)
 
         self.focus_layer = LateralInhibition(strength=float(focus_strength))
         self.gate_layer = ResonantGate(steer_strength=float(steer_strength))
         self.synthetic_bias = SyntheticGELUBias(hidden=gelu_hidden, approximate="tanh")
         self.synthetic_bias.reset_seed(int(gelu_seed))
         self.synthetic_bias.freeze_(True)
+        self.pruner: Optional[SynapticPruner] = None
 
         self.cache_version = 0
         self.radix_cache = RadixLRUCache(max_items=int(radix_cache_items))
@@ -824,7 +530,9 @@ class NeuroSymbolicGraphGenerator:
         self.cache_version += 1
         self.radix_cache.clear()
 
-    def _pick_initial_context(self, lm: QuadgramLM, seed_words: List[str]) -> Tuple[str, str, str]:
+    def _pick_initial_context(
+        self, lm: QuadgramLM, rng: np.random.Generator, seed_words: List[str]
+    ) -> Tuple[str, str, str]:
         sw = [t for t in seed_words if re.match(r"^[a-z][a-z0-9_\-']*$", t)]
         if len(sw) >= 3:
             return (sw[-3], sw[-2], sw[-1])
@@ -835,125 +543,142 @@ class NeuroSymbolicGraphGenerator:
         seed_tok = lm.vocab[0] if lm.vocab else "the"
         return (seed_tok, seed_tok, seed_tok)
 
+    def _build_token_structure_graph(
+        self, tokens: List[str], max_nodes: int = 220
+    ) -> SimpleGraph:
+        return SimpleGraph.from_token_sequence(tokens, max_nodes)
+
+    def _graph_signature(self, G: SimpleGraph) -> Dict[str, object]:
+        return graph_signature(G)
+
+    def _passes_automorphism_checks(self, ref_sig, out_sig) -> bool:
+        return passes_automorphism_checks(ref_sig, out_sig, self.geometric_strength)
+
+    def _synaptic_prune(
+        self,
+        W: torch.Tensor,
+        energies: torch.Tensor,
+        vocab100: List[str],
+        progress=None,
+    ):
+        if not self.rfe_enabled or self.rfe_iterations <= 0:
+            return W, vocab100
+        k, bars_n = W.shape
+        self.pruner = SynapticPruner(bars_n)
+        W_curr = W.detach().clone().requires_grad_(True)
+        kept_mask = torch.ones(bars_n, dtype=torch.bool)
+
+        for iteration in range(self.rfe_iterations):
+            if progress:
+                progress(
+                    0.80 + 0.05 * (iteration / max(1, self.rfe_iterations)),
+                    desc=f"Synaptic Pruning {iteration+1}",
+                )
+            W_modulated = self.pruner(W_curr)
+            loss = -torch.sum(W_modulated * energies.view(-1, 1)) + 0.1 * torch.var(
+                W_modulated, dim=0
+            ).sum()
+            loss.backward()
+            with torch.no_grad():
+                grads = W_curr.grad.abs().sum(dim=0)
+                weights = W_curr.abs().sum(dim=0)
+                importance = 0.6 * weights + 0.4 * grads
+                importance = importance / (importance.max() + 1e-12)
+                n_keep = int(kept_mask.sum().item() * (1.0 - self.rfe_removal_rate))
+                if n_keep < 10:
+                    break
+                active = torch.where(kept_mask)[0]
+                local_importance = importance[active]
+                _, top_local = torch.topk(
+                    local_importance, k=min(n_keep, local_importance.numel())
+                )
+                new_mask = torch.zeros_like(kept_mask)
+                new_mask[active[top_local]] = True
+                kept_mask = new_mask
+                W_curr.grad.zero_()
+
+        with torch.no_grad():
+            final_idx = torch.where(kept_mask)[0]
+            W_final = W[:, final_idx]
+            vocab_final = [vocab100[i] for i in final_idx.tolist()]
+        return W_final, vocab_final
+
     def build_state(self, text: str, progress=None) -> ModelState:
         if progress:
-            progress(0.0, desc="Normalizing")
+            progress(0, desc="Normalizing")
         text = normalize(text)
-        docs = re.split(r"\n\s*\n", text)
-        docs = [d.strip() for d in docs if d.strip()]
-        docs = docs[:500] if docs else [text]
 
+        docs = re.split(r"\n\s*\n", text)[:500]
         X, vocab = pure_tfidf(docs, max_features=8000)
-        if X.size == 0 or not vocab:
-            return ModelState(vocab_top=[], bar_probs=torch.ones(1), token_boost={})
 
-        # Apply ML02450 feature extraction if enabled
-        if self.use_ml02450:
-            if progress:
-                progress(0.3, desc="Applying ML02450 feature extraction")
-            
-            ml_extractor = ML02450Extractor(
-                n_features=50,
-                n_iterations=24,
-                seed=self.svd_random_state
-            )
-            
-            # Only apply if we have enough features
-            if X.shape[1] >= 50:
-                X_ml = ml_extractor.fit_transform(X)
-                # Combine ML02450 features with original top features
-                col_sums_ml = np.abs(X_ml).sum(axis=0)
-                col_sums_orig = X.sum(axis=0)
-                
-                # Select top features from both
-                n_from_ml = min(25, X_ml.shape[1])
-                n_from_orig = min(self.bars_n - n_from_ml, col_sums_orig.shape[0])
-                
-                top_idx_ml = np.argsort(-col_sums_ml)[:n_from_ml]
-                top_idx_orig = np.argsort(-col_sums_orig)[:n_from_orig]
-                
-                # Build combined vocabulary
-                vocab_top = []
-                # Add ML-enhanced features (use original vocab mapping)
-                for idx in top_idx_ml:
-                    if idx < len(vocab):
-                        vocab_top.append(vocab[idx])
-                # Add original high-scoring features
-                for idx in top_idx_orig:
-                    if vocab[idx] not in vocab_top:
-                        vocab_top.append(vocab[idx])
-                
-                vocab_top = vocab_top[:self.bars_n]
-                
-                # Use ML-transformed features for SVD
-                X_svd = X_ml[:, top_idx_ml]
-            else:
-                # Fallback to original method
-                col_sums = X.sum(axis=0)
-                n_keep = min(self.bars_n, col_sums.shape[0])
-                top_idx = np.argsort(-col_sums)[:n_keep]
-                vocab_top = [vocab[i] for i in top_idx]
-                X_svd = X[:, top_idx]
-        else:
-            # Original method without ML02450
-            col_sums = X.sum(axis=0)
-            n_keep = min(self.bars_n, col_sums.shape[0])
-            top_idx = np.argsort(-col_sums)[:n_keep]
-            vocab_top = [vocab[i] for i in top_idx]
-            X_svd = X[:, top_idx]
-
-        if progress:
-            progress(0.6, desc="Computing SVD")
+        top_idx = np.argsort(-X.sum(axis=0))[: self.bars_n]
+        vocab100 = [vocab[i] for i in top_idx]
+        X_svd = X[:, top_idx]
 
         n_rows, n_cols = X_svd.shape
         max_rank = min(n_rows, n_cols)
-        k = max(1, min(self.nodelets_n, max_rank, 10))
+        k = 1 if max_rank <= 1 else min(self.nodelets_n, max_rank, 10)
+
         svd = pure_truncated_svd(X_svd, n_components=k, random_state=self.svd_random_state)
 
-        # Nodelet energies from component norms
-        nodelets: List[Nodelet] = []
+        nodelets = []
         for i, comp in enumerate(svd.components_):
             terms = sorted(
-                [(vocab_top[j], float(comp[j])) for j in range(min(len(comp), len(vocab_top)))],
+                [(vocab100[j], float(comp[j])) for j in range(len(comp))],
                 key=lambda x: -abs(x[1]),
             )[:10]
             eng = float(np.linalg.norm(comp))
-            nodelets.append(Nodelet(i, terms, eng))
-
-        energies = np.array([n.energy for n in nodelets], dtype=np.float64)
-        if energies.size == 0:
-            energies = np.ones(1, dtype=np.float64)
-        energies = energies / (energies.max() + 1e-12)
+            nodelets.append(Nodelet(i, terms, eng, f"Nodelet {i}"))
 
         W = torch.tensor(svd.components_, dtype=torch.float32)
         W = F.relu(W)
         W = W / (W.max(dim=1, keepdim=True)[0] + 1e-12)
 
-        e_t = torch.tensor(energies, dtype=torch.float32).view(-1, 1)
-        logits = (e_t * W).sum(dim=0)
+        energies = torch.tensor(
+            [n.energy for n in nodelets], dtype=torch.float32
+        )
+        energies = energies / (energies.max() + 1e-12)
+        W, vocab100 = self._synaptic_prune(W, energies, vocab100, progress)
+
+        logits = (energies.view(-1, 1) * W).sum(dim=0)
         probs = F.softmax(logits / self.softmax_temp, dim=-1)
         probs = self.focus_layer(probs.view(1, 1, -1)).squeeze(0).squeeze(0)
 
         token_boost: Dict[str, float] = {}
-        for w, p in zip(vocab_top, probs.detach().cpu().tolist()):
+        for w, p in zip(vocab100, probs.detach().cpu().tolist()):
             for subw in w.split():
                 if len(subw) > 2 and subw not in STOPWORDS:
-                    token_boost[subw] = max(token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0)
+                    token_boost[subw] = max(
+                        token_boost.get(subw, 0.0), math.log(p + 1e-12) + 5.0
+                    )
 
-        if progress:
-            progress(1.0, desc="Complete")
+        G_sem = SimpleGraph(nodes=[], edges=[])  # dummy semantic graph
 
-        return ModelState(vocab_top=vocab_top, bar_probs=probs, token_boost=token_boost)
+        return ModelState(
+            nodelets=nodelets,
+            vocab100=vocab100,
+            binding_W=W,
+            bar_probs=probs,
+            token_boost=token_boost,
+            pillar_weights=torch.zeros_like(probs),
+            geometric_bias=torch.zeros_like(probs),
+            semantic_graph=G_sem,
+            lm_graph=None,
+        )
 
     def prepare_corpus(self, text: str, progress=None) -> PreparedCorpus:
         text = normalize(text)
         state = self.build_state(text, progress)
         tokens = basic_tokenize(text)
-        lm = QuadgramLM(
-            self.lm_add_k, use_grid=self.use_contextual_grid, grid_size=self.grid_size
-        )
+        lm = QuadgramLM(self.lm_add_k)
         lm.ingest(tokens)
-        return PreparedCorpus(text=text, tokens=tokens, lm=lm, state=state)
+
+        G = self._build_token_structure_graph(tokens)
+        ref_sig = self._graph_signature(G)
+
+        return PreparedCorpus(
+            text=text, tokens=tokens, lm=lm, state=state, ref_sig=ref_sig
+        )
 
     def _final_probs_for_context_cached(
         self,
@@ -968,15 +693,23 @@ class NeuroSymbolicGraphGenerator:
             return cached
 
         cand, base_probs = prep.lm.next_distribution(w1, w2, w3)
-        if not cand:
+        if len(cand) == 0:
             cand = prep.lm.vocab[:100] if prep.lm.vocab else ["the", "is", "a"]
             base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
         else:
             base_p = base_probs.detach().clone().to(dtype=torch.float32)
-            base_p = base_p / (base_p.sum() + 1e-12)
 
+        if base_p.numel() != len(cand):
+            base_p = torch.ones(len(cand), dtype=torch.float32) / max(1, len(cand))
+
+        base_p = base_p.view(-1)
+        base_p = base_p / (base_p.sum() + 1e-12)
         base_p = self.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
-        boosts = torch.tensor([prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32)
+
+        boosts = torch.tensor(
+            [prep.state.token_boost.get(w, 0.0) for w in cand],
+            dtype=torch.float32,
+        ).view(-1)
         bias = self.synthetic_bias(base_p, boosts).view(-1)
         final_probs = self.gate_layer(base_p, boosts + bias, temp=0.9).view(-1)
 
@@ -985,26 +718,13 @@ class NeuroSymbolicGraphGenerator:
 
 
 # ----------------------------
-# Continuous batching decoder
+# Continuous Batching Decoder
 # ----------------------------
-@dataclass
-class DecodeStream:
-    stream_id: int
-    tokens_out: List[str]
-    w1: str
-    w2: str
-    w3: str
-    done: bool = False
-    alpha_count: int = 0
-    max_steps: int = 240
-    stop_tokens: set = field(default_factory=lambda: {".", "!", "?"})
-    min_alpha: int = 120
-
 
 class ContinuousBatchDecoder:
     def __init__(
         self,
-        gen: NeuroSymbolicGraphGenerator,
+        gen: "NeuroSymbolicGraphGenerator",
         prep: PreparedCorpus,
         rng: np.random.Generator,
         token_budget_per_round: int = 64,
@@ -1016,6 +736,39 @@ class ContinuousBatchDecoder:
         self.token_budget_per_round = int(max(1, token_budget_per_round))
         self.speculative = bool(speculative)
 
+    def _sample_from_probs(self, cand: List[str], probs: torch.Tensor) -> str:
+        p = probs.detach().cpu().numpy()
+        
+        # GASPARE UPDATE: Use seed (self.rng) to determine a sparse cutoff
+        cutoff = np.mean(p) + (self.rng.random() * np.std(p))
+        p_sparse = np.where(p > cutoff, p, 0.0)
+
+        # Safety: if we pruned everything, revert to original
+        if p_sparse.sum() < 1e-12:
+            p_sparse = p
+
+        # Renormalize
+        p_sparse = p_sparse / (p_sparse.sum() + 1e-12)
+
+        # --- Your requested operation: convert to binary, then subtract ---
+        # Convert to binary (0/1)
+        b = (p_sparse > 0).astype(int)
+
+        # Count 0s and 1s
+        num_zeros = np.count_nonzero(b == 0)
+        num_ones = np.count_nonzero(b == 1)
+
+        # Total length
+        total = b.size
+
+        # Subtract counts of 0s and 1s from total
+        result = total - (num_zeros + num_ones)
+        # result will always be 0 here, since b is only 0 or 1
+
+        # Continue with sampling as before
+        return self.rng.choice(cand, p=p_sparse)
+
+
     def _propose_token_base(self, w1: str, w2: str, w3: str) -> str:
         cand, base_probs = self.prep.lm.next_distribution(w1, w2, w3)
         if not cand:
@@ -1023,22 +776,6 @@ class ContinuousBatchDecoder:
         p = base_probs.detach().cpu().numpy()
         p = p / (p.sum() + 1e-12)
         return self.rng.choice(cand, p=p)
-
-    def _sample_from_probs(self, cand: List[str], probs: torch.Tensor) -> str:
-        p = probs.detach().cpu().numpy()
-
-        # Gaspare: dynamic sparse cutoff
-        cutoff = np.mean(p) + (self.rng.random() * np.std(p))
-        p_sparse = np.where(p > cutoff, p, 0.0)
-        if p_sparse.sum() < 1e-12:
-            p_sparse = p
-        p_sparse = p_sparse / (p_sparse.sum() + 1e-12)
-
-        # Menger: curvature weighting
-        seed_menger = int(self.rng.integers(0, 2**32))
-        p_menger = menger_probs_transform(p_sparse, n_triples=500, seed=seed_menger, strength=1.5)
-
-        return self.rng.choice(cand, p=p_menger)
 
     def step_round(self, streams: List[DecodeStream]) -> None:
         active = [s for s in streams if not s.done]
@@ -1053,27 +790,30 @@ class ContinuousBatchDecoder:
             groups.setdefault((s.w1, s.w2, s.w3), []).append(s)
 
         for (w1, w2, w3), bucket in groups.items():
-            cand, final_probs = self.gen._final_probs_for_context_cached(self.prep, w1, w2, w3)
+            cand, final_probs = self.gen._final_probs_for_context_cached(
+                self.prep, w1, w2, w3
+            )
 
-            topk_set = None
-            if self.speculative and len(cand) > 0:
+            if self.speculative:
                 topk = min(self.gen.speculative_accept_topk, len(cand))
                 _, idx = torch.topk(final_probs, k=topk)
                 topk_set = set(idx.detach().cpu().tolist())
 
             for s in bucket:
-                if not cand:
-                    nxt = s.w3
-                else:
-                    if self.speculative and topk_set is not None:
-                        proposed = self._propose_token_base(s.w1, s.w2, s.w3)
-                        try:
-                            j = cand.index(proposed)
-                        except ValueError:
-                            j = -1
-                        nxt = proposed if (j >= 0 and j in topk_set) else self._sample_from_probs(cand, final_probs)
+                nxt = None
+                if self.speculative:
+                    proposed = self._propose_token_base(s.w1, s.w2, s.w3)
+                    try:
+                        j = cand.index(proposed)
+                    except ValueError:
+                        j = -1
+
+                    if j >= 0 and j in topk_set:
+                        nxt = proposed
                     else:
                         nxt = self._sample_from_probs(cand, final_probs)
+                else:
+                    nxt = self._sample_from_probs(cand, final_probs)
 
                 s.tokens_out.append(nxt)
                 if nxt.isalpha():
@@ -1087,15 +827,23 @@ class ContinuousBatchDecoder:
 
 
 # ----------------------------
-# SGLang-ish wrappers
+# SGLang-like DSL & Primitives
 # ----------------------------
+
 class SGPrompt:
     def __init__(self, text: str = ""):
         self.text = str(text)
+        self.fields: Dict[str, str] = {}
 
     def __iadd__(self, other: str):
         self.text += str(other)
         return self
+
+    def __getitem__(self, key: str) -> str:
+        return self.fields.get(key, "")
+
+    def __setitem__(self, key: str, value: str):
+        self.fields[str(key)] = str(value)
 
     def __str__(self):
         return self.text
@@ -1120,7 +868,10 @@ class SGContext:
 
     def clone(self, seed_offset: int) -> "SGContext":
         return SGContext(
-            self.corpus_text, self.generator, seed=self.seed + int(seed_offset), prepared=self.prepared
+            corpus_text=self.corpus_text,
+            generator=self.generator,
+            seed=self.seed + int(seed_offset),
+            prepared=self.prepared,
         )
 
 
@@ -1133,19 +884,22 @@ def sg_gen_batched(
 ) -> List[str]:
     if not ctxs:
         return []
-
     gen = ctxs[0].generator
-    ctxs[0].ensure_prepared()
     prep = ctxs[0].prepared
-    assert prep is not None
+    if prep is None:
+        ctxs[0].ensure_prepared()
+        prep = ctxs[0].prepared
 
     rng = np.random.default_rng(ctxs[0].seed)
+    streams = []
 
-    streams: List[DecodeStream] = []
     for i, (ctx, prompt) in enumerate(zip(ctxs, prompts)):
         off = seed_offsets[i] if seed_offsets else i
+        local_rng = np.random.default_rng(ctx.seed + off)
+
         seed_words = basic_tokenize(prompt.text)
-        w1, w2, w3 = gen._pick_initial_context(prep.lm, seed_words)
+        w1, w2, w3 = gen._pick_initial_context(prep.lm, local_rng, seed_words)
+
         streams.append(
             DecodeStream(
                 stream_id=i,
@@ -1153,14 +907,16 @@ def sg_gen_batched(
                 w1=w1,
                 w2=w2,
                 w3=w3,
-                max_steps=int(max_tokens),
-                min_alpha=int(max_tokens // 2) if stop_at_punc else 999999,
+                max_steps=max_tokens,
+                min_alpha=max_tokens // 2 if stop_at_punc else 99999,
             )
         )
 
-    decoder = ContinuousBatchDecoder(gen, prep, rng, token_budget_per_round=64, speculative=True)
+    decoder = ContinuousBatchDecoder(
+        gen, prep, rng, token_budget_per_round=64, speculative=True
+    )
 
-    for _ in range(int(max_tokens) * 2):
+    for _ in range(max_tokens * 2):
         if all(s.done for s in streams):
             break
         decoder.step_round(streams)
@@ -1169,16 +925,19 @@ def sg_gen_batched(
     for s in streams:
         out_toks = s.tokens_out[3:] if len(s.tokens_out) > 3 else []
         results.append(detokenize(out_toks))
-
     return results
 
 
-def sg_gen(ctx: SGContext, prompt: SGPrompt, max_tokens=240, seed_offset=0) -> str:
-    res = sg_gen_batched([ctx], [prompt], max_tokens=max_tokens, seed_offsets=[seed_offset])
+def sg_gen(
+    ctx: SGContext, prompt: SGPrompt, max_tokens=240, seed_offset=0
+) -> str:
+    res = sg_gen_batched([ctx], [prompt], max_tokens, [seed_offset])
     return res[0]
 
 
-def sg_fork(ctx: SGContext, prompt: SGPrompt, n: int) -> List[Tuple[SGContext, SGPrompt]]:
+def sg_fork(
+    ctx: SGContext, prompt: SGPrompt, n: int
+) -> List[Tuple[SGContext, SGPrompt]]:
     n = int(max(1, n))
     ctx.ensure_prepared()
     out = []
@@ -1188,205 +947,19 @@ def sg_fork(ctx: SGContext, prompt: SGPrompt, n: int) -> List[Tuple[SGContext, S
 
 
 def sg_join(prompts: List[SGPrompt], joiner: str = "\n\n") -> SGPrompt:
-    return SGPrompt(joiner.join(p.text for p in prompts))
+    merged = SGPrompt("")
+    merged.text = joiner.join(p.text for p in prompts)
+    return merged
 
 
-# ----------------------------
-# Top-K Chain of Thought
-# ----------------------------
-@dataclass
-class ReasoningChain:
-    """Represents a single reasoning chain with its generated steps."""
-    chain_id: int
-    steps: List[str]
-    final_answer: str
-    score: float = 0.0
-    coherence: float = 0.0
-    coverage: float = 0.0
-
-
-class TopKCoT:
-    """
-    Top-K Chain of Thought generator.
-    Generates multiple reasoning chains in parallel, scores them,
-    and selects the best one based on coherence and coverage.
-    """
-    
-    def __init__(self, k: int = 3, steps_per_chain: int = 3):
-        self.k = int(max(1, k))
-        self.steps_per_chain = int(max(1, steps_per_chain))
-    
-    def _compute_coherence(self, steps: List[str], prep: PreparedCorpus) -> float:
-        """
-        Compute coherence score based on word overlap between consecutive steps.
-        Higher score means better flow between reasoning steps.
-        """
-        if len(steps) < 2:
-            return 1.0
-        
-        coherence_sum = 0.0
-        for i in range(len(steps) - 1):
-            words1 = set(basic_tokenize(steps[i]))
-            words2 = set(basic_tokenize(steps[i + 1]))
-            
-            # Filter out stopwords
-            words1 = {w for w in words1 if w not in STOPWORDS and len(w) > 2}
-            words2 = {w for w in words2 if w not in STOPWORDS and len(w) > 2}
-            
-            if not words1 or not words2:
-                continue
-            
-            # Jaccard similarity
-            intersection = len(words1 & words2)
-            union = len(words1 | words2)
-            coherence_sum += intersection / max(1, union)
-        
-        return coherence_sum / max(1, len(steps) - 1)
-    
-    def _compute_coverage(self, chain_text: str, prep: PreparedCorpus) -> float:
-        """
-        Compute coverage score based on how many important corpus concepts
-        are referenced in the reasoning chain.
-        """
-        chain_words = set(basic_tokenize(chain_text))
-        chain_words = {w for w in chain_words if w not in STOPWORDS and len(w) > 2}
-        
-        if not chain_words:
-            return 0.0
-        
-        # Get top vocabulary from corpus state
-        top_vocab = set(prep.state.vocab_top[:50])  # Top 50 important terms
-        
-        overlap = len(chain_words & top_vocab)
-        return overlap / max(1, len(top_vocab))
-    
-    def _score_chain(self, chain: ReasoningChain, prep: PreparedCorpus) -> float:
-        """
-        Compute overall score for a reasoning chain.
-        Combines coherence, coverage, and length penalty.
-        """
-        chain.coherence = self._compute_coherence(chain.steps, prep)
-        
-        # Compute coverage on full chain text
-        full_text = " ".join(chain.steps)
-        chain.coverage = self._compute_coverage(full_text, prep)
-        
-        # Length penalty - prefer chains that are substantial but not too verbose
-        total_words = len(basic_tokenize(full_text))
-        ideal_length = 50 * self.steps_per_chain  # ~50 words per step
-        length_penalty = 1.0 - abs(total_words - ideal_length) / (2 * ideal_length)
-        length_penalty = max(0.3, min(1.0, length_penalty))
-        
-        # Combined score
-        chain.score = (
-            0.4 * chain.coherence +
-            0.4 * chain.coverage +
-            0.2 * length_penalty
-        )
-        
-        return chain.score
-    
-    def generate(
-        self,
-        ctx: SGContext,
-        question: str,
-        cot_prompt_template: str = "Let's think step by step.\n\nStep {step}:",
-        answer_prompt: str = "\n\nTherefore, the answer is:",
-        max_tokens_per_step: int = 80,
-    ) -> ReasoningChain:
-        """
-        Generate k reasoning chains and return the best one.
-        
-        Args:
-            ctx: Context with prepared corpus
-            question: The question or prompt to reason about
-            cot_prompt_template: Template for step prompts (use {step} for step number)
-            answer_prompt: Prompt for final answer generation
-            max_tokens_per_step: Maximum tokens per reasoning step
-            
-        Returns:
-            The highest-scoring reasoning chain
-        """
-        ctx.ensure_prepared()
-        prep = ctx.prepared
-        assert prep is not None
-        
-        chains: List[ReasoningChain] = []
-        
-        # Generate k parallel reasoning chains
-        for chain_id in range(self.k):
-            chain_ctx = ctx.clone(seed_offset=2000 + chain_id)
-            steps: List[str] = []
-            
-            # Build reasoning chain step by step
-            current_prompt = SGPrompt(question + "\n\n")
-            
-            for step_num in range(1, self.steps_per_chain + 1):
-                # Generate this reasoning step
-                step_prompt_text = cot_prompt_template.format(step=step_num)
-                step_prompt = SGPrompt(current_prompt.text + step_prompt_text + " ")
-                
-                step_text = sg_gen(
-                    chain_ctx,
-                    step_prompt,
-                    max_tokens=max_tokens_per_step,
-                    seed_offset=step_num * 100
-                )
-                
-                steps.append(step_text)
-                current_prompt += step_prompt_text + " " + step_text + "\n\n"
-            
-            # Generate final answer
-            answer_prompt_obj = SGPrompt(current_prompt.text + answer_prompt + " ")
-            final_answer = sg_gen(
-                chain_ctx,
-                answer_prompt_obj,
-                max_tokens=max_tokens_per_step,
-                seed_offset=9999
-            )
-            
-            chain = ReasoningChain(
-                chain_id=chain_id,
-                steps=steps,
-                final_answer=final_answer
-            )
-            
-            # Score the chain
-            self._score_chain(chain, prep)
-            chains.append(chain)
-        
-        # Select best chain
-        best_chain = max(chains, key=lambda c: c.score)
-        return best_chain
-    
-    def format_chain(self, chain: ReasoningChain, include_scores: bool = False) -> str:
-        """
-        Format a reasoning chain as readable text.
-        """
-        output = []
-        
-        for i, step in enumerate(chain.steps, 1):
-            output.append(f"{step}")
-        
-        output.append(f"\n{chain.final_answer}")
-        
-               
-        return "\n\n".join(output)
-
-
-# ----------------------------
-# Program + training
-# ----------------------------
-def run_program(
-    infile: Any,
+def run_sglang_style_program(
+    infile: str,
     n_take: int,
     seed: int,
     steer: float,
     focus: float,
     gelu_seed: int,
-    use_grid: bool,
-    grid_size: int,
-    takeaway_prefix: str,
+    takeaway_prompt_str: str,
     summary_prompt_tmpl: str,
     trained_state: Optional[dict] = None,
 ) -> str:
@@ -1398,164 +971,101 @@ def run_program(
         gelu_seed=int(gelu_seed),
         radix_cache_items=30000,
         speculative_accept_topk=10,
-        use_contextual_grid=bool(use_grid),
-        grid_size=int(grid_size),
     )
 
     if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
         try:
-            gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
+            gen.synthetic_bias.load_state_dict(
+                trained_state["gelu_state_dict"], strict=True
+            )
         except Exception:
             pass
-
-    gen.synthetic_bias.freeze_(True)
-    gen.synthetic_bias.eval()
-    gen.bump_cache_version()
+        gen.synthetic_bias.freeze_(True)
+        gen.synthetic_bias.eval()
+        gen.bump_cache_version()
 
     ctx = SGContext(corpus_text, gen, seed=int(seed))
     ctx.ensure_prepared()
 
-    root = SGPrompt(str(takeaway_prefix).strip() + "\n\n")
+    root = SGPrompt(str(takeaway_prompt_str) + "\n\n")
     branches = sg_fork(ctx, root, n=int(n_take))
+
     branch_ctxs = [b[0] for b in branches]
     branch_prompts = [b[1] for b in branches]
 
     for i, bp in enumerate(branch_prompts):
         bp += f"[Takeaway {i+1}] "
 
-    take_texts = sg_gen_batched(branch_ctxs, branch_prompts, max_tokens=220, stop_at_punc=True)
+    take_texts = sg_gen_batched(
+        branch_ctxs, branch_prompts, max_tokens=220, stop_at_punc=True
+    )
 
     for i, txt in enumerate(take_texts):
         branch_prompts[i] += txt
 
     merged = sg_join(branch_prompts, joiner="\n\n")
 
-    final_sum_prompt = summary_prompt_tmpl.replace("{joined_takeaways}", merged.text)
+    final_sum_prompt = summary_prompt_tmpl.replace(
+        "{joined_takeaways}", merged.text
+    )
     summary_prompt = SGPrompt(final_sum_prompt)
     summary_text = sg_gen(ctx, summary_prompt, max_tokens=260)
 
     return summary_prompt.text + summary_text
 
 
-def run_cot_program(
-    infile: Any,
-    question: str,
-    k: int,
-    steps: int,
-    seed: int,
-    steer: float,
-    focus: float,
-    gelu_seed: int,
-    use_grid: bool,
-    grid_size: int,
-    cot_template: str,
-    answer_template: str,
-    max_tokens_per_step: int,
-    show_scores: bool,
-    trained_state: Optional[dict] = None,
-) -> str:
-    """
-    Run Top-K Chain of Thought reasoning on the corpus.
-    
-    Generates k parallel reasoning chains, scores them based on
-    coherence and coverage, and returns the best one.
-    """
-    corpus_text = load_text(infile)
-
-    gen = NeuroSymbolicGraphGenerator(
-        steer_strength=float(steer),
-        focus_strength=float(focus),
-        gelu_seed=int(gelu_seed),
-        radix_cache_items=30000,
-        speculative_accept_topk=10,
-        use_contextual_grid=bool(use_grid),
-        grid_size=int(grid_size),
-    )
-
-    if isinstance(trained_state, dict) and "gelu_state_dict" in trained_state:
-        try:
-            gen.synthetic_bias.load_state_dict(trained_state["gelu_state_dict"], strict=True)
-        except Exception:
-            pass
-
-    gen.synthetic_bias.freeze_(True)
-    gen.synthetic_bias.eval()
-    gen.bump_cache_version()
-
-    ctx = SGContext(corpus_text, gen, seed=int(seed))
-    ctx.ensure_prepared()
-    
-    # Create Top-K CoT generator
-    cot = TopKCoT(k=int(k), steps_per_chain=int(steps))
-    
-    # Generate reasoning chains
-    best_chain = cot.generate(
-        ctx=ctx,
-        question=question,
-        cot_prompt_template=cot_template,
-        answer_prompt=answer_template,
-        max_tokens_per_step=int(max_tokens_per_step),
-    )
-    
-    # Format output
-    output = f"Question: {question}\n\n"
-    output += "=" * 60 + "\n\n"
-    output += cot.format_chain(best_chain, include_scores=bool(show_scores))
-    
-    return output
-
+# ----------------------------
+# Gradio Training & App
+# ----------------------------
 
 def train_bias_net(
-    infile: Any,
-    seed: int,
-    steer: float,
-    focus: float,
-    gelu_seed: int,
-    use_grid: bool,
-    grid_size: int,
-    train_steps: int,
-    lr: float,
-    max_contexts: int,
+    infile,
+    seed,
+    steer,
+    focus,
+    gelu_seed,
+    train_steps,
+    lr,
+    max_contexts,
     progress=gr.Progress(),
 ):
     text = load_text(infile)
-
     gen = NeuroSymbolicGraphGenerator(
         steer_strength=float(steer),
         focus_strength=float(focus),
         gelu_seed=int(gelu_seed),
-        use_contextual_grid=bool(use_grid),
-        grid_size=int(grid_size),
     )
 
-    progress(0.0, desc="Preparing")
+    progress(0.0, desc="Building state")
     prep = gen.prepare_corpus(text)
     tokens = prep.tokens
 
-    if len(tokens) < 12:
-        return None, "Not enough tokens to train."
+    if len(tokens) < 10:
+        return None, "Not enough tokens."
 
     gen.synthetic_bias.reset_seed(int(gelu_seed))
     gen.synthetic_bias.freeze_(False)
     gen.synthetic_bias.train()
 
     opt = optim.Adam(gen.synthetic_bias.parameters(), lr=float(lr))
-
     positions = list(range(3, len(tokens)))
     if max_contexts and int(max_contexts) > 0:
         positions = positions[: min(len(positions), int(max_contexts))]
 
     rng = np.random.default_rng(int(seed))
     batch_size = 24
-    steps = int(train_steps)
     running_loss = 0.0
 
+    steps = int(train_steps)
     for step in range(steps):
         opt.zero_grad(set_to_none=True)
-        used = 0
         loss_acc = 0.0
-
-        batch_pos = rng.choice(positions, size=min(batch_size, len(positions)), replace=False)
+        used = 0
+        batch_pos = rng.choice(
+            positions,
+            size=min(batch_size, len(positions)),
+            replace=False,
+        )
 
         for i in batch_pos:
             w1, w2, w3 = tokens[i - 3], tokens[i - 2], tokens[i - 1]
@@ -1568,10 +1078,9 @@ def train_bias_net(
             base_p = base_probs.detach().clone().to(dtype=torch.float32)
             base_p = base_p / (base_p.sum() + 1e-12)
             base_p = gen.focus_layer(base_p.view(1, 1, -1)).squeeze(0).squeeze(0)
-
             boosts = torch.tensor(
-                [prep.state.token_boost.get(w, 0.0) for w in cand], dtype=torch.float32
-            )
+                [prep.state.token_boost.get(w, 0.0) for w in cand]
+            ).view(-1)
             bias = gen.synthetic_bias(base_p, boosts).view(-1)
             probs = gen.gate_layer(base_p, boosts + bias, temp=0.9)
 
@@ -1580,206 +1089,104 @@ def train_bias_net(
             except ValueError:
                 continue
 
-            loss_acc = loss_acc - torch.log(probs[j].clamp_min(1e-12))
+            loss_acc -= torch.log(probs[j].clamp_min(1e-12))
             used += 1
 
-        if used > 0.5:
+        if used > 0:
             loss = loss_acc / used
             loss.backward()
             opt.step()
             running_loss += float(loss.item())
 
         if (step + 1) % max(1, steps // 10) == 0:
-            progress((step + 1) / steps, desc=f"Training {step+1}/{steps}")
+            progress(
+                (step + 1) / steps,
+                desc=f"Training {step+1}/{steps}",
+            )
 
-    state = {
-        "gelu_state_dict": {k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()}
-    }
-    return state, f"Trained. Avg loss={running_loss/max(1,steps):.4f}"
+    return {
+        "gelu_state_dict": {
+            k: v.detach().cpu() for k, v in gen.synthetic_bias.state_dict().items()
+        }
+    }, f"Trained. Avg loss={running_loss/max(1,steps):.4f}"
 
 
-# ----------------------------
-# Gradio app
-# ----------------------------
 def build_app():
-    with gr.Blocks(title="Neurosymbolic Enhanced (Grid + Associations + CoT)") as demo:
+    with gr.Blocks(
+        title="Neurosymbolic V3.6 (Gaspare + Seed-based Sparsification)"
+    ) as demo:
         gr.Markdown(
-            "# Neurosymbolic Enhanced\n"
-            "*Gaspare + Menger + Contextual Grid + Top-K Chain of Thought*\n\n"
-            "**Features**: Contextual grid structures, associational networks, and top-k "
-            "chain of thought reasoning with automatic scoring and selection."
+            "# Neurosymbolic V3.6: Gaspare-style Graphs + SGLang Runtime\n"
+            "*Continuous Batching, RadixCache, Speculative Decoding*"
         )
 
         trained_state = gr.State(None)
 
-        with gr.Tabs():
-            # ========== Structured Generation Tab ==========
-            with gr.TabItem("Structured Generation"):
-                gr.Markdown("Generate structured takeaways and summaries from your corpus.")
-                
-                with gr.Row():
-                    infile_struct = gr.File(label="Input File (txt/md only)")
-                    out_txt_struct = gr.Textbox(label="Structured Output", lines=20)
+        with gr.Row():
+            infile = gr.File(label="Input File (txt/md only)")
+            out_txt = gr.Textbox(label="Structured Output", lines=20)
 
-                with gr.Row():
-                    n_take = gr.Slider(1, 10, value=4, step=1, label="Parallel Forks (Batch Size)")
-                    seed_struct = gr.Number(value=42, label="Seed", precision=0)
+        with gr.Row():
+            n_take = gr.Slider(1, 10, value=4, label="Parallel Forks (Batch Size)")
+            seed = gr.Number(value=42, label="Seed")
 
-                with gr.Row():
-                    steer_struct = gr.Slider(0, 5, value=1.35, label="Steer")
-                    focus_struct = gr.Slider(0, 1, value=0.5, label="Focus")
-                    gelu_seed_struct = gr.Number(value=1337, label="GELU Seed", precision=0)
+        with gr.Row():
+            steer = gr.Slider(0, 5, value=1.35, label="Steer")
+            focus = gr.Slider(0, 1, value=0.5, label="Focus")
+            gelu_seed = gr.Number(value=1337, label="GELU Seed")
 
-                with gr.Accordion("Contextual Grid Settings", open=False):
-                    use_grid_struct = gr.Checkbox(value=True, label="Enable Contextual Grid")
-                    grid_size_struct = gr.Slider(10, 40, value=20, step=1, label="Grid Size")
+        with gr.Accordion("Editable Prompts", open=False):
+            p_takeaway = gr.Textbox(
+                label="Takeaway Prompt (Prefix)",
+                value="",
+                lines=2,
+            )
+            p_summary = gr.Textbox(
+                label="Prompt Template, {joined_takeaways} will be replaced",
+                value="explain the nature of this?\n\n{joined_takeaways}\n\nplan:",
+                lines=4,
+            )
 
-                with gr.Accordion("Editable Prompts", open=False):
-                    p_takeaway = gr.Textbox(label="Takeaway Prompt (Prefix)", value="this is", lines=2)
-                    p_summary = gr.Textbox(
-                        label="Prompt Template, {joined_takeaways} will be replaced",
-                        value="explain the nature of this?\n\n{joined_takeaways}\n\nplan:",
-                        lines=4,
-                    )
+        train_btn = gr.Button("Train GELU Bias (Optional)")
+        run_btn = gr.Button(
+            "Run Structured Program (SGLang style)", variant="primary"
+        )
+        status = gr.Textbox(label="Train Status")
 
-                run_btn_struct = gr.Button("Run Structured Program", variant="primary")
+        train_btn.click(
+            train_bias_net,
+            inputs=[
+                infile,
+                seed,
+                steer,
+                focus,
+                gelu_seed,
+                gr.Number(100, visible=False),
+                gr.Number(0.001, visible=False),
+                gr.Number(0, visible=False),
+            ],
+            outputs=[trained_state, status],
+        )
 
-                run_btn_struct.click(
-                    run_program,
-                    inputs=[
-                        infile_struct,
-                        n_take,
-                        seed_struct,
-                        steer_struct,
-                        focus_struct,
-                        gelu_seed_struct,
-                        use_grid_struct,
-                        grid_size_struct,
-                        p_takeaway,
-                        p_summary,
-                        trained_state,
-                    ],
-                    outputs=out_txt_struct,
-                )
-
-            # ========== Top-K CoT Tab ==========
-            with gr.TabItem("Top-K Chain of Thought"):
-                gr.Markdown(
-                    "### Chain of Thought Reasoning\n"
-                    "Generate multiple reasoning chains in parallel, score them based on coherence "
-                    "and coverage, and select the best one."
-                )
-                
-                with gr.Row():
-                    infile_cot = gr.File(label="Input File (txt/md only)")
-                    out_txt_cot = gr.Textbox(label="CoT Output", lines=25)
-
-                question_input = gr.Textbox(
-                    label="Question / Reasoning Prompt",
-                    value="What are the key insights from this text?",
-                    lines=3
-                )
-
-                with gr.Row():
-                    k_chains = gr.Slider(1, 10, value=3, step=1, label="K (Number of Chains)")
-                    steps_per_chain = gr.Slider(1, 10, value=1, step=1, label="Steps per Chain")
-                    seed_cot = gr.Number(value=42, label="Seed", precision=0)
-
-                with gr.Row():
-                    steer_cot = gr.Slider(0, 5, value=1.35, label="Steer")
-                    focus_cot = gr.Slider(0, 1, value=0.5, label="Focus")
-                    gelu_seed_cot = gr.Number(value=1337, label="GELU Seed", precision=0)
-
-                with gr.Row():
-                    max_tokens_step = gr.Slider(30, 2000, value=800, step=10, label="Max Tokens per Step")
-                    show_scores = gr.Checkbox(value=True, label="Show Scores")
-
-                with gr.Accordion("Contextual Grid Settings", open=False):
-                    use_grid_cot = gr.Checkbox(value=True, label="Enable Contextual Grid")
-                    grid_size_cot = gr.Slider(10, 40, value=20, step=1, label="Grid Size")
-
-                with gr.Accordion("CoT Prompt Templates", open=False):
-                    cot_step_template = gr.Textbox(
-                        label="Step Template (use {step} for step number)",
-                        value="Let's think step by step.\n\nStep {step}:",
-                        lines=2
-                    )
-                    cot_answer_template = gr.Textbox(
-                        label="Answer Template",
-                        value="\n\nTherefore, the answer is:",
-                        lines=2
-                    )
-
-                run_btn_cot = gr.Button("Generate CoT Reasoning", variant="primary")
-
-                run_btn_cot.click(
-                    run_cot_program,
-                    inputs=[
-                        infile_cot,
-                        question_input,
-                        k_chains,
-                        steps_per_chain,
-                        seed_cot,
-                        steer_cot,
-                        focus_cot,
-                        gelu_seed_cot,
-                        use_grid_cot,
-                        grid_size_cot,
-                        cot_step_template,
-                        cot_answer_template,
-                        max_tokens_step,
-                        show_scores,
-                        trained_state,
-                    ],
-                    outputs=out_txt_cot,
-                )
-
-            # ========== Training Tab ==========
-            with gr.TabItem("Training"):
-                gr.Markdown(
-                    "### Train GELU Bias Network\n"
-                    "Optional: Fine-tune the synthetic bias network on your corpus."
-                )
-                
-                infile_train = gr.File(label="Input File (txt/md only)")
-                
-                with gr.Row():
-                    seed_train = gr.Number(value=42, label="Seed", precision=0)
-                    train_steps = gr.Number(value=100, label="Training Steps", precision=0)
-                    lr_train = gr.Number(value=0.001, label="Learning Rate")
-
-                with gr.Row():
-                    steer_train = gr.Slider(0, 5, value=1.35, label="Steer")
-                    focus_train = gr.Slider(0, 1, value=0.5, label="Focus")
-                    gelu_seed_train = gr.Number(value=1337, label="GELU Seed", precision=0)
-
-                with gr.Accordion("Grid Settings", open=False):
-                    use_grid_train = gr.Checkbox(value=True, label="Enable Contextual Grid")
-                    grid_size_train = gr.Slider(10, 40, value=20, step=1, label="Grid Size")
-
-                train_btn = gr.Button("Train GELU Bias", variant="secondary")
-                status = gr.Textbox(label="Train Status")
-
-                train_btn.click(
-                    train_bias_net,
-                    inputs=[
-                        infile_train,
-                        seed_train,
-                        steer_train,
-                        focus_train,
-                        gelu_seed_train,
-                        use_grid_train,
-                        grid_size_train,
-                        train_steps,
-                        lr_train,
-                        gr.Number(0, visible=False),
-                    ],
-                    outputs=[trained_state, status],
-                )
+        run_btn.click(
+            run_sglang_style_program,
+            inputs=[
+                infile,
+                n_take,
+                seed,
+                steer,
+                focus,
+                gelu_seed,
+                p_takeaway,
+                p_summary,
+                trained_state,
+            ],
+            outputs=out_txt,
+        )
 
     return demo
 
 
 if __name__ == "__main__":
     app = build_app()
-    app.queue().launch(debug=True, show_error=True)
+    app.queue().launch()
